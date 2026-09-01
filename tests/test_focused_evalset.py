@@ -1,10 +1,26 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from glean_gepa.focused_evalset import (
+    DEFAULT_RUN_LABEL,
+    HIGH_SIGNAL_RUN_LABEL,
+    EvalRunTarget,
+    FocusedEvalSet,
     build_upload_eval_set_request,
     ensure_focused_eval_set,
     focused_eval_set_version,
+    prepare_high_signal_eval_batch,
+    resolve_eval_run_target,
 )
+
+SOURCE = {
+    "eval_set_name": "Example",
+    "eval_set_version": "v1",
+    "deployment_ids": ["prod"],
+    "status": "active",
+}
+FOCUSED = FocusedEvalSet("gepa-high-signal-example", "v1_hs_abc", 1)
 
 
 def test_focused_eval_set_version_is_stable_for_the_same_entries():
@@ -65,3 +81,46 @@ def test_ensure_focused_eval_set_reuses_an_existing_version():
 
     assert focused is not None
     evalcli.upload_eval_set.assert_not_called()
+
+
+def test_prepare_high_signal_eval_batch_attaches_focused_set_or_fails():
+    focused = FOCUSED
+    batch = [{**SOURCE, "eval_entry_ids": ["keep"]}]
+    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=focused) as ensure:
+        prepared = prepare_high_signal_eval_batch(MagicMock(), batch)
+
+    ensure.assert_called_once()
+    assert prepared is not None
+    assert prepared[0]["eval_set_name"] == focused.name
+    assert prepared[0]["eval_set_version"] == focused.version
+    assert prepared[0]["focused_eval_set_name"] == focused.name
+    assert prepared[0]["focused_eval_set_version"] == focused.version
+    assert prepared[0]["eval_entry_ids"] == ["keep"]
+
+    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=None):
+        assert prepare_high_signal_eval_batch(MagicMock(), batch) is None
+
+
+@pytest.mark.parametrize(
+    "data, ensure_return, expected, ensure_called",
+    [
+        (SOURCE, None, EvalRunTarget("Example", "v1", DEFAULT_RUN_LABEL, is_focused=False), False),
+        (
+            {**SOURCE, "eval_entry_ids": ["keep"], "focused_eval_set_name": "focused", "focused_eval_set_version": "v1_hs"},
+            None,
+            EvalRunTarget("focused", "v1_hs", HIGH_SIGNAL_RUN_LABEL, is_focused=True),
+            False,
+        ),
+        (
+            {**SOURCE, "eval_entry_ids": ["keep"]},
+            FOCUSED,
+            EvalRunTarget(FOCUSED.name, FOCUSED.version, HIGH_SIGNAL_RUN_LABEL, is_focused=True),
+            True,
+        ),
+        ({**SOURCE, "eval_entry_ids": ["keep"]}, None, None, True),
+    ],
+)
+def test_resolve_eval_run_target(data, ensure_return, expected, ensure_called):
+    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=ensure_return) as ensure:
+        assert resolve_eval_run_target(MagicMock(), data) == expected
+    assert ensure.called is ensure_called

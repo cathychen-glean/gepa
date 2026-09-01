@@ -4,6 +4,8 @@ import json
 from datetime import date
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from glean_gepa.al_adapter import (
     ALRunner,
     Candidate,
@@ -196,7 +198,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     )
     with (
         patch(
-            "glean_gepa.single_model_adapter.ensure_focused_eval_set",
+            "glean_gepa.focused_evalset.ensure_focused_eval_set",
             return_value=FocusedEvalSet("gepa-high-signal-source", "v1_hs_abc", 1),
         ) as ensure,
         patch.object(adapter, "_get_or_run_student_eval", return_value="focused-run") as run_eval,
@@ -420,14 +422,14 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         cache_file=str(cache_file),
     )
     with (
-        patch.object(first_runner, "run", return_value="run_123") as run,
+        patch.object(first_runner, "start", return_value=("run_123", False)) as start,
         patch(
             "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
         ) as fetch,
     ):
         without_traces = first.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=False)
     assert without_traces.trajectories is None
-    run.assert_called_once()
+    start.assert_called_once()
     fetch.assert_called_once()
 
     second_runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
@@ -439,12 +441,12 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         cache_file=str(cache_file),
     )
     with (
-        patch.object(second_runner, "run") as run,
+        patch.object(second_runner, "start") as start,
         patch("glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis") as fetch,
     ):
         with_traces = second.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=True)
 
-    run.assert_not_called()
+    start.assert_not_called()
     fetch.assert_not_called()
     assert with_traces.trajectories is not None
     trace_output = with_traces.trajectories[0]["output"]
@@ -575,3 +577,51 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         assert adapter._get_or_fetch_shell_error_analysis("run_legacy") is refreshed
 
     fetch.assert_called_once()
+
+
+def test_launched_student_eval_is_soft_cached_and_resumed_after_timeout(tmp_path):
+    cache_file = tmp_path / "eval_cache.json"
+    evalcli = MagicMock()
+    evalcli.create_eval_run.side_effect = lambda **kwargs: kwargs["eval_run_id"]
+    first = SingleModelAdapter(
+        runner=ALRunner(evalcli=evalcli),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        cache_file=str(cache_file),
+    )
+    eval_kwargs = {
+        "eval_set_name": "set",
+        "eval_set_version": "v1",
+        "deployment_ids": ["prod"],
+        "system_prompt": "prompt",
+    }
+    with patch.object(first.runner, "wait", side_effect=TimeoutError("terminal timed out")):
+        with pytest.raises(TimeoutError):
+            first._get_or_run_student_eval(**eval_kwargs)
+
+    saved = json.loads(cache_file.read_text())
+    assert saved["eval_cache"] == {}
+    assert len(saved["in_flight_eval_cache"]) == 1
+    launched_id = next(iter(saved["in_flight_eval_cache"].values()))
+    assert evalcli.create_eval_run.call_args.kwargs["eval_run_id"] == launched_id
+
+    second = SingleModelAdapter(
+        runner=ALRunner(evalcli=MagicMock()),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        cache_file=str(cache_file),
+    )
+    with (
+        patch.object(second.runner, "start") as start,
+        patch.object(second.runner, "wait") as wait,
+    ):
+        eval_id = second._get_or_run_student_eval(**eval_kwargs)
+
+    start.assert_not_called()
+    wait.assert_called_once_with(launched_id)
+    assert eval_id == launched_id
+    saved = json.loads(cache_file.read_text())
+    assert saved["in_flight_eval_cache"] == {}
+    assert list(saved["eval_cache"].values()) == [launched_id]

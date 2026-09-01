@@ -16,9 +16,7 @@ from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import StdOutLogger
 from glean_gepa.adapter_types import ALDataInst, JudgingMode
 from glean_gepa.al_adapter import (
-    MODULES,
     ALRunner,
-    Judge,
     ModuleSpec,
     Thresholds,
 )
@@ -29,24 +27,72 @@ from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
-from glean_gepa.prompt import WRITING_CODE_KEY
+from glean_gepa.prompt import (
+    KNOWN_PROMPT_KEYS,
+    MODULE_TOKEN_BUDGETS,
+    FULL_PROMPT_KEY,
+    WRITING_CODE_KEY,
+    materialize_system_prompt,
+)
+from glean_gepa.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
 
-def _load_seed_candidate(path: Path) -> dict[str, str]:
+def _load_seed_candidate(path: Path, required_keys: set[str]) -> dict[str, str]:
     if not path.is_file():
         raise SystemExit(f"seed_candidate file not found: {path}")
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict) or not raw:
         raise SystemExit("seed_candidate must be a non-empty JSON object")
 
-    if set(raw) != {WRITING_CODE_KEY}:
-        raise SystemExit(f"seed_candidate must contain only {WRITING_CODE_KEY!r}")
-    writing_code = raw[WRITING_CODE_KEY]
-    if not isinstance(writing_code, str):
-        raise SystemExit(f"{WRITING_CODE_KEY} must be a string. Got type={type(writing_code)}")
-    return {WRITING_CODE_KEY: writing_code}
+    unknown = set(raw) - KNOWN_PROMPT_KEYS
+    if unknown:
+        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
+        raise SystemExit(f"seed_candidate has unknown keys: {unknown_list}")
+
+    missing = required_keys - set(raw)
+    if missing:
+        missing_list = ", ".join(sorted(repr(key) for key in missing))
+        raise SystemExit(f"seed_candidate missing required keys: {missing_list}")
+
+    seed: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            raise SystemExit(f"{key} must be a string. Got type={type(value)}")
+        seed[key] = value
+    return seed
+
+
+def _parse_editable_modules(raw: str) -> list[str]:
+    modules = [part.strip() for part in raw.split(",") if part.strip()]
+    if not modules:
+        raise SystemExit("editable_modules must list at least one prompt key")
+    unknown = [module for module in modules if module not in KNOWN_PROMPT_KEYS]
+    if unknown:
+        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
+        known_list = ", ".join(sorted(KNOWN_PROMPT_KEYS))
+        raise SystemExit(f"unknown editable_modules: {unknown_list}. Known keys: {known_list}")
+    deduped: list[str] = []
+    for module in modules:
+        if module not in deduped:
+            deduped.append(module)
+    return deduped
+
+
+def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str]) -> dict[str, str]:
+    """Build the GEPA candidate dict for the requested editable modules.
+
+    ``FULL_PROMPT`` is always a fully stitched system prompt. Other keys are
+    copied from the seed file as independent modules.
+    """
+    seed: dict[str, str] = {}
+    for key in editable_modules:
+        if key == FULL_PROMPT_KEY:
+            seed[key] = materialize_system_prompt(raw)
+        else:
+            seed[key] = raw[key]
+    return seed
 
 
 def _make_reflection_lm(
@@ -212,7 +258,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Drop later examples whose isolated execution errors are within Hamming distance k.",
     )
     parser.add_argument("--evalcli", default=None)
-    parser.add_argument("--shell_error_lookback_days", type=int, default=7)
+    parser.add_argument(
+        "--agentspan_lookback_days",
+        type=int,
+        default=DEFAULT_LOOKBACK_DAYS,
+        help="UTC days of Agentspan shards to search when scoring an eval run "
+        "(shell-tool errors or teacher-student tool match).",
+    )
     parser.add_argument("--bigquery_project", default=None)
     parser.add_argument(
         "--train_eval_versions",
@@ -241,6 +293,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="single_model",
     )
     parser.add_argument(
+        "--editable_modules",
+        default=WRITING_CODE_KEY,
+        help="Comma-separated prompt keys to edit (WRITING_CODE, FULL_PROMPT). "
+        "FULL_PROMPT edits the full materialized system prompt.",
+    )
+    parser.add_argument(
         "--fake_flow",
         action="store_true",
         help="Run deterministic fake eval data and prompt iterations without external Glean services.",
@@ -257,7 +315,10 @@ def main() -> None:
 
     if args.seed_candidate is None:
         raise SystemExit("--seed_candidate is required unless --fake_flow is set")
-    seed_candidate = _load_seed_candidate(args.seed_candidate)
+    editable_modules = _parse_editable_modules(args.editable_modules)
+    required_keys = {key for key in editable_modules if key != FULL_PROMPT_KEY}
+    raw_seed = _load_seed_candidate(args.seed_candidate, required_keys=required_keys)
+    seed_candidate = _seed_for_editable_modules(raw_seed, editable_modules)
     evalcli = EvalCliClient(binary=args.evalcli)
     train_versions, val_versions = _resolve_eval_version_split(args, evalcli)
     trainset = _make_evalset(train_versions)
@@ -268,19 +329,27 @@ def main() -> None:
         "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         "student_model": args.student_model,
         "cache_file": "~/eval_cache.json",
+        "bigquery_client": BigQueryClient(project_id=args.bigquery_project),
+        "agentspan_lookback_days": args.agentspan_lookback_days,
+        "editable_modules": editable_modules,
     }
     if judging_mode == "teacher_student":
-        adapter = TeacherStudentAdapter(**adapter_kwargs, teacher_model=args.teacher_model, judge=Judge(evalcli))
-    else:
-        adapter = SingleModelAdapter(
+        adapter = TeacherStudentAdapter(
             **adapter_kwargs,
-            bigquery_client=BigQueryClient(project_id=args.bigquery_project),
-            shell_error_lookback_days=args.shell_error_lookback_days,
+            teacher_model=args.teacher_model,
         )
+    else:
+        adapter = SingleModelAdapter(**adapter_kwargs)
 
     logger = StdOutLogger()
     tracker = create_experiment_tracker()
-    module_specs = {name: ModuleSpec(name, "free_text", 1024) for name in MODULES}
+    module_specs = {
+        name: ModuleSpec(name, "free_text", MODULE_TOKEN_BUDGETS.get(name, 1024)) for name in adapter.editable_modules
+    }
+    global_token_cap = max(
+        args.global_token_cap,
+        *(MODULE_TOKEN_BUDGETS.get(name, 0) for name in adapter.editable_modules),
+    )
     proposer = EvolutionaryProposer(
         logger=logger,
         trainset=trainset,
@@ -294,7 +363,7 @@ def main() -> None:
         experiment_tracker=tracker,
         model=args.student_model,
         module_specs=module_specs,
-        global_token_cap=args.global_token_cap,
+        global_token_cap=global_token_cap,
         reflect_k=args.reflection_samples,
         reflection_hamming_distance_k=args.reflection_hamming_distance_k,
         baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),

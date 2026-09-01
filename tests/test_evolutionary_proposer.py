@@ -4,6 +4,7 @@ from glean_gepa.evolutionary_proposer import make_children_for_generation
 
 class _ReflectionAdapter:
     def __init__(self) -> None:
+        self.editable_modules = ["WRITING_CODE"]
         self.reflection_calls = 0
 
     def get_screening_score(self, _eval: object) -> float:

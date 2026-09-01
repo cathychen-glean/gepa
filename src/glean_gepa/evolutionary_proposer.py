@@ -16,7 +16,6 @@ from gepa.logging.experiment_tracker import ExperimentTracker
 from gepa.logging.logger import LoggerProtocol
 from gepa.proposer.base import CandidateProposal
 from glean_gepa.al_adapter import (
-    MODULES,
     Candidate,
     GleanAdapterBase,
     ModuleSpec,
@@ -24,13 +23,13 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
-from glean_gepa.prompt import WRITING_CODE_KEY, default_writing_code
+from glean_gepa.prompt import PROMPT_MODULE_DEFAULTS
 from glean_gepa.utils import apply_single_module_edit
 
 
 # TODO(Cathy): pick modules based on holistic performance of the eval
-def pick_modules_to_edit() -> list[str]:
-    return list(MODULES)
+def pick_modules_to_edit(adapter: GleanAdapterBase) -> list[str]:
+    return list(adapter.editable_modules)
 
 
 def make_children_for_generation(
@@ -104,7 +103,7 @@ def make_children_for_generation(
             # Need traces to reflect; skip mutation if missing.
             continue
 
-        modules_to_edit = pick_modules_to_edit()
+        modules_to_edit = pick_modules_to_edit(adapter)
 
         high_signal = adapter.make_reflective_dataset(
             candidate=parent,
@@ -235,8 +234,10 @@ class EvolutionaryProposer:
                 self._batch_data = []
 
     def _to_candidate(self, program: dict[str, str]) -> Candidate:
-        """Convert a GEPA program to the sole editable Glean prompt module."""
-        prompt_modules = {WRITING_CODE_KEY: program.get(WRITING_CODE_KEY, default_writing_code)}
+        """Convert a GEPA program into adapter-editable Glean prompt modules."""
+        prompt_modules = dict(program)
+        for key in self.al_adapter.editable_modules:
+            prompt_modules.setdefault(key, PROMPT_MODULE_DEFAULTS[key])
         content = json.dumps(prompt_modules, sort_keys=True)
         cand_id = hashlib.md5(content.encode()).hexdigest()[:10]
         return Candidate(
@@ -291,9 +292,13 @@ class EvolutionaryProposer:
             prog_idx_to_cand_id[idx] = cand.candidate_id
             frontier_candidates.append(cand)
 
-            frontier_evals[cand.candidate_id] = self.al_adapter.evaluate(
-                trace_batch, cand.prompt_modules, capture_traces=True
-            )
+        frontier_eval_batches = self.al_adapter.evaluate_many(
+            trace_batch,
+            [cand.prompt_modules for cand in frontier_candidates],
+            capture_traces=True,
+        )
+        for cand, eval_batch in zip(frontier_candidates, frontier_eval_batches, strict=True):
+            frontier_evals[cand.candidate_id] = eval_batch
 
         # 4. Generate children using evolutionary strategies. Cached mutations
         # are scoped to the current training slice, so a fresh slice prompts a
@@ -342,11 +347,18 @@ class EvolutionaryProposer:
                 return []
         else:
             high_signal_batch = trace_batch
-        screen_evals = invoke_batch_evaluate(
-            self.al_adapter,
-            [(child.prompt_modules, high_signal_batch) for child in valid_children],
-            capture_traces=use_high_signal_gate,
-        )
+        if use_high_signal_gate:
+            screen_evals = invoke_batch_evaluate(
+                self.al_adapter,
+                [(child.prompt_modules, high_signal_batch) for child in valid_children],
+                capture_traces=True,
+            )
+        else:
+            screen_evals = self.al_adapter.evaluate_many(
+                high_signal_batch,
+                [child.prompt_modules for child in valid_children],
+                capture_traces=False,
+            )
         screened_children = _select_screened_children(
             self.al_adapter,
             parent_eval,

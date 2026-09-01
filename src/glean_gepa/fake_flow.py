@@ -68,6 +68,7 @@ class FakeFlowAdapter(GleanAdapterBase):
             failure_label="Fake eval evidence",
             primary_objective="fake_score",
             default_frontier_type="objective",
+            editable_modules=list(MODULES),
         )
 
     def evaluate(

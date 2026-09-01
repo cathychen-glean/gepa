@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 
 DEFAULT_AGENTS_SPAN_TABLE = "scio-apps.scrubbed_agentspan.scrubbed_agentspan_*"
 DEFAULT_EVALSET_ENTRIES_TABLE = "scio-apps.fact.evalset_entries"
+DEFAULT_LOOKBACK_DAYS = 1
 SHELL_SUCCESS_OBJECTIVE = "shell_success_rate"
 SHELL_SPAN_NAMES = ("Execute Action: Shell", "Execute Action: Shell Tool")
 SHELL_ACTION_IDS = ("Shell", "Shell Tool")
@@ -502,15 +503,17 @@ def _parse_bigquery_date(value: Any) -> date | None:
         return None
 
 
-def default_date_range(*, lookback_days: int = 7, end_date: date | None = None) -> tuple[date, date]:
-    resolved_end = end_date or date.today()
+def default_date_range(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None) -> tuple[date, date]:
+    # Agentspan shards by UTC ``_TABLE_SUFFIX``. Local ``date.today()`` is wrong after
+    # UTC midnight while the local timezone is still the previous calendar day.
+    resolved_end = end_date or datetime.now(timezone.utc).date()
     return resolved_end - timedelta(days=lookback_days), resolved_end
 
 
 def build_eval_run_search_params(
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
 ) -> list[QueryParameter]:
     search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
@@ -551,9 +554,10 @@ def resolve_eval_run_date_range(
     if min_ms is None or max_ms is None:
         return None
 
-    min_date = date.fromtimestamp(int(min_ms) / 1000)
-    max_date = date.fromtimestamp(int(max_ms) / 1000)
-    search_end = end_date or date.today()
+    # Agentspan ``_TABLE_SUFFIX`` is UTC; local ``fromtimestamp`` can land on the previous day.
+    min_date = datetime.fromtimestamp(int(min_ms) / 1000, tz=timezone.utc).date()
+    max_date = datetime.fromtimestamp(int(max_ms) / 1000, tz=timezone.utc).date()
+    search_end = end_date or datetime.now(timezone.utc).date()
     search_start = search_end - timedelta(days=lookback_days)
     start_date = max(min_date, search_start)
     end_date_resolved = min(max_date, search_end)
@@ -665,7 +669,7 @@ def fetch_eval_run_shell_tool_error_analysis(
     client: Any,
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     include_error_examples: bool = True,
@@ -758,7 +762,7 @@ def fetch_shell_tool_error_metrics(
     client: Any,
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> ShellToolErrorMetrics:
