@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, cast
 
 from glean_gepa.adapter_types import (
@@ -23,7 +22,7 @@ from glean_gepa.al_adapter import (
     extract_tool_names_from_spans,
     get_tool_alignment_from_traces,
 )
-from glean_gepa.batch import GleanEvaluationBatch
+from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.prompt import compile_encoded_prompt
 
 PRIMARY_OBJECTIVE = "correctness"
@@ -209,25 +208,19 @@ class TeacherStudentAdapter(GleanAdapterBase):
         all_scores: list[float] = []
         all_trajectories: list[TeacherStudentALTrajectory] | None = [] if capture_traces else None
         all_objective_scores: list[dict[str, float]] = []
+        all_eval_run_ids: list[EvalRunIds] = []
 
         for al_data_inst in batch:
             eval_set_version = al_data_inst.get("eval_set_version", "")
             eval_set_name = al_data_inst.get("eval_set_name", "")
             deployment_ids = al_data_inst.get("deployment_ids", [])
 
-            # Create cache keys for teacher and student
-            teacher_prompt_hash = hashlib.md5(b"<<TEACHER_PROD_PROMPT>>").hexdigest()[:16]
-            student_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-
-            teacher_cache_key = (eval_set_name, eval_set_version, self.teacher_model, teacher_prompt_hash)
-            student_cache_key = (eval_set_name, eval_set_version, self.student_model, student_prompt_hash)
-
-            # Check cache for teacher eval
-            teacher_eval_id = self._eval_cache.get(teacher_cache_key)
+            # Child-cache IDs belong to a persisted screening result. All other
+            # eval-ID lookups and writes are owned by ALRunner.
+            teacher_eval_id = al_data_inst.get("cached_teacher_eval_run_id")
             if teacher_eval_id:
                 print(f"[Cache HIT] Using cached teacher eval_id: {teacher_eval_id}")
             else:
-                # Trigger teacher eval run
                 teacher_eval_id = self.runner.run(
                     self.teacher_model,
                     system_prompt="<<TEACHER_PROD_PROMPT>>",
@@ -235,17 +228,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     eval_set_version=eval_set_version,
                     deployment_ids=deployment_ids,
                 )
-                # Cache and save immediately
-                self._eval_cache[teacher_cache_key] = teacher_eval_id
-                self._save_cache()
-                print(f"[Cache MISS] Started and cached teacher eval_id: {teacher_eval_id}")
 
-            # Check cache for student eval
-            student_eval_id = self._eval_cache.get(student_cache_key)
+            student_eval_id = al_data_inst.get("cached_student_eval_run_id")
             if student_eval_id:
                 print(f"[Cache HIT] Using cached student eval_id: {student_eval_id}")
             else:
-                # Trigger student eval run
                 student_eval_id = self.runner.run(
                     self.student_model,
                     system_prompt=system_prompt,
@@ -253,10 +240,14 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     eval_set_version=eval_set_version,
                     deployment_ids=deployment_ids,
                 )
-                # Cache and save immediately
-                self._eval_cache[student_cache_key] = student_eval_id
-                self._save_cache()
-                print(f"[Cache MISS] Started and cached student eval_id: {student_eval_id}")
+            all_eval_run_ids.append(
+                {
+                    "eval_set_name": eval_set_name,
+                    "eval_set_version": eval_set_version,
+                    "student_eval_run_id": student_eval_id,
+                    "teacher_eval_run_id": teacher_eval_id,
+                }
+            )
             # teacher_eval_id = "gepa_gpt_3070257bbe5f1340_1774652253"
             # student_eval_id = "gepa_fast_1ad33e85e6067b04_1774652258"
 
@@ -269,8 +260,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
             else:
                 print(f"[Judge Cache MISS] Will trigger judge for {teacher_eval_id} vs {student_eval_id}")
                 # Mark as triggered and save immediately
-                self._judge_triggered.add(judge_cache_key)
-                self._save_cache()
+                with self._cache_lock:
+                    self._judge_triggered.add(judge_cache_key)
+                    self._save_cache()
 
             # Run judge to compare teacher vs student
             judge_result = self.judge.judge(teacher_eval_id, student_eval_id, skip_trigger=skip_trigger)
@@ -325,6 +317,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     "teacher_tool_calls": teacher_trace["num_tool_calls"],
                     "teacher_input_tokens": teacher_trace["input_tokens"],
                     "teacher_output_tokens": teacher_trace["output_tokens"],
+                    "student_eval_run_id": student_eval_id,
+                    "teacher_eval_run_id": teacher_eval_id,
                     # Metadata
                     "entry_id": entry_id,
                 }
@@ -379,6 +373,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             trajectories=all_trajectories,
             objective_scores=all_objective_scores,
             summary=summary,
+            eval_run_ids=all_eval_run_ids,
         )
 
 

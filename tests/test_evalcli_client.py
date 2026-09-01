@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from glean_gepa.al_adapter import CODING_HARNESS_SC_PARAMS, ALRunner
 from glean_gepa.evalcli_client import EvalCliClient, EvalCliError, _subprocess_env
+
+
+def test_coding_harness_sc_params_selects_coding_agent_loop():
+    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
+
+    params = runner._build_sc_params("gpt", "")
+
+    assert params.startswith(CODING_HARNESS_SC_PARAMS)
+    assert "co.internal_looping_pyagent_default_route_override=coding_agent_loop" in params
+    assert "co.py_agent_route_override=o3_agentic_loop" not in params
+    assert "co.lo.cao.agentic_loop_sc_params=co.so.enable_for_agentic_loop%3D1%2C" in params
+    assert "co.so.ptc_only_tools%3Dglean_search%253Bglean_document_reader" in params
 
 
 def test_create_eval_run_invokes_evalcli_with_expected_args():
@@ -30,12 +44,61 @@ def test_create_eval_run_invokes_evalcli_with_expected_args():
     assert "--eval-params" in args
 
 
+def test_al_runner_caches_created_eval_before_waiting(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = EvalCliClient(binary="/fake/evalcli")
+    runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+    events = []
+
+    def on_created(eval_run_id):
+        events.append(("created", eval_run_id, json.loads(cache_file.read_text())))
+
+    def wait_for_eval_run(eval_run_id):
+        events.append(("wait", eval_run_id, json.loads(cache_file.read_text())))
+
+    with (
+        patch.object(client, "create_eval_run", return_value="run_123"),
+        patch.object(client, "wait_for_eval_run", side_effect=wait_for_eval_run),
+    ):
+        assert (
+            runner.run(
+                "fast",
+                "prompt",
+                "eval-set",
+                "v1",
+                ["scio-prod"],
+                on_created=on_created,
+            )
+            == "run_123"
+        )
+
+    assert [event[0] for event in events] == ["created", "wait"]
+    assert all(event[2] for event in events)
+    assert list(events[0][2].values()) == ["run_123"]
+
+
 def test_create_judge_run_parses_response_list():
     client = EvalCliClient(binary="/fake/evalcli")
     with patch.object(client, "_invoke_json", return_value=[{"id": "judge_456", "status": "SUBMITTED"}]):
         judge_id = client.create_judge_run(student_eval_id="student", teacher_eval_id="teacher")
 
     assert judge_id == "judge_456"
+
+
+def test_list_eval_set_versions_returns_version_rows():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with patch.object(client, "_invoke_json", return_value={"evalSetVersions": [{"version": "20260827"}]}) as mock_invoke:
+        rows = client.list_eval_set_versions(eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"])
+
+    assert rows == [{"version": "20260827"}]
+    assert mock_invoke.call_args[0] == (
+        "evalsets",
+        "list",
+        "--name",
+        "Glean Chat V2 Medium",
+        "--deployment-ids",
+        "scio-prod",
+    )
 
 
 def test_wait_for_judge_run_raises_on_failure():
@@ -88,7 +151,7 @@ def test_subprocess_env_preserves_existing_ssl_cert(monkeypatch):
     assert "REQUESTS_CA_BUNDLE" not in env
 
 
-def test_wait_for_eval_run_retries_transient_errors():
+def test_wait_for_eval_run_retries_transient_errors(capsys):
     client = EvalCliClient(binary="/fake/evalcli")
     in_progress = [{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 1}]}]
     complete = [{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 1}]}]
@@ -102,9 +165,25 @@ def test_wait_for_eval_run_retries_transient_errors():
         ],
     ) as mock_invoke:
         with patch("glean_gepa.evalcli_client.time.sleep"):
-            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=10)
+            client.wait_for_eval_run("run_123", poll_interval_sec=0)
 
     assert mock_invoke.call_count == 3
+    status_logs = [line for line in capsys.readouterr().out.splitlines() if line.startswith("Eval run run_123 status:")]
+    assert len(status_logs) == 2
+    assert "TASK_SUBMITTED" in status_logs[0]
+    assert "TASK_SUCCEEDED" in status_logs[1]
+
+
+def test_wait_for_eval_run_honors_timeout():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(client, "_invoke_json") as mock_invoke,
+        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=[10.0, 11.0]),
+    ):
+        with pytest.raises(EvalCliError, match="timed out after 1s"):
+            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=1)
+
+    mock_invoke.assert_not_called()
 
 
 def test_wait_for_eval_run_raises_on_non_transient_errors():
@@ -115,7 +194,7 @@ def test_wait_for_eval_run_raises_on_non_transient_errors():
         side_effect=EvalCliError("stderr: auth failed"),
     ):
         with pytest.raises(EvalCliError, match="auth failed"):
-            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=1)
+            client.wait_for_eval_run("run_123", poll_interval_sec=0)
 
 
 def test_invoke_raises_on_nonzero_exit():

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 
 DEFAULT_AGENTS_SPAN_TABLE = "scio-apps.scrubbed_agentspan.scrubbed_agentspan_*"
 DEFAULT_EVALSET_ENTRIES_TABLE = "scio-apps.fact.evalset_entries"
+DEFAULT_EVAL_WORKFLOW_RUNS_TABLE = "scio-apps.fact.eval_workflow_runs"
 SHELL_SUCCESS_OBJECTIVE = "shell_success_rate"
 SHELL_SPAN_NAMES = ("Execute Action: Shell", "Execute Action: Shell Tool")
 SHELL_ACTION_IDS = ("Shell", "Shell Tool")
@@ -119,8 +120,11 @@ def _shell_spans_select_sql() -> str:
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
     COALESCE(
-      jsonPayload.action.action_run_id,
-      jsonPayload.context.agent_trace.span_id
+      NULLIF(jsonPayload.action.action_run_id, ''),
+      NULLIF(jsonPayload.context.agent_trace.span_id, ''),
+      -- Some eval spans omit both IDs. Count the observed span instead of
+      -- letting COUNT(DISTINCT NULL) turn a real execution into 0/0.
+      TO_JSON_STRING(jsonPayload)
     ) AS shell_execution_id,
     jsonPayload.context.eval.entry_uuid AS entry_uuid,
     CAST(jsonPayload.context.eval.entry_id AS STRING) AS entry_id,
@@ -129,6 +133,7 @@ def _shell_spans_select_sql() -> str:
     jsonPayload.context.agent_trace.trace_id AS trace_id,
     jsonPayload.span_info.session_info.session_tracking_token AS session_tracking_token,
     jsonPayload.context.agent_trace.span_id AS span_id,
+    NULLIF(jsonPayload.action.action_run_id, '') AS action_run_id,
     jsonPayload.span_info.span_name AS span_name,
     jsonPayload.action.action_id AS action_id,
     jsonPayload.action.execution_status AS action_status,
@@ -183,12 +188,54 @@ def build_shell_tool_error_per_entry_query(
     *,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     entry_ids: Sequence[str] | None = None,
+    include_error_examples: bool = True,
 ) -> str:
     """Build SQL for per-entry shell tool error metrics scoped to one eval run."""
     entry_filter = ""
     if entry_ids:
         entry_filter = "AND COALESCE(entry_id, entry_uuid) IN UNNEST(@entry_ids)"
     shell_spans = _shell_spans_select_sql().format(agentspan_table=agentspan_table)
+    error_detail_columns = """
+    , ARRAY_AGG(
+      IF(
+        is_error,
+        STRUCT(
+          TIMESTAMP_MILLIS(start_ms) AS started_at,
+          project_id,
+          entry_key AS entry_id,
+          eval_id,
+          run_id,
+          trace_id,
+          session_tracking_token,
+          span_id,
+          span_name,
+          action_id,
+          action_run_id,
+          action_status,
+          span_status,
+          provider_status,
+          output_status_code,
+          error_str
+        ),
+        NULL
+      )
+      IGNORE NULLS
+      ORDER BY start_ms DESC
+      LIMIT 10
+    ) AS recent_error_examples,
+    ARRAY_AGG(
+      IF(is_error, trace_id, NULL)
+      IGNORE NULLS
+      ORDER BY start_ms DESC
+      LIMIT 10
+    ) AS trace_ids,
+    ARRAY_AGG(
+      IF(is_error, session_tracking_token, NULL)
+      IGNORE NULLS
+      ORDER BY start_ms DESC
+      LIMIT 10
+    ) AS session_tracking_tokens
+""" if include_error_examples else ""
     return f"""
 WITH shell_spans AS (
 {shell_spans}
@@ -224,46 +271,7 @@ per_entry AS (
         COUNT(DISTINCT shell_execution_id)
       ),
       2
-    ) AS shell_error_pct,
-    ARRAY_AGG(
-      IF(
-        is_error,
-        STRUCT(
-          TIMESTAMP_MILLIS(start_ms) AS started_at,
-          project_id,
-          entry_key AS entry_id,
-          eval_id,
-          run_id,
-          trace_id,
-          session_tracking_token,
-          span_id,
-          span_name,
-          action_id,
-          shell_execution_id AS action_run_id,
-          action_status,
-          span_status,
-          provider_status,
-          output_status_code,
-          error_str
-        ),
-        NULL
-      )
-      IGNORE NULLS
-      ORDER BY start_ms DESC
-      LIMIT 10
-    ) AS recent_error_examples,
-    ARRAY_AGG(
-      IF(is_error, trace_id, NULL)
-      IGNORE NULLS
-      ORDER BY start_ms DESC
-      LIMIT 10
-    ) AS trace_ids,
-    ARRAY_AGG(
-      IF(is_error, session_tracking_token, NULL)
-      IGNORE NULLS
-      ORDER BY start_ms DESC
-      LIMIT 10
-    ) AS session_tracking_tokens
+    ) AS shell_error_pct{error_detail_columns}
   FROM classified
   GROUP BY entry_key
 )
@@ -321,7 +329,7 @@ SELECT
         span_id,
         span_name,
         action_id,
-        shell_execution_id AS action_run_id,
+        action_run_id,
         action_status,
         span_status,
         provider_status,
@@ -342,29 +350,39 @@ GROUP BY eval_id
 def build_high_signal_source_entries_query(
     *,
     evalset_entries_table: str = DEFAULT_EVALSET_ENTRIES_TABLE,
+    eval_workflow_runs_table: str = DEFAULT_EVAL_WORKFLOW_RUNS_TABLE,
     deployment_ids: Sequence[str] | None = None,
 ) -> str:
-    """Resolve source eval-set entries by session tracking token."""
+    """Resolve source evalset rows from an eval run's trace-side entry UUIDs."""
     deployment_filter = ""
     if deployment_ids:
         deployment_filter = "AND project_id IN UNNEST(@deployment_ids)"
     return f"""
+WITH runtime_entries AS (
+  SELECT
+    entry_uuid,
+    ARRAY_AGG(stt IGNORE NULLS ORDER BY workflow_start_timestamp DESC LIMIT 1)[SAFE_OFFSET(0)] AS stt
+  FROM `{eval_workflow_runs_table}`
+  WHERE eval_id = @eval_run_id
+    AND entry_uuid IN UNNEST(@entry_uuids)
+  GROUP BY entry_uuid
+)
 SELECT
-  entry_id AS id,
-  project_id AS deploymentId,
-  stt,
-  workflow_run_id AS runId,
-  query_ts,
-  datepartition AS source_date
-FROM `{evalset_entries_table}`
-WHERE eval_set_name = @eval_set_name
-  AND eval_set_version = @eval_set_version
-  AND stt IN UNNEST(@session_tracking_tokens)
+  runtime_entries.entry_uuid AS id,
+  evalset_entries.project_id AS deploymentId,
+  evalset_entries.stt,
+  evalset_entries.workflow_run_id AS runId,
+  evalset_entries.query_ts,
+  evalset_entries.datepartition AS source_date
+FROM runtime_entries
+JOIN `{evalset_entries_table}` AS evalset_entries USING (stt)
+WHERE evalset_entries.eval_set_name = @eval_set_name
+  AND evalset_entries.eval_set_version = @eval_set_version
   AND LENGTH(stt) > 0
-  AND LENGTH(workflow_run_id) > 0
+  AND LENGTH(evalset_entries.workflow_run_id) > 0
   {deployment_filter}
-QUALIFY ROW_NUMBER() OVER (PARTITION BY stt ORDER BY log_ts DESC) = 1
-ORDER BY stt
+QUALIFY ROW_NUMBER() OVER (PARTITION BY runtime_entries.entry_uuid ORDER BY evalset_entries.log_ts DESC) = 1
+ORDER BY id
 """.strip()
 
 
@@ -413,25 +431,29 @@ def fetch_high_signal_evalset_entries(
     *,
     eval_set_name: str,
     eval_set_version: str,
-    session_tracking_tokens: Sequence[str],
+    eval_run_id: str,
+    entry_ids: Sequence[str],
     deployment_ids: Sequence[str] | None = None,
     evalset_entries_table: str = DEFAULT_EVALSET_ENTRIES_TABLE,
+    eval_workflow_runs_table: str = DEFAULT_EVAL_WORKFLOW_RUNS_TABLE,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> list[dict[str, Any]]:
-    """Fetch upload-ready high-signal entries with their historical trace IDs."""
-    tokens = sorted(set(session_tracking_tokens))
-    if not tokens:
+    """Fetch upload-ready source entries from the parent eval's trace-side entry UUIDs."""
+    entry_uuids = sorted(set(entry_ids))
+    if not entry_uuids:
         return []
     params = [
         QueryParameter("eval_set_name", "STRING", eval_set_name),
         QueryParameter("eval_set_version", "STRING", eval_set_version),
-        QueryParameter("session_tracking_tokens", "STRING", tokens),
+        QueryParameter("eval_run_id", "STRING", eval_run_id),
+        QueryParameter("entry_uuids", "STRING", entry_uuids),
     ]
     if deployment_ids:
         params.append(QueryParameter("deployment_ids", "STRING", list(deployment_ids)))
     source_rows = client.query(
         build_high_signal_source_entries_query(
             evalset_entries_table=evalset_entries_table,
+            eval_workflow_runs_table=eval_workflow_runs_table,
             deployment_ids=deployment_ids,
         ),
         params=params,
@@ -548,8 +570,11 @@ def resolve_eval_run_date_range(
     if min_ms is None or max_ms is None:
         return None
 
-    min_date = date.fromtimestamp(int(min_ms) / 1000)
-    max_date = date.fromtimestamp(int(max_ms) / 1000)
+    # `_TABLE_SUFFIX` is a UTC date. Convert the bounds in UTC too; using the
+    # host timezone can shift a just-after-midnight span into the prior day,
+    # causing the aggregate query to scan a different shard and return 0/0.
+    min_date = datetime.fromtimestamp(int(min_ms) / 1000, tz=timezone.utc).date()
+    max_date = datetime.fromtimestamp(int(max_ms) / 1000, tz=timezone.utc).date()
     search_end = end_date or date.today()
     search_start = search_end - timedelta(days=lookback_days)
     start_date = max(min_date, search_start)
@@ -665,6 +690,7 @@ def fetch_eval_run_shell_tool_error_analysis(
     lookback_days: int = 7,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+    include_error_examples: bool = True,
 ) -> EvalRunShellToolErrorAnalysis:
     bounds_rows = client.query(
         build_eval_run_time_bounds_query(agentspan_table=agentspan_table),
@@ -691,8 +717,24 @@ def fetch_eval_run_shell_tool_error_analysis(
         )
 
     start_date, resolved_end = date_range
+    # Aggregate counts must cover every matching shell span. Per-entry metrics
+    # deliberately require eval-entry attribution and therefore omit spans that
+    # lack an entry id/uuid; using them as the aggregate made those omitted
+    # spans look like a perfect 0/0 run.
+    aggregate_rows = client.query(
+        build_shell_tool_error_rate_query(agentspan_table=agentspan_table),
+        params=build_shell_tool_error_query_params(
+            eval_id=eval_id,
+            start_date=start_date,
+            end_date=resolved_end,
+        ),
+    )
+    aggregate = parse_shell_tool_error_metrics(aggregate_rows[0]) if aggregate_rows else empty_shell_tool_error_metrics(eval_id)
     per_entry_rows = client.query(
-        build_shell_tool_error_per_entry_query(agentspan_table=agentspan_table),
+        build_shell_tool_error_per_entry_query(
+            agentspan_table=agentspan_table,
+            include_error_examples=include_error_examples,
+        ),
         params=build_shell_tool_error_query_params(
             eval_id=eval_id,
             start_date=start_date,
@@ -705,7 +747,6 @@ def fetch_eval_run_shell_tool_error_analysis(
         for metrics in [parse_shell_tool_error_entry_metrics(row)]
         if metrics.entry_id
     }
-    aggregate = aggregate_entry_metrics(eval_id, per_entry)
     return EvalRunShellToolErrorAnalysis(
         eval_id=eval_id,
         start_date=start_date,
