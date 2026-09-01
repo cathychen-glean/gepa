@@ -23,7 +23,7 @@ from glean_gepa.al_adapter import (
     get_tool_alignment_from_traces,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.prompt import compile_encoded_prompt
+from glean_gepa.prompt import WRITING_CODE_KEY, compile_encoded_prompt
 
 PRIMARY_OBJECTIVE = "correctness"
 
@@ -39,6 +39,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         student_model: str,
         *,
         judge: Judge | None = None,
+        editable_modules: list[str] | None = None,
         cache_file: str | None = None,
     ):
         if judge is None:
@@ -57,6 +58,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             failure_label="HIGH-SIGNAL FAILURES (teacher vs student)",
             primary_objective=PRIMARY_OBJECTIVE,
             default_frontier_type="hybrid",
+            editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
             cache_file=cache_file,
         )
 

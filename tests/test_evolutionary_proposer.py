@@ -14,6 +14,7 @@ class _ReflectionAdapter:
     def __init__(self, variants: list[str] | None = None) -> None:
         self.reflection_calls = 0
         self.variants = variants if variants is not None else ["cached rewrite 1", "cached rewrite 2"]
+        self.editable_modules = ["WRITING_CODE"]
 
     def get_screening_score(self, _eval: object) -> float:
         return 1.0

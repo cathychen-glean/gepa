@@ -919,6 +919,7 @@ class Thresholds:
 
 class GleanAdapterBase:
     supports_high_signal_eval = False
+
     def __init__(
         self,
         runner: ALRunner,
@@ -933,6 +934,7 @@ class GleanAdapterBase:
         failure_label: str,
         primary_objective: str,
         default_frontier_type: str,
+        editable_modules: list[str],
         cache_file: str | None = None,
     ):
         self.runner = runner
@@ -940,6 +942,7 @@ class GleanAdapterBase:
         self.student_model = student_model
         self.primary_objective = primary_objective
         self.default_frontier_type = default_frontier_type
+        self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
         self._cache_lock = threading.RLock()
         self._evaluate_fn = evaluate_fn
@@ -1104,13 +1107,9 @@ class GleanAdapterBase:
         """Prepare a high-signal batch once before its child candidates are screened."""
         return batch
 
-    def attach_cached_eval_run_ids(
-        self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]
-    ) -> list[ALDataInst]:
+    def attach_cached_eval_run_ids(self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]) -> list[ALDataInst]:
         """Attach persisted eval IDs to matching eval-set items for reuse."""
-        cached_by_eval_set = {
-            (record["eval_set_name"], record["eval_set_version"]): record for record in eval_run_ids
-        }
+        cached_by_eval_set = {(record["eval_set_name"], record["eval_set_version"]): record for record in eval_run_ids}
         attached: list[ALDataInst] = []
         for data in batch:
             record = cached_by_eval_set.get((data["eval_set_name"], data["eval_set_version"]))
@@ -1154,9 +1153,7 @@ class GleanAdapterBase:
             for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items()
         ]
 
-    def high_signal_fix_rate(
-        self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch
-    ) -> float:
+    def high_signal_fix_rate(self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch) -> float:
         """Fraction of focused entries that are error-free for the child."""
         parent_failure_count = sum(1 for trajectory in parent_eval.trajectories or [] if trajectory["score"] < 1.0)
         if not parent_failure_count:

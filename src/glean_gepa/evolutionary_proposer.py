@@ -22,7 +22,6 @@ from gepa.logging.logger import LoggerProtocol
 from gepa.proposer.base import CandidateProposal
 from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.al_adapter import (
-    MODULES,
     Candidate,
     GleanAdapterBase,
     ModuleSpec,
@@ -30,7 +29,7 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
-from glean_gepa.prompt import WRITING_CODE_KEY, default_writing_code
+from glean_gepa.prompt import PROMPT_MODULE_DEFAULTS
 from glean_gepa.utils import apply_single_module_edit
 
 CHILDREN_CACHE_SCHEMA_VERSION = 4
@@ -47,8 +46,8 @@ class ChildCacheRecord:
 
 
 # TODO(Cathy): pick modules based on holistic performance of the eval
-def pick_modules_to_edit() -> list[str]:
-    return list(MODULES)
+def pick_modules_to_edit(adapter: GleanAdapterBase) -> list[str]:
+    return list(adapter.editable_modules)
 
 
 def _format_child_delta(parent: Candidate, child: Candidate, module: str) -> str:
@@ -142,7 +141,7 @@ def make_children_for_generation(
         # calling the reflector so an empty/invalid response is cached too.
         cached_children = children_by_root.setdefault(parent.candidate_id, []) if children_by_root is not None else None
 
-        modules_to_edit = pick_modules_to_edit()
+        modules_to_edit = pick_modules_to_edit(adapter)
 
         high_signal = adapter.make_reflective_dataset(
             candidate=parent,
@@ -484,8 +483,10 @@ class EvolutionaryProposer:
         return GleanEvaluationBatch(outputs=[], scores=[], trajectories=None, summary={objective: screening_score})
 
     def _to_candidate(self, program: dict[str, str], parent_id: str | None = None) -> Candidate:
-        """Convert a GEPA program to the sole editable Glean prompt module."""
-        prompt_modules = {WRITING_CODE_KEY: program.get(WRITING_CODE_KEY, default_writing_code)}
+        """Convert a GEPA program into adapter-editable Glean prompt modules."""
+        prompt_modules = dict(program)
+        for key in self.al_adapter.editable_modules:
+            prompt_modules.setdefault(key, PROMPT_MODULE_DEFAULTS[key])
         content = json.dumps(prompt_modules, sort_keys=True)
         cand_id = hashlib.md5(content.encode()).hexdigest()[:10]
         return Candidate(
