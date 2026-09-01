@@ -20,7 +20,13 @@ from glean_gepa.adapter_types import (
     ALTrajectory,
 )
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.evalcli_client import EvalCliClient
+from glean_gepa.evalcli_client import (
+    CORRECTNESS_INPUT_MAPPINGS,
+    CORRECTNESS_JUDGE_TYPE,
+    CORRECTNESS_RUN_PARAMS,
+    EvalCliClient,
+)
+from glean_gepa.focused_evalset import prepare_high_signal_eval_batch
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.shell_tool_error_util import (
     EvalRunShellToolErrorAnalysis,
@@ -127,7 +133,7 @@ class ModuleSpec:
 @dataclass
 class Candidate:
     model: str  # "claude" | "gemini" etc
-    prompt_modules: dict[str, str]  # Single editable key: {"WRITING_CODE": "..."}
+    prompt_modules: dict[str, str]  # Editable keys, e.g. {"FULL_PROMPT": "..."}
     module_specs: dict[str, ModuleSpec]
     global_token_cap: int  # relative to baseline prompt for that model
     baseline_prompt_hash: str  # used to define "relative cap"
@@ -222,6 +228,8 @@ class ReflectiveExampleMetrics(TypedDict):
     score: float
     shell_success_rate: NotRequired[float]
     correctness: NotRequired[float]
+    completeness: NotRequired[float]
+    tool_alignment: NotRequired[float]
 
 
 # TypedDict with keys containing spaces must use functional form
@@ -263,6 +271,9 @@ class ALRunner:
     Triggers eval runs and manages eval run IDs for the judge.
 
     Uses evalcli to create eval runs and poll until completion.
+    `start` submits a run without waiting so teacher and student can overlap;
+    `wait` polls until that run finishes. `run` is start-then-wait for callers
+    that need a completed eval before continuing.
     All execution data (answers, tool events, tokens, etc.) is retrieved later by the Judge
     via evalcli analyze commands.
     """
@@ -279,6 +290,8 @@ class ALRunner:
 
         # Track eval run IDs: cache_key -> eval_run_id
         self._eval_run_ids: dict[tuple[str, str, str, str, str], str] = {}
+        # Started-but-not-yet-complete runs: eval_run_id -> cache_key
+        self._in_flight: dict[str, tuple[str, str, str, str, str]] = {}
 
         # Load cached eval run IDs if cache file exists
         if self.cache_file:
@@ -343,7 +356,7 @@ class ALRunner:
 
         return ",".join(base_params)
 
-    def run(
+    def start(
         self,
         model: str,
         system_prompt: str,
@@ -351,31 +364,35 @@ class ALRunner:
         eval_set_version: str,
         deployment_ids: list[str],
         run_label: str = "gepa",
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
-        Trigger an eval run and return the eval_run_id.
-
-        Args:
-            model: "claude" or "gpt"
-            system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
-            eval_set_name: Name of the eval set
-            eval_set_version: Version of the eval set
-            deployment_ids: List of deployment IDs to use
-            run_label: Prefix for eval run id / cache key (e.g. gepa vs verify_<hash>)
+        Create an eval run without waiting for it to finish.
 
         Returns:
-            eval_run_id string
+            (eval_run_id, wait_required). wait_required is False when a completed
+            run was already cached.
         """
-        system_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-        cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
+        cache_key = (
+            model,
+            hashlib.md5(system_prompt.encode()).hexdigest()[:16],
+            eval_set_name,
+            eval_set_version,
+            run_label,
+        )
+        cached = self._eval_run_ids.get(cache_key)
+        if cached:
+            return cached, False
+        in_flight_id = next(
+            (eval_id for eval_id, inflight_key in self._in_flight.items() if inflight_key == cache_key),
+            None,
+        )
+        if in_flight_id:
+            return in_flight_id, True
 
-        if cache_key in self._eval_run_ids:
-            return self._eval_run_ids[cache_key]
-
-        eval_id = f"{run_label}_{model}_{system_prompt_hash}_{int(time.time())}"
-
+        id_token = hashlib.md5("|".join(cache_key).encode()).hexdigest()[:16]
+        eval_id = f"{run_label}_{model}_{id_token}_{int(time.time())}"
         sc_params = self._build_sc_params(model, system_prompt)
-        eval_params = "experimental_queue=temp-system-prompt-optimization"
+        eval_params = "experimental_queue=eval-experimental-2"
         if model == "fast":
             eval_params += ",gleanchat_agent=FAST"
         else:
@@ -391,26 +408,60 @@ class ALRunner:
             sc_params=sc_params,
             eval_params=eval_params,
         )
-        self.evalcli.wait_for_eval_run(created_id)
-        print(f"Eval run {created_id} completed successfully")
+        self._in_flight[created_id] = cache_key
+        return created_id, True
 
-        self._eval_run_ids[cache_key] = created_id
-        self._save_cache()
+    def wait(self, eval_run_id: str) -> None:
+        """Wait for a started eval run and record it in the completed-run cache."""
+        cache_key = self._in_flight.get(eval_run_id)
+        if cache_key is not None and cache_key in self._eval_run_ids:
+            self._in_flight.pop(eval_run_id, None)
+            return
+        if eval_run_id in self._eval_run_ids.values():
+            self._in_flight.pop(eval_run_id, None)
+            return
 
-        return created_id
+        self.evalcli.wait_for_eval_run(eval_run_id)
+        print(f"Eval run {eval_run_id} completed successfully")
+        if cache_key is not None:
+            self._eval_run_ids[cache_key] = eval_run_id
+            self._save_cache()
+            self._in_flight.pop(eval_run_id, None)
 
-    def get_eval_run_id(
+    def run(
         self,
         model: str,
         system_prompt: str,
         eval_set_name: str,
         eval_set_version: str,
+        deployment_ids: list[str],
         run_label: str = "gepa",
-    ) -> str | None:
-        """Get the eval run ID for a given cache key."""
-        system_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-        cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
-        return self._eval_run_ids.get(cache_key)
+    ) -> str:
+        """
+        Trigger an eval run, wait for completion, and return the eval_run_id.
+
+        Args:
+            model: "claude" or "gpt"
+            system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
+            eval_set_name: Name of the eval set
+            eval_set_version: Version of the eval set
+            deployment_ids: List of deployment IDs to use
+            run_label: Prefix for eval run id / cache key (e.g. gepa vs verify_<hash>)
+
+        Returns:
+            eval_run_id string
+        """
+        eval_id, wait_required = self.start(
+            model,
+            system_prompt,
+            eval_set_name,
+            eval_set_version,
+            deployment_ids,
+            run_label=run_label,
+        )
+        if wait_required:
+            self.wait(eval_id)
+        return eval_id
 
 
 class Judge:
@@ -450,8 +501,11 @@ class Judge:
         if not skip_trigger:
             print(f"Triggering judge run for {teacher_eval_id} vs {student_eval_id}...")
             judge_run_id = self.evalcli.create_judge_run(
-                student_eval_id=student_eval_id,
-                teacher_eval_id=teacher_eval_id,
+                eval_run_id=student_eval_id,
+                judge_type=CORRECTNESS_JUDGE_TYPE,
+                run_params=CORRECTNESS_RUN_PARAMS,
+                base_eval_run_id=teacher_eval_id,
+                input_mappings=CORRECTNESS_INPUT_MAPPINGS,
             )
             self.evalcli.wait_for_judge_run(judge_run_id)
         else:
@@ -891,6 +945,7 @@ class GleanAdapterBase:
         failure_label: str,
         primary_objective: str,
         default_frontier_type: str,
+        editable_modules: list[str],
         cache_file: str | None = None,
     ):
         self.runner = runner
@@ -898,6 +953,7 @@ class GleanAdapterBase:
         self.student_model = student_model
         self.primary_objective = primary_objective
         self.default_frontier_type = default_frontier_type
+        self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
         self._evaluate_fn = evaluate_fn
         self._failure_pattern_fn = failure_pattern_fn
@@ -917,6 +973,9 @@ class GleanAdapterBase:
 
         # Eval ID cache: (eval_set_name, eval_set_version, model, prompt_hash) -> eval_id
         self._eval_cache: dict[tuple[str, ...], str] = {}
+        # Launched-but-not-yet-complete runs. Survives process restart so a
+        # timeout can resume polling instead of creating a duplicate eval.
+        self._in_flight_eval_cache: dict[tuple[str, ...], str] = {}
 
         # These caches are keyed by the immutable eval run ID so they remain useful
         # when the prompt/eval cache is loaded in a later process.
@@ -944,20 +1003,29 @@ class GleanAdapterBase:
                     # Load eval cache
                     eval_cache_data = data.get("eval_cache", {})
                     self._eval_cache = {tuple(json.loads(k)): v for k, v in eval_cache_data.items()}
+                    in_flight_data = data.get("in_flight_eval_cache", {})
+                    self._in_flight_eval_cache = {}
+                    for raw_key, eval_id in in_flight_data.items():
+                        cache_key = tuple(json.loads(raw_key))
+                        if cache_key not in self._eval_cache:
+                            self._in_flight_eval_cache[cache_key] = eval_id
 
                     # Load judge triggered cache
                     judge_triggered_data = data.get("judge_triggered", [])
                     self._judge_triggered = {tuple(item) for item in judge_triggered_data}
 
                     self._load_eval_analysis_cache(data.get("eval_analysis_cache", {}))
+                    self._load_extra_cache(data)
                     print(
                         f"[GleanAdapter] Loaded {len(self._eval_cache)} eval IDs, "
+                        f"{len(self._in_flight_eval_cache)} in-flight eval IDs, "
                         f"{len(self._eval_analysis_cache)} error analyses, and "
                         f"{len(self._judge_triggered)} judge triggers from cache: {self.cache_file}"
                     )
         except Exception as e:
             print(f"[GleanAdapter] Failed to load cache from {self.cache_file}: {e}")
             self._eval_cache = {}
+            self._in_flight_eval_cache = {}
             self._judge_triggered = set()
             self._eval_analysis_cache = {}
 
@@ -977,22 +1045,31 @@ class GleanAdapterBase:
             # Build cache data structure
             data = {
                 "eval_cache": {json.dumps(list(k)): v for k, v in self._eval_cache.items()},
+                "in_flight_eval_cache": {json.dumps(list(k)): v for k, v in self._in_flight_eval_cache.items()},
                 "judge_triggered": [list(pair) for pair in self._judge_triggered],
                 "eval_analysis_cache": {
                     eval_id: self._serialize_eval_analysis(analysis)
                     for eval_id, analysis in self._eval_analysis_cache.items()
                 },
             }
+            data.update(self._extra_cache_payload())
 
             with open(self.cache_file, "w") as f:
                 json.dump(data, f, indent=2)
             print(
                 f"[GleanAdapter] Saved {len(self._eval_cache)} eval IDs, "
+                f"{len(self._in_flight_eval_cache)} in-flight eval IDs, "
                 f"{len(self._eval_analysis_cache)} error analyses, and "
                 f"{len(self._judge_triggered)} judge triggers to cache: {self.cache_file}"
             )
         except Exception as e:
             print(f"[GleanAdapter] Failed to save cache to {self.cache_file}: {e}")
+
+    def _extra_cache_payload(self) -> dict[str, Any]:
+        return {}
+
+    def _load_extra_cache(self, data: dict[str, Any]) -> None:
+        return None
 
     @staticmethod
     def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
@@ -1074,9 +1151,21 @@ class GleanAdapterBase:
             ]
             return [future.result() for future in futures]
 
+    def evaluate_many(
+        self,
+        batch: list[ALDataInst],
+        candidates: list[dict[str, str]],
+        capture_traces: bool = False,
+    ) -> list[GleanEvaluationBatch]:
+        """Evaluate many candidates on the same batch. Override to overlap eval runs."""
+        return [self.evaluate(batch, candidate, capture_traces) for candidate in candidates]
+
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Prepare a high-signal batch once before its child candidates are screened."""
-        return batch
+        """Upload/reuse focused eval sets once before concurrent child screening."""
+        evalcli = getattr(getattr(self, "runner", None), "evalcli", None)
+        if evalcli is None:
+            return batch
+        return prepare_high_signal_eval_batch(evalcli, batch)
 
     def get_screening_score(self, eval_batch: GleanEvaluationBatch) -> float:
         """Return the objective selected by the concrete adapter for screening."""
@@ -1126,6 +1215,25 @@ class GleanAdapterBase:
         fixed_count = sum(1 for trajectory in child_trajectories if trajectory["score"] >= 1.0)
         return fixed_count / len(child_trajectories)
 
+    def _lookup_eval_id(self, cache_key: tuple[str, ...]) -> tuple[str, bool] | None:
+        """Return (eval_id, wait_required) for a completed or in-flight cached run."""
+        eval_id = self._eval_cache.get(cache_key)
+        if eval_id:
+            return eval_id, False
+        eval_id = self._in_flight_eval_cache.get(cache_key)
+        if eval_id:
+            return eval_id, True
+        return None
+
+    def _record_eval_id(self, cache_key: tuple[str, ...], eval_id: str, *, completed: bool) -> None:
+        """Persist a launched run immediately, then promote it once wait succeeds."""
+        if completed:
+            self._eval_cache[cache_key] = eval_id
+            self._in_flight_eval_cache.pop(cache_key, None)
+        elif cache_key not in self._eval_cache:
+            self._in_flight_eval_cache[cache_key] = eval_id
+        self._save_cache()
+
     def _get_or_run_student_eval(
         self,
         *,
@@ -1144,12 +1252,18 @@ class GleanAdapterBase:
             run_label,
         )
 
-        student_eval_id = self._eval_cache.get(student_cache_key)
-        if student_eval_id:
-            print(f"[Cache HIT] Using cached student eval_id: {student_eval_id} ({run_label})")
+        cached = self._lookup_eval_id(student_cache_key)
+        if cached is not None:
+            student_eval_id, wait_required = cached
+            if wait_required:
+                print(f"[Soft cache HIT] Waiting for student eval_id: {student_eval_id} ({run_label})")
+                self.runner.wait(student_eval_id)
+                self._record_eval_id(student_cache_key, student_eval_id, completed=True)
+            else:
+                print(f"[Cache HIT] Using cached student eval_id: {student_eval_id} ({run_label})")
             return student_eval_id
 
-        student_eval_id = self.runner.run(
+        student_eval_id, wait_required = self.runner.start(
             self.student_model,
             system_prompt=system_prompt,
             eval_set_name=eval_set_name,
@@ -1157,9 +1271,12 @@ class GleanAdapterBase:
             deployment_ids=deployment_ids,
             run_label=run_label,
         )
-        self._eval_cache[student_cache_key] = student_eval_id
-        self._save_cache()
-        print(f"[Cache MISS] Started and cached student eval_id: {student_eval_id} ({run_label})")
+        self._record_eval_id(student_cache_key, student_eval_id, completed=not wait_required)
+        if wait_required:
+            print(f"[Cache MISS] Started student eval_id: {student_eval_id} ({run_label})")
+            self.runner.wait(student_eval_id)
+            self._record_eval_id(student_cache_key, student_eval_id, completed=True)
+        print(f"[Cache MISS] Cached student eval_id: {student_eval_id} ({run_label})")
         return student_eval_id
 
     # ---------------------------
@@ -1260,8 +1377,8 @@ class GleanAdapterBase:
         max_variants: int = 3,
     ) -> tuple[list[str], bool]:
         """
-        Returns (new_module_texts, module_marked_irrelevant). The sole
-        WRITING_CODE module is always relevant, so the second value is False.
+        Returns (new_module_texts, module_marked_irrelevant). Editable
+        modules are always treated as relevant, so the second value is False.
         Must:
           1) merge reflections across examples
           2) diagnose recurring failure modes tied to module

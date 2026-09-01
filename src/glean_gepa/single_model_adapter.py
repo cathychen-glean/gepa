@@ -21,8 +21,8 @@ from glean_gepa.al_adapter import (
     log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.focused_evalset import ensure_focused_eval_set
-from glean_gepa.prompt import compile_encoded_prompt
+from glean_gepa.focused_evalset import resolve_eval_run_target
+from glean_gepa.prompt import WRITING_CODE_KEY, compile_encoded_prompt
 from glean_gepa.reflection_sampling import strip_stdout_sections
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
@@ -36,34 +36,6 @@ class SingleModelAdapter(GleanAdapterBase):
 
     supports_high_signal_eval = True
 
-    def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Upload/reuse focused eval sets once, before concurrent child screening."""
-        prepared: list[ALDataInst] = []
-        for data in batch:
-            entry_ids = data.get("eval_entry_ids")
-            if not entry_ids:
-                prepared.append(data)
-                continue
-            focused = ensure_focused_eval_set(
-                self.runner.evalcli,
-                base_eval_set_name=data["eval_set_name"],
-                base_eval_set_version=data["eval_set_version"],
-                deployment_ids=data["deployment_ids"],
-                entry_ids=entry_ids,
-            )
-            if focused is None:
-                return None
-            prepared.append(
-                {
-                    **data,
-                    "eval_set_name": focused.name,
-                    "eval_set_version": focused.version,
-                    "focused_eval_set_name": focused.name,
-                    "focused_eval_set_version": focused.version,
-                }
-            )
-        return prepared
-
     def __init__(
         self,
         runner: ALRunner,
@@ -71,13 +43,14 @@ class SingleModelAdapter(GleanAdapterBase):
         student_model: str,
         *,
         bigquery_client: Any | None = None,
-        shell_error_lookback_days: int = 7,
+        agentspan_lookback_days: int = 1,
+        editable_modules: list[str] | None = None,
         cache_file: str | None = None,
     ):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
         self.bigquery_client = bigquery_client
-        self.shell_error_lookback_days = shell_error_lookback_days
+        self.agentspan_lookback_days = agentspan_lookback_days
         super().__init__(
             runner=runner,
             thresholds=thresholds,
@@ -90,6 +63,7 @@ class SingleModelAdapter(GleanAdapterBase):
             failure_label="HIGH-SIGNAL FAILURES",
             primary_objective=SHELL_SUCCESS_OBJECTIVE,
             default_frontier_type="objective",
+            editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
             cache_file=cache_file,
         )
 
@@ -103,7 +77,7 @@ class SingleModelAdapter(GleanAdapterBase):
         analysis = fetch_eval_run_shell_tool_error_analysis(
             self.bigquery_client,
             eval_id=eval_id,
-            lookback_days=self.shell_error_lookback_days,
+            lookback_days=self.agentspan_lookback_days,
             include_error_examples=include_error_examples,
         )
         if include_error_examples:
@@ -226,36 +200,18 @@ class SingleModelAdapter(GleanAdapterBase):
         total_high_signal_entries = 0
 
         for al_data_inst in batch:
-            base_eval_set_version = al_data_inst.get("eval_set_version", "")
-            base_eval_set_name = al_data_inst.get("eval_set_name", "")
             deployment_ids = al_data_inst.get("deployment_ids", [])
             requested_entry_ids = al_data_inst.get("eval_entry_ids")
-            eval_set_name = base_eval_set_name
-            eval_set_version = base_eval_set_version
-            run_label = "gepa"
-
-            if requested_entry_ids:
-                focused_eval_set_name = al_data_inst.get("focused_eval_set_name")
-                focused_eval_set_version = al_data_inst.get("focused_eval_set_version")
-                if focused_eval_set_name and focused_eval_set_version:
-                    eval_set_name = focused_eval_set_name
-                    eval_set_version = focused_eval_set_version
-                else:
-                    focused_eval_set = ensure_focused_eval_set(
-                        self.runner.evalcli,
-                        base_eval_set_name=base_eval_set_name,
-                        base_eval_set_version=base_eval_set_version,
-                        deployment_ids=deployment_ids,
-                        entry_ids=requested_entry_ids,
-                    )
-                    if focused_eval_set is None:
-                        # Do not fall back to the full eval set: a failed focused
-                        # setup must not let a candidate bypass the gate.
-                        summary_shell_rates.append(0.0)
-                        continue
-                    eval_set_name = focused_eval_set.name
-                    eval_set_version = focused_eval_set.version
-                run_label = "gepa_high_signal"
+            target = resolve_eval_run_target(self.runner.evalcli, al_data_inst)
+            if target is None:
+                # Do not fall back to the full eval set: a failed focused
+                # setup must not let a candidate bypass the gate.
+                summary_shell_rates.append(0.0)
+                continue
+            eval_set_name = target.eval_set_name
+            eval_set_version = target.eval_set_version
+            run_label = target.run_label
+            is_focused_eval = target.is_focused
 
             student_eval_id = self._get_or_run_student_eval(
                 eval_set_name=eval_set_name,
@@ -265,7 +221,6 @@ class SingleModelAdapter(GleanAdapterBase):
                 run_label=run_label,
             )
 
-            is_focused_eval = bool(requested_entry_ids)
             analysis = self._get_or_fetch_shell_error_analysis(
                 student_eval_id,
                 include_error_examples=not is_focused_eval,

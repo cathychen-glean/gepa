@@ -31,9 +31,12 @@ CORRECTNESS_INPUT_MAPPINGS = json.dumps(
     ]
 )
 
+CORRECTNESS_JUDGE_TYPE = "CORRECTNESS"
 CORRECTNESS_RUN_PARAMS = json.dumps(
     {"Judge Type": "DIRECT_CORRECTNESS", "Llm model": "default", "Use Cache": "true"}
 )
+COMPLETENESS_JUDGE_TYPE = "COMPLETENESS"
+COMPLETENESS_RUN_PARAMS = json.dumps({"Llm model": "default", "Use Cache": "true"})
 
 TERMINAL_JUDGE_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
@@ -52,6 +55,7 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "API request failed: 504",
     "Connection refused",
     "Connection reset",
+    "__Host-GCP_IAP_AUTH_TOKEN_",
 )
 
 
@@ -188,32 +192,53 @@ class EvalCliClient:
         eval_run_id: str,
         *,
         poll_interval_sec: int = 60,
-        timeout_sec: int = 7200,
+        timeout_sec: int = 14400,
     ) -> None:
         print(f"Waiting for eval run {eval_run_id} to complete...")
         elapsed = 0
+        last_status: Any = None
         while elapsed < timeout_sec:
             try:
                 statuses = self._invoke_json("run", "status", "--id", eval_run_id)
             except EvalCliError as exc:
                 if not _is_transient_evalcli_error(exc):
                     raise
-                print(
-                    f"Transient Cortex error while polling {eval_run_id}; "
-                    f"retrying in {poll_interval_sec}s..."
-                )
+                if "__Host-GCP_IAP_AUTH_TOKEN_" in str(exc):
+                    print(
+                        f"IAP cookie missing while polling {eval_run_id}. "
+                        "Open https://dev.glean.com/internal/evaltool/runs in Chrome, then waiting to retry..."
+                    )
+                else:
+                    print(
+                        f"Transient Cortex error while polling {eval_run_id}; "
+                        f"retrying in {poll_interval_sec}s..."
+                    )
                 time.sleep(poll_interval_sec)
                 elapsed += poll_interval_sec
                 continue
 
+            last_status = statuses
             if isinstance(statuses, list) and statuses and _is_eval_complete(statuses[0]):
                 print(f"Eval run {eval_run_id} completed successfully")
                 return
+            if isinstance(statuses, list) and statuses:
+                counts = statuses[0].get("taskCountsByStatus") or []
+                summary = ", ".join(
+                    f"{entry.get('status')}={entry.get('count')}"
+                    for entry in counts
+                    if (entry.get("count") or 0) > 0
+                )
+                print(
+                    f"Eval run {eval_run_id} still running after {elapsed}s"
+                    + (f" ({summary})" if summary else "")
+                )
 
             time.sleep(poll_interval_sec)
             elapsed += poll_interval_sec
 
-        raise EvalCliError(f"Eval run {eval_run_id} timed out after {timeout_sec}s")
+        raise EvalCliError(
+            f"Eval run {eval_run_id} timed out after {timeout_sec}s; last status: {last_status!r}"
+        )
 
     def get_eval_set_version(self, *, eval_set_name: str, eval_set_version: str) -> dict[str, Any] | None:
         """Return the eval set version, or None when it does not exist yet."""
@@ -230,31 +255,60 @@ class EvalCliClient:
             return None
         return result if isinstance(result, dict) else None
 
-    def list_eval_set_versions(self, *, eval_set_name: str, deployment_ids: list[str]) -> list[dict[str, Any]]:
-        """List the available versions of an eval set for the given deployments."""
-        result = self._invoke_json(
-            "evalsets",
-            "list",
-            "--name",
-            eval_set_name,
-            "--deployment-ids",
-            *deployment_ids,
-        )
-        if isinstance(result, list):
-            rows = result
-        elif isinstance(result, dict):
-            rows = (
-                result.get("evalSetVersions")
-                or result.get("versions")
-                or result.get("evalSets")
-                or result.get("items")
-                or []
+    def list_eval_set_versions(
+        self,
+        *,
+        eval_set_name: str,
+        deployment_ids: list[str],
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List versions of an eval set, optionally filtered to the given deployments."""
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            result = self._invoke_json(
+                "evalsets",
+                "versions",
+                "--name",
+                eval_set_name,
+                "--page",
+                str(page),
+                "--page-size",
+                str(page_size),
             )
-        else:
-            raise EvalCliError(f"Unexpected eval set versions response: {result!r}")
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            raise EvalCliError(f"Unexpected eval set versions response: {result!r}")
-        return rows
+            if isinstance(result, list):
+                batch = result
+            elif isinstance(result, dict):
+                batch = (
+                    result.get("evalSetVersions")
+                    or result.get("versions")
+                    or result.get("evalSets")
+                    or result.get("items")
+                    or []
+                )
+            else:
+                raise EvalCliError(f"Unexpected eval set versions response: {result!r}")
+            if not isinstance(batch, list) or not all(isinstance(row, dict) for row in batch):
+                raise EvalCliError(f"Unexpected eval set versions response: {result!r}")
+            rows.extend(batch)
+            total_pages = 1
+            if isinstance(result, dict):
+                total_pages = (result.get("pageInfo") or {}).get("totalPages") or 1
+            if not batch or page >= total_pages:
+                break
+            page += 1
+        if not deployment_ids:
+            return rows
+        wanted = set(deployment_ids)
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            available = row.get("availableDeploymentIds") or row.get("available_deployment_ids")
+            if not isinstance(available, list) or not available:
+                filtered.append(row)
+                continue
+            if wanted.intersection(available):
+                filtered.append(row)
+        return filtered
 
     def list_eval_set_entries(
         self,
@@ -339,32 +393,79 @@ class EvalCliClient:
             f"entries after {timeout_sec}s"
         )
 
-    def create_judge_run(self, *, student_eval_id: str, teacher_eval_id: str) -> str:
-        results = self._invoke_json(
-            "judge",
-            "create",
-            "--eval-run-id",
-            student_eval_id,
-            "--base-eval-run-id",
-            teacher_eval_id,
-            "--judge-type",
-            "CORRECTNESS",
-            "--run-params",
-            CORRECTNESS_RUN_PARAMS,
-            "--input-mappings",
-            CORRECTNESS_INPUT_MAPPINGS,
-        )
+    def _parse_judge_create_response(self, results: Any) -> str:
         if not results:
             raise EvalCliError("judge create returned empty response")
-
         judge_run = results[0] if isinstance(results, list) else results
         if not isinstance(judge_run, dict):
             raise EvalCliError(f"Unexpected judge create response: {judge_run!r}")
-
         judge_run_id = judge_run.get("id")
         if not judge_run_id:
             raise EvalCliError(f"judge create response missing id: {judge_run}")
         return str(judge_run_id)
+
+    def create_judge_run(
+        self,
+        *,
+        eval_run_id: str,
+        judge_type: str,
+        run_params: str,
+        base_eval_run_id: str | None = None,
+        input_mappings: str | None = None,
+    ) -> str:
+        cmd = [
+            "judge",
+            "create",
+            "--eval-run-id",
+            eval_run_id,
+            "--judge-type",
+            judge_type,
+            "--run-params",
+            run_params,
+        ]
+        if base_eval_run_id:
+            cmd.extend(["--base-eval-run-id", base_eval_run_id])
+        if input_mappings:
+            cmd.extend(["--input-mappings", input_mappings])
+        return self._parse_judge_create_response(self._invoke_json(*cmd))
+
+    def find_judge_run_id(self, eval_run_id: str, *, judge_type: str) -> str | None:
+        """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list)."""
+        wanted_type = judge_type.upper()
+        result = self._invoke_json(
+            "judge",
+            "list",
+            "--eval-run-ids",
+            eval_run_id,
+            "--judge-types",
+            wanted_type,
+        )
+        if isinstance(result, list):
+            rows = [row for row in result if isinstance(row, dict)]
+        elif isinstance(result, dict):
+            raw = result.get("judgeRuns") or result.get("runs") or result.get("items") or []
+            rows = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+        else:
+            rows = []
+        for row in rows:
+            config = row.get("config") if isinstance(row.get("config"), dict) else {}
+            row_type = config.get("judgeType") or row.get("judgeType") or row.get("judge_type")
+            if str(row_type or wanted_type).upper() != wanted_type:
+                continue
+            judge_run_id = row.get("id")
+            if judge_run_id:
+                return str(judge_run_id)
+        return None
+
+    def get_eval_metrics(self, eval_run_id: str, *, base_eval_id: str | None = None) -> dict[str, Any]:
+        """Aggregated judge metrics via POST /metrics/evalruns/pairwise."""
+        cmd = ["metrics", "summary", "--test-eval-id", eval_run_id]
+        if base_eval_id:
+            cmd.extend(["--base-eval-id", base_eval_id])
+        result = self._invoke_json(*cmd)
+        if not isinstance(result, dict):
+            raise EvalCliError(f"Unexpected metrics summary response: {result!r}")
+        return result
 
     def wait_for_judge_run(
         self,
@@ -387,15 +488,11 @@ class EvalCliClient:
             elapsed += poll_interval_sec
         raise EvalCliError(f"Judge run {judge_run_id} timed out after {timeout_sec}s")
 
-    def get_analysis_view(self, student_eval_id: str, teacher_eval_id: str) -> dict[str, Any]:
-        result = self._invoke_json(
-            "analyze",
-            "view",
-            "--test-run-ids",
-            student_eval_id,
-            "--base-run-id",
-            teacher_eval_id,
-        )
+    def get_analysis_view(self, test_eval_id: str, base_eval_id: str | None = None) -> dict[str, Any]:
+        cmd = ["analyze", "view", "--test-run-ids", test_eval_id]
+        if base_eval_id:
+            cmd.extend(["--base-run-id", base_eval_id])
+        result = self._invoke_json(*cmd)
         if not isinstance(result, dict):
             raise EvalCliError(f"Unexpected analysis view response: {result!r}")
         return result

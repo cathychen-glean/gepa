@@ -2,8 +2,10 @@
 
 from base64 import b64encode
 
-# Sole editable candidate key — coding instructions under "## Writing Code".
+# Candidate key for coding instructions under "## Writing Code".
 WRITING_CODE_KEY = "WRITING_CODE"
+# Candidate key for the full system prompt (materialized when this key is edited).
+FULL_PROMPT_KEY = "FULL_PROMPT"
 
 default_writing_code = """All SDK functions are **asynchronous**; call them with `asyncio.run()`.
 A normal tool returns a **ToolResult**:
@@ -217,18 +219,42 @@ The current date in the user's preferred timezone is [[today]]<<<[[shell_date_hi
 """
 
 
-def compile_encoded_prompt(candidate: dict[str, str]) -> str:
-    """Compile single-key candidate dict into encoded prompt parameter.
+PROMPT_MODULE_DEFAULTS = {
+    WRITING_CODE_KEY: default_writing_code,
+    FULL_PROMPT_KEY: prompt_format,
+}
+KNOWN_PROMPT_KEYS = frozenset(PROMPT_MODULE_DEFAULTS)
+MODULE_TOKEN_BUDGETS = {
+    WRITING_CODE_KEY: 1024,
+    FULL_PROMPT_KEY: 8192,
+}
 
-    Candidate should have key WRITING_CODE (coding instructions under "## Writing Code").
+
+def materialize_system_prompt(candidate: dict[str, str]) -> str:
+    """Inject every prompt module into one complete system prompt.
+
+    Used when ``FULL_PROMPT`` is an editable GEPA module: after this, there is
+    no ``{WRITING_CODE}`` slot and GEPA iterates on the full prompt as a single string.
     """
+    template = candidate.get(FULL_PROMPT_KEY, prompt_format)
     writing_code = candidate.get(WRITING_CODE_KEY, default_writing_code)
-    # Use replace (not str.format) so braces inside coding instructions are preserved.
-    system_prompt = prompt_format.replace("{WRITING_CODE}", writing_code)
+    return template.replace("{WRITING_CODE}", writing_code)
 
-    encoded_system_prompt = b64encode(system_prompt.encode("utf-8")).decode("ascii")
 
-    return (
-        "llmo.per_prompt_overrides.coding_agent_loop_system="
-        + encoded_system_prompt
-    )
+def compile_system_prompt(candidate: dict[str, str]) -> str:
+    """Fill the system prompt from a candidate.
+
+    If ``WRITING_CODE`` is present, splice it into the template. Otherwise use
+    ``FULL_PROMPT`` as-is (already a materialized full prompt).
+    Use replace (not str.format) so braces inside module text are preserved.
+    """
+    template = candidate.get(FULL_PROMPT_KEY, prompt_format)
+    if WRITING_CODE_KEY not in candidate:
+        return template
+    return template.replace("{WRITING_CODE}", candidate[WRITING_CODE_KEY])
+
+
+def compile_encoded_prompt(candidate: dict[str, str]) -> str:
+    """Compile candidate modules into the encoded prompt override parameter."""
+    encoded_system_prompt = b64encode(compile_system_prompt(candidate).encode("utf-8")).decode("ascii")
+    return "llmo.per_prompt_overrides.coding_agent_loop_system=" + encoded_system_prompt
