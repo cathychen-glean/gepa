@@ -1,24 +1,12 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from glean_gepa.al_adapter import CODING_HARNESS_SC_PARAMS, ALRunner
-from glean_gepa.evalcli_client import (
-    COMPLETENESS_JUDGE_TYPE,
-    COMPLETENESS_RUN_PARAMS,
-    CORRECTNESS_INPUT_MAPPINGS,
-    CORRECTNESS_JUDGE_TYPE,
-    CORRECTNESS_RUN_PARAMS,
-    EvalCliClient,
-    EvalCliError,
-    _subprocess_env,
-)
-from glean_gepa.judge_metrics_util import (
-    judge_pass_rate_from_metrics,
-    wait_for_judge_metrics,
-)
+from glean_gepa.evalcli_client import EvalCliClient, EvalCliError, _subprocess_env
 
 
 def test_coding_harness_sc_params_selects_coding_agent_loop():
@@ -56,133 +44,60 @@ def test_create_eval_run_invokes_evalcli_with_expected_args():
     assert "--eval-params" in args
 
 
+def test_al_runner_caches_created_eval_before_waiting(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = EvalCliClient(binary="/fake/evalcli")
+    runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+    events = []
+
+    def on_created(eval_run_id):
+        events.append(("created", eval_run_id, json.loads(cache_file.read_text())))
+
+    def wait_for_eval_run(eval_run_id):
+        events.append(("wait", eval_run_id, json.loads(cache_file.read_text())))
+
+    with (
+        patch.object(client, "create_eval_run", return_value="run_123"),
+        patch.object(client, "wait_for_eval_run", side_effect=wait_for_eval_run),
+    ):
+        assert (
+            runner.run(
+                "fast",
+                "prompt",
+                "eval-set",
+                "v1",
+                ["scio-prod"],
+                on_created=on_created,
+            )
+            == "run_123"
+        )
+
+    assert [event[0] for event in events] == ["created", "wait"]
+    assert all(event[2] for event in events)
+    assert list(events[0][2].values()) == ["run_123"]
+
+
 def test_create_judge_run_parses_response_list():
     client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(client, "_invoke_json", return_value=[{"id": "judge_456", "status": "SUBMITTED"}]) as mock_invoke:
-        judge_id = client.create_judge_run(
-            eval_run_id="student",
-            judge_type=CORRECTNESS_JUDGE_TYPE,
-            run_params=CORRECTNESS_RUN_PARAMS,
-            base_eval_run_id="teacher",
-            input_mappings=CORRECTNESS_INPUT_MAPPINGS,
-        )
+    with patch.object(client, "_invoke_json", return_value=[{"id": "judge_456", "status": "SUBMITTED"}]):
+        judge_id = client.create_judge_run(student_eval_id="student", teacher_eval_id="teacher")
 
     assert judge_id == "judge_456"
-    args = mock_invoke.call_args[0]
-    assert args[args.index("--judge-type") + 1] == "CORRECTNESS"
-    assert args[args.index("--base-eval-run-id") + 1] == "teacher"
-    assert "--input-mappings" in args
 
 
-def test_completeness_evalcli_create_list_and_metrics():
+def test_list_eval_set_versions_returns_version_rows():
     client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(client, "_invoke_json", return_value={"id": "judge_complete"}) as mock_invoke:
-        judge_id = client.create_judge_run(
-            eval_run_id="student-run",
-            judge_type=COMPLETENESS_JUDGE_TYPE,
-            run_params=COMPLETENESS_RUN_PARAMS,
-        )
-    assert judge_id == "judge_complete"
-    create_args = mock_invoke.call_args[0]
-    assert create_args[0:2] == ("judge", "create")
-    assert create_args[create_args.index("--eval-run-id") + 1] == "student-run"
-    assert create_args[create_args.index("--judge-type") + 1] == "COMPLETENESS"
-    assert "--base-eval-run-id" not in create_args
-
-    with patch.object(
-        client,
-        "_invoke_json",
-        return_value={"judgeRuns": [{"id": "judge-1", "config": {"judgeType": "COMPLETENESS"}}]},
-    ) as mock_invoke:
-        found = client.find_judge_run_id("student-run", judge_type="COMPLETENESS")
-    assert found == "judge-1"
-    list_args = mock_invoke.call_args[0]
-    assert list_args[0:2] == ("judge", "list")
-    assert "list-for-run" not in list_args
-    assert list_args[list_args.index("--eval-run-ids") + 1] == "student-run"
-
-    with patch.object(client, "_invoke_json", return_value={"judgeMetrics": {}}) as mock_invoke:
-        client.get_eval_metrics("student-run")
-    metrics_args = mock_invoke.call_args[0]
-    assert metrics_args[0:2] == ("metrics", "summary")
-    assert metrics_args[metrics_args.index("--test-eval-id") + 1] == "student-run"
-
-
-@pytest.mark.parametrize(
-    "payload, expected",
-    [
-        (
-            {
-                "judgeMetrics": {
-                    "additional_properties": {
-                        "COMPLETENESS": {"passRate": 0.8, "sampleSize": 10, "judgeRunId": "judge-1"},
-                    }
-                }
-            },
-            0.8,
-        ),
-        (
-            {"judgeMetrics": {"COMPLETENESS": [{"judgeRunId": "judge-1", "test": 0.75, "sampleSize": 4}]}},
-            0.75,
-        ),
-        (
-            {"judgeMetrics": {"COMPLETENESS": {"passRate": None, "judgeRunId": "judge-1"}}},
-            None,
-        ),
-    ],
-)
-def test_judge_pass_rate_from_metrics(payload, expected):
-    assert judge_pass_rate_from_metrics(payload, judge_type=COMPLETENESS_JUDGE_TYPE, judge_run_id="judge-1") == expected
-
-
-def test_wait_for_judge_metrics_ready_and_timeout():
-    ready = type("EvalCli", (), {})()
-    ready.get_eval_metrics = lambda _eval_id, **_kwargs: {"judgeMetrics": {"COMPLETENESS": {"passRate": 0.6}}}
-    analysis = wait_for_judge_metrics(
-        ready,
-        eval_id="run-1",
-        judge_type=COMPLETENESS_JUDGE_TYPE,
-        judge_run_id="judge-1",
-        poll_interval_sec=0,
-    )
-    assert analysis.aggregate == 0.6
-    assert analysis.eval_id == "run-1"
-
-    stalled = type("EvalCli", (), {})()
-    stalled.get_eval_metrics = lambda _eval_id, **_kwargs: {"judgeMetrics": {"COMPLETENESS": {"passRate": None}}}
-    with pytest.raises(EvalCliError, match="not ready"):
-        wait_for_judge_metrics(
-            stalled,
-            eval_id="run-1",
-            judge_type=COMPLETENESS_JUDGE_TYPE,
-            judge_run_id="judge-1",
-            poll_interval_sec=0,
-            timeout_sec=0,
-        )
-
-
-def test_list_eval_set_versions_returns_matching_and_unspecified_deployments():
-    client = EvalCliClient(binary="/fake/evalcli")
-    payload = {
-        "evalSetVersions": [
-            {"version": "20260827", "availableDeploymentIds": ["scio-prod"]},
-            {"version": "20260826", "availableDeploymentIds": ["scio-staging"]},
-            {"version": "20260825"},
-        ]
-    }
-    with patch.object(client, "_invoke_json", return_value=payload) as mock_invoke:
+    with patch.object(client, "_invoke_json", return_value={"evalSetVersions": [{"version": "20260827"}]}) as mock_invoke:
         rows = client.list_eval_set_versions(eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"])
 
-    assert [row["version"] for row in rows] == ["20260827", "20260825"]
+    assert rows == [{"version": "20260827"}]
     assert mock_invoke.call_args[0] == (
         "evalsets",
-        "versions",
+        "list",
         "--name",
         "Glean Chat V2 Medium",
-        "--page",
-        "1",
-        "--page-size",
-        "100",
+        "--deployment-ids",
+        "scio-prod",
     )
 
 
@@ -236,35 +151,39 @@ def test_subprocess_env_preserves_existing_ssl_cert(monkeypatch):
     assert "REQUESTS_CA_BUNDLE" not in env
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        EvalCliError("stderr: Error: API request failed: 502\nResponse: Connection refused"),
-        EvalCliError("stderr: Error: Could not find valid __Host-GCP_IAP_AUTH_TOKEN_* cookie in any browser."),
-    ],
-)
-def test_wait_for_eval_run_retries_transient_errors(error):
+def test_wait_for_eval_run_retries_transient_errors(capsys):
     client = EvalCliClient(binary="/fake/evalcli")
     in_progress = [{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 1}]}]
     complete = [{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 1}]}]
     with patch.object(
         client,
         "_invoke_json",
-        side_effect=[error, in_progress, complete],
+        side_effect=[
+            EvalCliError("stderr: Error: API request failed: 502\nResponse: Connection refused"),
+            in_progress,
+            complete,
+        ],
     ) as mock_invoke:
         with patch("glean_gepa.evalcli_client.time.sleep"):
-            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=10)
+            client.wait_for_eval_run("run_123", poll_interval_sec=0)
 
     assert mock_invoke.call_count == 3
+    status_logs = [line for line in capsys.readouterr().out.splitlines() if line.startswith("Eval run run_123 status:")]
+    assert len(status_logs) == 2
+    assert "TASK_SUBMITTED" in status_logs[0]
+    assert "TASK_SUCCEEDED" in status_logs[1]
 
 
-def test_wait_for_eval_run_timeout_includes_last_status():
+def test_wait_for_eval_run_honors_timeout():
     client = EvalCliClient(binary="/fake/evalcli")
-    in_progress = [{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}]
-    with patch.object(client, "_invoke_json", return_value=in_progress):
-        with patch("glean_gepa.evalcli_client.time.sleep"):
-            with pytest.raises(EvalCliError, match="timed out after 1s; last status:"):
-                client.wait_for_eval_run("run_123", poll_interval_sec=1, timeout_sec=1)
+    with (
+        patch.object(client, "_invoke_json") as mock_invoke,
+        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=[10.0, 11.0]),
+    ):
+        with pytest.raises(EvalCliError, match="timed out after 1s"):
+            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=1)
+
+    mock_invoke.assert_not_called()
 
 
 def test_wait_for_eval_run_raises_on_non_transient_errors():
@@ -275,7 +194,7 @@ def test_wait_for_eval_run_raises_on_non_transient_errors():
         side_effect=EvalCliError("stderr: auth failed"),
     ):
         with pytest.raises(EvalCliError, match="auth failed"):
-            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=1)
+            client.wait_for_eval_run("run_123", poll_interval_sec=0)
 
 
 def test_invoke_raises_on_nonzero_exit():

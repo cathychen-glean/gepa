@@ -13,14 +13,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.evalcli_client import EvalCliClient, EvalCliError
 
-DEFAULT_BUCKET_TYPE = "SESSIONT"
-DEFAULT_RUN_LABEL = "gepa"
+DEFAULT_BUCKET_TYPE = "SESSION"
 FOCUSED_EVAL_SET_NAME_PREFIX = "gepa-high-signal"
-HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA = "fact-agentspan-trace-v2"
-HIGH_SIGNAL_RUN_LABEL = "gepa_high_signal"
+HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA = "fact-agentspan-trace-v5"
 
 
 @dataclass(frozen=True)
@@ -28,95 +25,6 @@ class FocusedEvalSet:
     name: str
     version: str
     entry_count: int
-
-
-@dataclass(frozen=True)
-class EvalRunTarget:
-    """Eval-set name/version and run label to use for one data inst."""
-
-    eval_set_name: str
-    eval_set_version: str
-    run_label: str
-    is_focused: bool = False
-
-
-def prepare_high_signal_eval_batch(
-    evalcli: EvalCliClient,
-    batch: Sequence[ALDataInst],
-) -> list[ALDataInst] | None:
-    """Upload/reuse focused eval sets once, before concurrent child screening.
-
-    Returns None if any focused set cannot be created so a candidate cannot
-    silently fall back to the full eval set.
-    """
-    prepared: list[ALDataInst] = []
-    for data in batch:
-        entry_ids = data.get("eval_entry_ids") or []
-        if not entry_ids:
-            prepared.append(data)
-            continue
-        focused = ensure_focused_eval_set(
-            evalcli,
-            base_eval_set_name=data["eval_set_name"],
-            base_eval_set_version=data["eval_set_version"],
-            deployment_ids=list(data.get("deployment_ids") or []),
-            entry_ids=entry_ids,
-        )
-        if focused is None:
-            return None
-        prepared.append(
-            {
-                **data,
-                "eval_set_name": focused.name,
-                "eval_set_version": focused.version,
-                "focused_eval_set_name": focused.name,
-                "focused_eval_set_version": focused.version,
-            }
-        )
-    return prepared
-
-
-def resolve_eval_run_target(
-    evalcli: EvalCliClient,
-    data: Mapping[str, Any],
-) -> EvalRunTarget | None:
-    """Return where to run this data inst. None if focused setup failed."""
-    entry_ids = data.get("eval_entry_ids") or []
-    eval_set_name = str(data.get("eval_set_name", ""))
-    eval_set_version = str(data.get("eval_set_version", ""))
-    if not entry_ids:
-        return EvalRunTarget(
-            eval_set_name=eval_set_name,
-            eval_set_version=eval_set_version,
-            run_label=DEFAULT_RUN_LABEL,
-            is_focused=False,
-        )
-
-    focused_name = data.get("focused_eval_set_name")
-    focused_version = data.get("focused_eval_set_version")
-    if focused_name and focused_version:
-        return EvalRunTarget(
-            eval_set_name=str(focused_name),
-            eval_set_version=str(focused_version),
-            run_label=HIGH_SIGNAL_RUN_LABEL,
-            is_focused=True,
-        )
-
-    focused = ensure_focused_eval_set(
-        evalcli,
-        base_eval_set_name=eval_set_name,
-        base_eval_set_version=eval_set_version,
-        deployment_ids=list(data.get("deployment_ids") or []),
-        entry_ids=entry_ids,
-    )
-    if focused is None:
-        return None
-    return EvalRunTarget(
-        eval_set_name=focused.name,
-        eval_set_version=focused.version,
-        run_label=HIGH_SIGNAL_RUN_LABEL,
-        is_focused=True,
-    )
 
 
 def focused_eval_set_name(base_eval_set_name: str) -> str:
@@ -203,6 +111,7 @@ def ensure_focused_eval_set(
     base_eval_set_version: str,
     deployment_ids: list[str],
     entry_ids: Sequence[str],
+    source_entries: Sequence[Mapping[str, Any]] | None = None,
     bucket_type: str = DEFAULT_BUCKET_TYPE,
 ) -> FocusedEvalSet | None:
     """Create or reuse an eval-set version containing only ``entry_ids``."""
@@ -221,11 +130,12 @@ def ensure_focused_eval_set(
             return FocusedEvalSet(name, version, len(existing_entries))
         version = focused_eval_set_retry_version(version)
 
-    source_entries = evalcli.list_eval_set_entries(
-        eval_set_name=base_eval_set_name,
-        eval_set_version=base_eval_set_version,
-        deployment_ids=deployment_ids,
-    )
+    if source_entries is None:
+        source_entries = evalcli.list_eval_set_entries(
+            eval_set_name=base_eval_set_name,
+            eval_set_version=base_eval_set_version,
+            deployment_ids=deployment_ids,
+        )
     wanted = set(entry_ids)
     selected = [entry for entry in source_entries if str(entry.get("id") or "") in wanted]
     upload_entries = [entry for source in selected if (entry := build_upload_entry(source)) is not None]
@@ -266,15 +176,10 @@ def ensure_focused_eval_set(
 
 
 __all__ = [
-    "DEFAULT_RUN_LABEL",
-    "EvalRunTarget",
     "FocusedEvalSet",
-    "HIGH_SIGNAL_RUN_LABEL",
     "build_upload_entry",
     "build_upload_eval_set_request",
     "ensure_focused_eval_set",
     "focused_eval_set_name",
     "focused_eval_set_version",
-    "prepare_high_signal_eval_batch",
-    "resolve_eval_run_target",
 ]
