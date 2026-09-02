@@ -98,6 +98,12 @@ def test_load_seed_candidate_rejects_invalid(tmp_path, raw, required_keys, match
         _load_seed_candidate(path, required_keys=required_keys)
 
 
+def test_parse_args_defaults_editable_modules_to_writing_code():
+    args = _parse_args(["--seed_candidate", "seed.json"])
+
+    assert args.editable_modules == WRITING_CODE_KEY
+
+
 def test_parse_args_accepts_all_reflection_samples_and_hamming_k():
     args = _parse_args(
         [

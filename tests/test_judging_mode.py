@@ -23,6 +23,13 @@ def test_concrete_adapters_own_screening_configuration():
         student_model="fast",
         thresholds=thresholds,
     )
+    single_full_prompt = SingleModelAdapter(
+        runner=runner,
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=thresholds,
+        editable_modules=[FULL_PROMPT_KEY],
+    )
     teacher_adapter = TeacherStudentAdapter(
         runner=runner,
         teacher_model="gpt",
@@ -50,12 +57,14 @@ def test_concrete_adapters_own_screening_configuration():
     assert single_adapter.primary_objective == SHELL_SUCCESS_OBJECTIVE
     assert single_adapter.default_frontier_type == "objective"
     assert single_adapter.editable_modules == [WRITING_CODE_KEY]
+    assert single_full_prompt.editable_modules == [FULL_PROMPT_KEY]
     assert single_adapter.get_screening_score(shell_eval) == 0.8
     assert teacher_adapter.primary_objective == "tool_alignment"
     assert teacher_adapter.default_frontier_type == "hybrid"
     assert teacher_adapter.editable_modules == [WRITING_CODE_KEY]
     assert teacher_full_prompt.editable_modules == [FULL_PROMPT_KEY]
     assert pick_modules_to_edit(single_adapter) == [WRITING_CODE_KEY]
+    assert pick_modules_to_edit(single_full_prompt) == [FULL_PROMPT_KEY]
     assert pick_modules_to_edit(teacher_full_prompt) == [FULL_PROMPT_KEY]
     assert teacher_adapter.get_screening_score(tool_match_eval) == 0.5
     assert not hasattr(single_adapter, "judging_mode")

@@ -1051,6 +1051,7 @@ class Thresholds:
 
 class GleanAdapterBase:
     supports_high_signal_eval = False
+
     def __init__(
         self,
         runner: ALRunner,
@@ -1261,13 +1262,9 @@ class GleanAdapterBase:
             bigquery_client=getattr(self, "bigquery_client", None),
         )
 
-    def attach_cached_eval_run_ids(
-        self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]
-    ) -> list[ALDataInst]:
+    def attach_cached_eval_run_ids(self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]) -> list[ALDataInst]:
         """Attach persisted eval IDs to matching eval-set items for reuse."""
-        cached_by_eval_set = {
-            (record["eval_set_name"], record["eval_set_version"]): record for record in eval_run_ids
-        }
+        cached_by_eval_set = {(record["eval_set_name"], record["eval_set_version"]): record for record in eval_run_ids}
         attached: list[ALDataInst] = []
         for data in batch:
             record = cached_by_eval_set.get((data["eval_set_name"], data["eval_set_version"]))
@@ -1311,9 +1308,7 @@ class GleanAdapterBase:
             for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items()
         ]
 
-    def high_signal_fix_rate(
-        self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch
-    ) -> float:
+    def high_signal_fix_rate(self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch) -> float:
         """Fraction of focused entries that are error-free for the child."""
         parent_failure_count = sum(1 for trajectory in parent_eval.trajectories or [] if trajectory["score"] < 1.0)
         if not parent_failure_count:
