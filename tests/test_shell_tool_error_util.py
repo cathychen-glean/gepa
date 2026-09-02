@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,15 +11,20 @@ from glean_gepa.shell_tool_error_util import (
     SHELL_SPAN_NAMES,
     ShellToolErrorEntryMetrics,
     ShellToolErrorMetrics,
+    build_eval_entry_uuid_tracking_query,
     build_eval_run_search_params,
+    build_high_signal_source_entries_query,
     build_shell_tool_error_per_entry_query,
     build_shell_tool_error_query_params,
     build_shell_tool_error_rate_query,
     empty_shell_tool_error_metrics,
+    fetch_high_signal_evalset_entries,
+    fetch_evalset_entry_tracking,
     fetch_shell_tool_error_metrics,
     is_shell_tool_error,
     parse_shell_tool_error_example,
     parse_shell_tool_error_metrics,
+    resolve_eval_run_date_range,
     shell_error_free_rate,
 )
 
@@ -65,7 +70,10 @@ def test_build_shell_tool_error_rate_query_includes_eval_and_shell_filters():
     assert "jsonPayload.action.error_str" in sql
     assert "jsonPayload.span_info.execution_status.message" in sql
     assert "jsonPayload.span_info.execution_status.user_message" in sql
-    assert "shell_execution_id AS action_run_id" in sql
+    assert "NULLIF(jsonPayload.action.action_run_id, '')" in sql
+    assert "NULLIF(jsonPayload.context.agent_trace.span_id, '')" in sql
+    assert "TO_JSON_STRING(jsonPayload)" in sql
+    assert "action_run_id," in sql
     assert "recent_error_examples" in sql
 
 
@@ -83,6 +91,60 @@ def test_per_entry_query_can_skip_error_examples_for_high_signal_screening():
     assert "shell_errors" in sql
     assert "recent_error_examples" not in sql
     assert "AS trace_ids" not in sql
+
+
+def test_high_signal_source_entries_query_maps_runtime_entry_uuids_to_source_entries():
+    sql = build_high_signal_source_entries_query()
+
+    assert "entry_uuid IN UNNEST(@entry_uuids)" in sql
+    assert "WHERE eval_id = @eval_run_id" in sql
+    assert "JOIN `scio-apps.fact.evalset_entries` AS evalset_entries USING (stt)" in sql
+
+
+def test_fetch_high_signal_evalset_entries_resolves_source_trace_by_entry_id():
+    client = MagicMock()
+    client.query.side_effect = [
+        [
+            {
+                "id": "entry-1",
+                "deploymentId": "scio-prod",
+                "stt": "source-stt",
+                "runId": "source-run",
+                "source_date": date(2026, 8, 14),
+            }
+        ],
+        [
+            {
+                "id": "entry-1",
+                "deploymentId": "scio-prod",
+                "stt": "source-stt",
+                "runId": "source-run",
+                "traceId": "source-trace",
+            }
+        ],
+    ]
+
+    entries = fetch_high_signal_evalset_entries(
+        client,
+        eval_set_name="Glean Chat V2 Medium",
+        eval_set_version="20260820",
+        eval_run_id="parent-eval-run",
+        entry_ids=["entry-1"],
+        deployment_ids=["scio-prod"],
+    )
+
+    assert entries == [
+        {
+            "id": "entry-1",
+            "deploymentId": "scio-prod",
+            "stt": "source-stt",
+            "runId": "source-run",
+            "traceId": "source-trace",
+        }
+    ]
+    source_params = client.query.call_args_list[0].kwargs["params"]
+    assert next(param.value for param in source_params if param.name == "entry_uuids") == ["entry-1"]
+    assert next(param.value for param in source_params if param.name == "eval_run_id") == "parent-eval-run"
 
 
 def test_build_shell_tool_error_query_params_uses_eval_run_date_range():
@@ -110,6 +172,18 @@ def test_build_eval_run_search_params_uses_lookback_window():
     assert param_map["eval_id"] == "run_123"
     assert param_map["search_start_date"] == "2026-08-08"
     assert param_map["search_end_date"] == "2026-08-11"
+
+
+def test_resolve_eval_run_date_range_uses_utc_for_bigquery_shards():
+    just_after_midnight_utc = int(datetime(2026, 8, 30, 0, 30, tzinfo=timezone.utc).timestamp() * 1000)
+
+    resolved = resolve_eval_run_date_range(
+        {"min_start_ms": just_after_midnight_utc, "max_start_ms": just_after_midnight_utc},
+        lookback_days=7,
+        end_date=date(2026, 8, 31),
+    )
+
+    assert resolved == (date(2026, 8, 30), date(2026, 8, 30))
 
 
 def test_shell_error_free_rate():
@@ -246,6 +320,16 @@ def test_fetch_shell_tool_error_metrics_returns_parsed_row():
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
             {
+                "eval_id": "run_123",
+                "shell_executions": 6,
+                "shell_errors": 2,
+                "shell_error_rate": 1 / 3,
+                "shell_error_pct": 33.33,
+                "recent_error_examples": [],
+            }
+        ],
+        [
+            {
                 "entry_id": "entry-1",
                 "shell_executions": 4,
                 "shell_errors": 1,
@@ -262,9 +346,38 @@ def test_fetch_shell_tool_error_metrics_returns_parsed_row():
         end_date=date(2026, 8, 12),
     )
 
-    assert metrics.shell_error_rate == 0.25
+    assert metrics.shell_error_rate == pytest.approx(1 / 3)
+    assert metrics.shell_errors == 2
+    assert mock_client.query.call_count == 3
+
+
+def test_fetch_shell_error_metrics_keeps_unattributed_shell_spans_in_aggregate():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
+        [
+            {
+                "eval_id": "run_123",
+                "shell_executions": 3,
+                "shell_errors": 1,
+                "shell_error_rate": 1 / 3,
+                "shell_error_pct": 33.33,
+                "recent_error_examples": [],
+            }
+        ],
+        [],
+    ]
+
+    metrics = fetch_shell_tool_error_metrics(
+        mock_client,
+        eval_id="run_123",
+        end_date=date(2026, 8, 12),
+    )
+
+    assert metrics.shell_executions == 3
     assert metrics.shell_errors == 1
-    assert mock_client.query.call_count == 2
+    assert metrics.shell_error_rate == pytest.approx(1 / 3)
+    assert mock_client.query.call_count == 3
 
 
 def test_fetch_shell_tool_error_metrics_returns_empty_when_no_rows():
@@ -276,6 +389,83 @@ def test_fetch_shell_tool_error_metrics_returns_empty_when_no_rows():
     assert metrics.shell_executions == 0
     assert metrics.shell_error_rate == 0.0
     mock_client.query.assert_called_once()
+
+
+def test_build_eval_entry_uuid_tracking_query_filters_entry_uuid():
+    sql = build_eval_entry_uuid_tracking_query()
+
+    assert "entry_uuid IN UNNEST(@entry_ids)" in sql
+    assert "session_tracking_token" in sql
+    assert "scrubbed_agentspan" in sql
+
+
+def test_fetch_evalset_entry_tracking_uses_agentspan_stt():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [
+            {
+                "id": "e1",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "eval-run",
+                "traceId": "eval-trace",
+            }
+        ],
+        [],
+    ]
+
+    tracking = fetch_evalset_entry_tracking(
+        mock_client,
+        eval_set_name="Glean Chat V2 Medium",
+        eval_set_version="20260817",
+        entry_ids=["e1"],
+        deployment_ids=["prod"],
+    )
+
+    assert tracking == {
+        "e1": {
+            "deploymentId": "prod",
+            "stt": "stt-1",
+        }
+    }
+    assert mock_client.query.call_count == 2
+    first_sql = mock_client.query.call_args_list[0].args[0]
+    assert "entry_uuid IN UNNEST(@entry_ids)" in first_sql
+
+
+def test_fetch_evalset_entry_tracking_prefers_original_run_id_from_fact():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [
+            {
+                "id": "e1",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "eval-run",
+                "traceId": "eval-trace",
+            }
+        ],
+        [
+            {
+                "id": "bq-id",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "orig-run",
+            }
+        ],
+    ]
+
+    tracking = fetch_evalset_entry_tracking(
+        mock_client,
+        eval_set_name="Glean Chat V2 Medium",
+        eval_set_version="20260817",
+        entry_ids=["e1"],
+        deployment_ids=["prod"],
+    )
+
+    assert tracking["e1"]["runId"] == "orig-run"
+    assert tracking["e1"]["stt"] == "stt-1"
+    assert "traceId" not in tracking["e1"]
 
 
 def test_bigquery_client_wraps_query_failures():

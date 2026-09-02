@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any
 
 from glean_gepa.shell_tool_error_util import (
     DEFAULT_AGENTS_SPAN_TABLE,
@@ -181,6 +182,57 @@ def compute_tool_match_score(student_tools: Sequence[str], teacher_tools: Sequen
         if index < len(teacher_tools) and student_tool == teacher_tools[index]:
             matches += 1
     return matches / compared
+
+
+def avg_levenshtein_alignment_score(average_distance: float) -> float:
+    """Map mean tool-sequence edit distance onto (0, 1]; lower distance scores higher."""
+    if average_distance == float("inf"):
+        return 0.0
+    return 1.0 / (1.0 + average_distance)
+
+
+def mean_sequence_levenshtein(
+    per_entry_tools: Mapping[str, tuple[Sequence[str], Sequence[str]]],
+    entry_ids: Sequence[str],
+    *,
+    fallback_distances: Mapping[str, int] | None = None,
+) -> float:
+    """Return the mean token-level Levenshtein distance over ``entry_ids``.
+
+    Missing entries use ``fallback_distances`` when provided so a child cannot
+    look better by dropping rows. If an id is still missing, the mean is
+    undefined and this returns ``inf``.
+    """
+    if not entry_ids:
+        return float("inf")
+    distances: list[int] = []
+    for entry_id in entry_ids:
+        pair = per_entry_tools.get(entry_id)
+        if pair is not None:
+            distances.append(sequence_levenshtein_distance(pair[0], pair[1]))
+        elif fallback_distances is not None and entry_id in fallback_distances:
+            distances.append(fallback_distances[entry_id])
+        else:
+            return float("inf")
+    return sum(distances) / len(distances)
+
+
+def sequence_levenshtein_distance(left: Sequence[str], right: Sequence[str]) -> int:
+    """Return the token-level edit distance between two ordered tool-name lists."""
+    if tuple(left) == tuple(right):
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for i, left_item in enumerate(left, start=1):
+        current = [i]
+        for j, right_item in enumerate(right, start=1):
+            substitution = previous[j - 1] + int(left_item != right_item)
+            current.append(min(previous[j] + 1, current[-1] + 1, substitution))
+        previous = current
+    return previous[-1]
 
 
 def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics:

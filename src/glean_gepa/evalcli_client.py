@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 import subprocess
 import tempfile
 import time
 from typing import Any
+
+from glean_gepa.debug import debug_print
 
 CODING_HARNESS_PRESET = "Coding Harness"
 DEFAULT_PRESET = CODING_HARNESS_PRESET
@@ -58,9 +61,20 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "__Host-GCP_IAP_AUTH_TOKEN_",
 )
 
+MIN_INGESTED_ENTRY_FRACTION = 0.5
+
 
 class EvalCliError(RuntimeError):
     pass
+
+
+def min_ingested_eval_set_entries(
+    expected_count: int, *, min_fraction: float = MIN_INGESTED_ENTRY_FRACTION
+) -> int:
+    """Return the fewest ingested rows that still count as a usable eval set."""
+    if expected_count <= 0:
+        return 1
+    return max(1, math.ceil(expected_count * min_fraction))
 
 
 def _is_unreliable_ca_bundle(path: str) -> bool:
@@ -192,12 +206,13 @@ class EvalCliClient:
         eval_run_id: str,
         *,
         poll_interval_sec: int = 60,
-        timeout_sec: int = 14400,
+        timeout_sec: int | None = None,
     ) -> None:
         print(f"Waiting for eval run {eval_run_id} to complete...")
-        elapsed = 0
-        last_status: Any = None
-        while elapsed < timeout_sec:
+        started_at = time.monotonic()
+        while True:
+            if timeout_sec is not None and time.monotonic() - started_at >= timeout_sec:
+                raise EvalCliError(f"Eval run {eval_run_id} timed out after {timeout_sec}s")
             try:
                 statuses = self._invoke_json("run", "status", "--id", eval_run_id)
             except EvalCliError as exc:
@@ -214,10 +229,9 @@ class EvalCliClient:
                         f"retrying in {poll_interval_sec}s..."
                     )
                 time.sleep(poll_interval_sec)
-                elapsed += poll_interval_sec
                 continue
 
-            last_status = statuses
+            print(f"Eval run {eval_run_id} status: {json.dumps(statuses, sort_keys=True, default=str)}")
             if isinstance(statuses, list) and statuses and _is_eval_complete(statuses[0]):
                 print(f"Eval run {eval_run_id} completed successfully")
                 return
@@ -228,17 +242,13 @@ class EvalCliClient:
                     for entry in counts
                     if (entry.get("count") or 0) > 0
                 )
+                elapsed = int(time.monotonic() - started_at)
                 print(
                     f"Eval run {eval_run_id} still running after {elapsed}s"
                     + (f" ({summary})" if summary else "")
                 )
 
             time.sleep(poll_interval_sec)
-            elapsed += poll_interval_sec
-
-        raise EvalCliError(
-            f"Eval run {eval_run_id} timed out after {timeout_sec}s; last status: {last_status!r}"
-        )
 
     def get_eval_set_version(self, *, eval_set_name: str, eval_set_version: str) -> dict[str, Any] | None:
         """Return the eval set version, or None when it does not exist yet."""
@@ -349,6 +359,7 @@ class EvalCliClient:
 
     def upload_eval_set(self, request: dict[str, Any]) -> None:
         """Upload a new eval set version. Entries are ingested asynchronously."""
+        debug_print(f"Uploading eval set payload:\n{json.dumps(request, indent=2)}")
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
         try:
             json.dump(request, handle)
@@ -367,10 +378,20 @@ class EvalCliClient:
         poll_interval_sec: int = 15,
         timeout_sec: int = 900,
     ) -> list[dict[str, Any]]:
-        """Poll until the uploaded eval set version has ingested all of its entries."""
-        print(f"Waiting for eval set {eval_set_name}:{eval_set_version} to ingest {expected_count} entries...")
+        """Poll until the uploaded eval set version has ingested enough entries.
+
+        SESSION ingest can skip tokens with no session log. Once the published
+        size stops growing, succeed if at least ``min_fraction`` of the uploaded
+        rows landed (default 50%).
+        """
+        min_count = min_ingested_eval_set_entries(expected_count)
+        print(
+            f"Waiting for eval set {eval_set_name}:{eval_set_version} to ingest "
+            f"{expected_count} entries (min {min_count})..."
+        )
         elapsed = 0
         entries: list[dict[str, Any]] = []
+        previous_count = -1
         while elapsed < timeout_sec:
             try:
                 entries = self.list_eval_set_entries(
@@ -381,16 +402,24 @@ class EvalCliClient:
             except EvalCliError:
                 entries = []
 
-            if len(entries) >= expected_count:
-                print(f"Eval set {eval_set_name}:{eval_set_version} ready with {len(entries)} entries")
+            count = len(entries)
+            if count >= expected_count:
+                print(f"Eval set {eval_set_name}:{eval_set_version} ready with {count} entries")
                 return entries
+            if count >= min_count and count == previous_count:
+                print(
+                    f"Eval set {eval_set_name}:{eval_set_version} ready with {count}/{expected_count} "
+                    "entries (SESSION ingest skipped the rest)"
+                )
+                return entries
+            previous_count = count
 
             time.sleep(poll_interval_sec)
             elapsed += poll_interval_sec
 
         raise EvalCliError(
             f"Eval set {eval_set_name}:{eval_set_version} only ingested {len(entries)}/{expected_count} "
-            f"entries after {timeout_sec}s"
+            f"entries after {timeout_sec}s (need at least {min_count})"
         )
 
     def _parse_judge_create_response(self, results: Any) -> str:

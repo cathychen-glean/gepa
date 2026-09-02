@@ -5,8 +5,11 @@ import pytest
 from glean_gepa.focused_evalset import (
     DEFAULT_RUN_LABEL,
     HIGH_SIGNAL_RUN_LABEL,
+    QUERY_CANONICAL_BUCKET_TYPE,
+    SESSION_BUCKET_TYPE,
     EvalRunTarget,
     FocusedEvalSet,
+    build_upload_entry,
     build_upload_eval_set_request,
     ensure_focused_eval_set,
     focused_eval_set_version,
@@ -22,9 +25,15 @@ SOURCE = {
 }
 FOCUSED = FocusedEvalSet("gepa-high-signal-example", "v1_hs_abc", 1)
 
-
 def test_focused_eval_set_version_is_stable_for_the_same_entries():
     assert focused_eval_set_version("v1", ["b", "a"]) == focused_eval_set_version("v1", ["a", "b"])
+
+
+def test_focused_eval_set_version_changes_with_bucket_type():
+    ids = ["a", "b"]
+    session = focused_eval_set_version("v1", ids, bucket_type=SESSION_BUCKET_TYPE)
+    query = focused_eval_set_version("v1", ids, bucket_type=QUERY_CANONICAL_BUCKET_TYPE)
+    assert session != query
 
 
 def test_build_upload_request_keeps_source_metadata():
@@ -47,8 +56,8 @@ def test_ensure_focused_eval_set_uploads_only_requested_entries():
     evalcli = MagicMock()
     evalcli.get_eval_set_version.return_value = None
     evalcli.list_eval_set_entries.return_value = [
-        {"id": "keep", "deploymentId": "prod", "stt": "session-1"},
-        {"id": "drop", "deploymentId": "prod", "stt": "session-2"},
+        {"id": "keep", "deploymentId": "prod", "user": "spark", "input": {"query": "hello"}, "stt": "session-1"},
+        {"id": "drop", "deploymentId": "prod", "user": "spark", "input": {"query": "other"}, "stt": "session-2"},
     ]
     evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
 
@@ -62,8 +71,215 @@ def test_ensure_focused_eval_set_uploads_only_requested_entries():
 
     assert focused is not None
     request = evalcli.upload_eval_set.call_args.args[0]
-    assert request["entries"] == [{"deploymentId": "prod", "stt": "session-1"}]
+    assert request["bucketType"] == QUERY_CANONICAL_BUCKET_TYPE
+    assert request["entries"] == [{"deploymentId": "prod", "user": "spark", "query": "hello"}]
     assert focused.entry_count == 1
+
+
+def test_build_upload_entry_rejects_session_rows_without_stt():
+    assert (
+        build_upload_entry(
+            {
+                "id": "keep",
+                "deploymentId": "prod",
+                "input": {"query": "hello"},
+                "sourceTrackingInfo": {"sessionTrackingToken": None, "traceId": None},
+            },
+            bucket_type=SESSION_BUCKET_TYPE,
+        )
+        is None
+    )
+
+
+def test_build_upload_entry_session_keeps_only_stt_identity():
+    entry = build_upload_entry(
+        {
+            "deploymentId": "prod",
+            "user": "spark",
+            "stt": "session-1",
+            "traceId": "eval-trace",
+            "runId": "orig-run",
+            "qtt": "qtt-1",
+            "input": {"query": "hello"},
+        },
+        bucket_type=SESSION_BUCKET_TYPE,
+    )
+
+    assert entry == {
+        "deploymentId": "prod",
+        "user": "spark",
+        "stt": "session-1",
+        "query": "hello",
+    }
+
+
+def test_build_upload_entry_query_canonical_is_fresh_query():
+    entry = build_upload_entry(
+        {
+            "deploymentId": "prod",
+            "user": "spark",
+            "stt": "session-1",
+            "traceId": "eval-trace",
+            "runId": "orig-run",
+            "qtt": "qtt-1",
+            "input": {"query": "hello"},
+        }
+    )
+
+    assert entry == {"deploymentId": "prod", "user": "spark", "query": "hello"}
+
+
+def test_build_upload_entry_query_canonical_rejects_rows_without_query():
+    assert build_upload_entry({"deploymentId": "prod", "stt": "session-1"}) is None
+
+
+def test_ensure_focused_eval_set_does_not_upload_session_rows_without_stt():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = None
+    evalcli.list_eval_set_entries.return_value = [
+        {"id": "keep", "deploymentId": "prod", "input": {"query": "hello"}},
+    ]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+        bucket_type=SESSION_BUCKET_TYPE,
+    )
+
+    assert focused is None
+    evalcli.upload_eval_set.assert_not_called()
+
+
+def test_ensure_focused_eval_set_does_not_resolve_stt_for_query_canonical():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = None
+    evalcli.list_eval_set_entries.return_value = [
+        {
+            "id": "keep",
+            "deploymentId": "prod",
+            "user": "spark",
+            "input": {"query": "hello"},
+            "sourceTrackingInfo": {
+                "traceId": None,
+                "sessionTrackingToken": None,
+                "queryTrackingToken": None,
+                "runId": None,
+            },
+        },
+    ]
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+
+    with patch("glean_gepa.focused_evalset.fetch_evalset_entry_tracking") as fetch:
+        focused = ensure_focused_eval_set(
+            evalcli,
+            base_eval_set_name="Example",
+            base_eval_set_version="v1",
+            deployment_ids=["prod"],
+            entry_ids=["keep"],
+            bigquery_client=MagicMock(),
+        )
+
+    fetch.assert_not_called()
+    request = evalcli.upload_eval_set.call_args.args[0]
+    assert request["bucketType"] == QUERY_CANONICAL_BUCKET_TYPE
+    assert request["entries"] == [
+        {
+            "deploymentId": "prod",
+            "user": "spark",
+            "query": "hello",
+        }
+    ]
+    assert focused is not None
+    assert focused.entry_count == 1
+
+
+def test_ensure_focused_eval_set_fills_stt_from_bigquery_for_session_bucket():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = None
+    evalcli.list_eval_set_entries.return_value = [
+        {
+            "id": "keep",
+            "deploymentId": "prod",
+            "user": "spark",
+            "input": {"query": "hello"},
+            "sourceTrackingInfo": {
+                "traceId": None,
+                "sessionTrackingToken": None,
+                "queryTrackingToken": None,
+                "runId": None,
+            },
+        },
+    ]
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+
+    with patch(
+        "glean_gepa.focused_evalset.fetch_evalset_entry_tracking",
+        return_value={
+            "keep": {
+                "deploymentId": "prod",
+                "stt": "session-1",
+                "runId": "run-1",
+            }
+        },
+    ) as fetch:
+        focused = ensure_focused_eval_set(
+            evalcli,
+            base_eval_set_name="Example",
+            base_eval_set_version="v1",
+            deployment_ids=["prod"],
+            entry_ids=["keep"],
+            bigquery_client=MagicMock(),
+            bucket_type=SESSION_BUCKET_TYPE,
+        )
+
+    fetch.assert_called_once()
+    request = evalcli.upload_eval_set.call_args.args[0]
+    assert request["entries"] == [
+        {
+            "deploymentId": "prod",
+            "user": "spark",
+            "stt": "session-1",
+            "query": "hello",
+        }
+    ]
+    assert focused is not None
+    assert focused.entry_count == 1
+
+
+def test_ensure_focused_eval_set_uploads_resolved_trace_identifiers():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = None
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+    source_entries = [
+        {
+            "id": "keep",
+            "deploymentId": "prod",
+            "stt": "session-1",
+            "runId": "run-1",
+            "traceId": "trace-1",
+        }
+    ]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+        source_entries=source_entries,
+        bucket_type=SESSION_BUCKET_TYPE,
+    )
+
+    assert focused is not None
+    assert evalcli.upload_eval_set.call_args.args[0]["entries"] == [
+        {
+            "deploymentId": "prod",
+            "stt": "session-1",
+        }
+    ]
 
 
 def test_ensure_focused_eval_set_reuses_an_existing_version():
@@ -80,6 +296,31 @@ def test_ensure_focused_eval_set_reuses_an_existing_version():
     )
 
     assert focused is not None
+    evalcli.upload_eval_set.assert_not_called()
+
+
+def test_ensure_focused_eval_set_reuses_a_nonempty_retry_version():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = {"name": "empty-deterministic"}
+    prefix = focused_eval_set_version("v1", ["keep"])
+    retry_version = f"{prefix}_retry_c8ad"
+    evalcli.list_eval_set_versions.return_value = [{"version": retry_version}]
+    evalcli.list_eval_set_entries.side_effect = [
+        [],
+        [{"id": "ingested-1"}, {"id": "ingested-2"}],
+    ]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+    )
+
+    assert focused is not None
+    assert focused.version == retry_version
+    assert focused.entry_count == 2
     evalcli.upload_eval_set.assert_not_called()
 
 

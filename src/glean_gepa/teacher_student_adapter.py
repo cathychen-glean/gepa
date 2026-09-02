@@ -20,7 +20,7 @@ from glean_gepa.al_adapter import (
     ReflectiveExampleMetrics,
     Thresholds,
 )
-from glean_gepa.batch import GleanEvaluationBatch
+from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
@@ -34,6 +34,7 @@ from glean_gepa.tool_match_util import (
     fetch_eval_run_tool_match_analysis,
     log_tool_match_analysis,
     require_compared_eval_entries,
+    sequence_levenshtein_distance,
 )
 
 PRIMARY_OBJECTIVE = "tool_alignment"
@@ -41,6 +42,7 @@ FIXED_GROUNDING = 1.0
 COMPLETENESS_WEIGHT = 0.5
 TOOL_ALIGNMENT_WEIGHT = 0.3
 GROUNDING_WEIGHT = 0.2
+HIGH_SIGNAL_ENTRY_LIMIT = 20
 POINTWISE_JUDGES: tuple[tuple[str, str], ...] = ((COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),)
 
 
@@ -137,13 +139,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
         run_label: str = "gepa",
     ) -> tuple[str, bool]:
         """Return a cached eval id, or start a new run without waiting."""
-        cached = self._lookup_eval_id(cache_key)
-        if cached is not None:
-            eval_id, wait_required = cached
-            hit_kind = "Soft cache HIT" if wait_required else "Cache HIT"
-            print(f"[{hit_kind}] Using cached {role} eval_id: {eval_id} ({run_label})")
-            return eval_id, wait_required
-
         eval_id, wait_required = self.runner.start(
             model,
             system_prompt=system_prompt,
@@ -152,11 +147,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
             deployment_ids=deployment_ids,
             run_label=run_label,
         )
-        self._record_eval_id(cache_key, eval_id, completed=not wait_required)
         if wait_required:
             print(f"[Cache MISS] Started {role} eval_id: {eval_id}")
         else:
-            print(f"[Cache HIT] Using cached {role} eval_id: {eval_id}")
+            print(f"[Cache HIT] Using cached {role} eval_id: {eval_id} ({run_label})")
         return eval_id, wait_required
 
     def _start_batch_evals(
@@ -168,7 +162,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
         started: list[_StartedPair] = []
         pending_waits: dict[str, tuple[tuple[str, ...], str]] = {}
         for al_data_inst in batch:
-            target = resolve_eval_run_target(self.runner.evalcli, al_data_inst)
+            target = resolve_eval_run_target(
+                self.runner.evalcli,
+                al_data_inst,
+                bigquery_client=self.bigquery_client,
+            )
             if target is None:
                 print(
                     "[Focused eval set] Could not prepare high-signal eval set for "
@@ -195,26 +193,36 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 student_prompt_hash,
                 run_label,
             )
-            teacher_eval_id, wait_teacher = self._get_or_start_eval(
-                cache_key=teacher_cache_key,
-                model=self.teacher_model,
-                system_prompt="<<TEACHER_PROD_PROMPT>>",
-                eval_set_name=eval_set_name,
-                eval_set_version=eval_set_version,
-                deployment_ids=deployment_ids,
-                role="teacher",
-                run_label=run_label,
-            )
-            student_eval_id, wait_student = self._get_or_start_eval(
-                cache_key=student_cache_key,
-                model=self.student_model,
-                system_prompt=system_prompt,
-                eval_set_name=eval_set_name,
-                eval_set_version=eval_set_version,
-                deployment_ids=deployment_ids,
-                role="student",
-                run_label=run_label,
-            )
+            teacher_eval_id = al_data_inst.get("cached_teacher_eval_run_id")
+            wait_teacher = False
+            if teacher_eval_id:
+                print(f"[Child cache HIT] Using cached teacher eval_id: {teacher_eval_id}")
+            else:
+                teacher_eval_id, wait_teacher = self._get_or_start_eval(
+                    cache_key=teacher_cache_key,
+                    model=self.teacher_model,
+                    system_prompt="<<TEACHER_PROD_PROMPT>>",
+                    eval_set_name=eval_set_name,
+                    eval_set_version=eval_set_version,
+                    deployment_ids=deployment_ids,
+                    role="teacher",
+                    run_label=run_label,
+                )
+            student_eval_id = al_data_inst.get("cached_student_eval_run_id")
+            wait_student = False
+            if student_eval_id:
+                print(f"[Child cache HIT] Using cached student eval_id: {student_eval_id}")
+            else:
+                student_eval_id, wait_student = self._get_or_start_eval(
+                    cache_key=student_cache_key,
+                    model=self.student_model,
+                    system_prompt=system_prompt,
+                    eval_set_name=eval_set_name,
+                    eval_set_version=eval_set_version,
+                    deployment_ids=deployment_ids,
+                    role="student",
+                    run_label=run_label,
+                )
             if wait_teacher:
                 pending_waits[teacher_eval_id] = (teacher_cache_key, "teacher")
             if wait_student:
@@ -229,9 +237,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
         return started, pending_waits
 
     def _wait_pending_evals(self, pending_waits: dict[str, tuple[tuple[str, ...], str]]) -> None:
-        for eval_id, (cache_key, role) in pending_waits.items():
+        for eval_id, (_cache_key, role) in pending_waits.items():
             self.runner.wait(eval_id)
-            self._record_eval_id(cache_key, eval_id, completed=True)
             print(f"[Cache MISS] Cached {role} eval_id: {eval_id}")
             for judge_type, run_params in POINTWISE_JUDGES:
                 self._ensure_judge(eval_id, judge_type=judge_type, run_params=run_params)
@@ -276,9 +283,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for judge_type, raw in by_type.items():
                 if not isinstance(raw, dict):
                     continue
-                per_entry = {
-                    str(entry_id): float(score) for entry_id, score in (raw.get("per_entry") or {}).items()
-                }
+                per_entry = {str(entry_id): float(score) for entry_id, score in (raw.get("per_entry") or {}).items()}
                 aggregate_raw = raw.get("aggregate")
                 aggregate = 0.0 if aggregate_raw is None else float(aggregate_raw)
                 if per_entry and raw.get("aggregate") is None:
@@ -381,6 +386,44 @@ class TeacherStudentAdapter(GleanAdapterBase):
             self._run_judges(started)
         return [self._finish_batch_evals(started, capture_traces) for started in all_started]
 
+    def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
+        """Keep the 20 parent failures with the largest tool-sequence edit distance."""
+        ranked: list[tuple[int, str, TeacherStudentALDataInst]] = []
+        seen: set[str] = set()
+        for trajectory in eval_batch.trajectories or []:
+            if trajectory["score"] >= 1.0:
+                continue
+            data = trajectory["data"]
+            output = trajectory["output"]
+            entry_id = output.get("entry_id")
+            if not entry_id or entry_id in seen:
+                continue
+            seen.add(entry_id)
+            distance = sequence_levenshtein_distance(
+                output.get("student_tool_events") or [],
+                output.get("teacher_tool_events") or [],
+            )
+            ranked.append((distance, entry_id, data))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        selected = ranked[:HIGH_SIGNAL_ENTRY_LIMIT]
+        if selected:
+            print(f"[High-signal] Selected {len(selected)}/{len(ranked)} entries by tool-sequence Levenshtein")
+
+        grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+        for _distance, entry_id, data in selected:
+            key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
+            grouped.setdefault(key, []).append(entry_id)
+        return [
+            {
+                "eval_set_name": eval_set_name,
+                "eval_set_version": eval_set_version,
+                "deployment_ids": list(deployment_ids),
+                "status": "active",
+                "eval_entry_ids": entry_ids,
+            }
+            for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items()
+        ]
+
     @staticmethod
     def _check_primary_tool_mismatch(output: TeacherStudentALRolloutOutput) -> bool:
         student_tools = output.get("student_tool_events", [])
@@ -470,15 +513,31 @@ class TeacherStudentAdapter(GleanAdapterBase):
         all_trajectories: list[TeacherStudentALTrajectory] | None = [] if capture_traces else None
         all_objective_scores: list[dict[str, float]] = []
         focused_alignment_rates: list[float] = []
+        focused_levenshtein_avgs: list[float] = []
+        all_eval_run_ids: list[EvalRunIds] = []
 
         for pair in started:
             al_data_inst = pair.al_data_inst
+            all_eval_run_ids.append(
+                {
+                    "eval_set_name": str(al_data_inst.get("eval_set_name", "")),
+                    "eval_set_version": str(al_data_inst.get("eval_set_version", "")),
+                    "student_eval_run_id": pair.student_eval_id,
+                    "teacher_eval_run_id": pair.teacher_eval_id,
+                }
+            )
             tool_match_analysis = self._get_or_fetch_tool_match_analysis(pair.teacher_eval_id, pair.student_eval_id)
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             if is_focused_eval:
                 matching = sum(1 for metrics in tool_match_analysis.per_entry.values() if metrics.tools_match)
                 focused_alignment_rates.append(matching / len(requested_entry_ids))
+                distances = [
+                    sequence_levenshtein_distance(metrics.student_tools, metrics.teacher_tools)
+                    for metrics in tool_match_analysis.per_entry.values()
+                ]
+                if distances:
+                    focused_levenshtein_avgs.append(sum(distances) / len(distances))
                 if not tool_match_analysis.per_entry:
                     continue
             else:
@@ -552,10 +611,14 @@ class TeacherStudentAdapter(GleanAdapterBase):
             if summary is None:
                 summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
             summary["tool_alignment"] = sum(focused_alignment_rates) / len(focused_alignment_rates)
+        if focused_levenshtein_avgs:
+            if summary is None:
+                summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
+            summary["avg_tool_levenshtein"] = sum(focused_levenshtein_avgs) / len(focused_levenshtein_avgs)
+            print(f"[High-signal] Average tool-sequence Levenshtein={summary['avg_tool_levenshtein']:.2f}")
         if summary is not None and started:
             teacher_scores = [
-                self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE).aggregate
-                for pair in started
+                self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE).aggregate for pair in started
             ]
             summary["teacher_completeness"] = sum(teacher_scores) / len(teacher_scores)
 
@@ -565,6 +628,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             trajectories=all_trajectories,
             objective_scores=all_objective_scores,
             summary=summary,
+            eval_run_ids=all_eval_run_ids,
         )
 
 

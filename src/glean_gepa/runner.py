@@ -22,6 +22,7 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.api import optimize
 from glean_gepa.bigquery_client import BigQueryClient
+from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
@@ -37,6 +38,24 @@ from glean_gepa.prompt import (
 from glean_gepa.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
+
+CACHE_DIRECTORY_NAME = "cache"
+ADAPTER_CACHE_FILENAME = "glean_adapter_cache.json"
+EVAL_RUN_CACHE_FILENAME = "glean_eval_run_cache.json"
+CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
+
+
+def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
+    """Return a run-local cache path, moving a legacy root-level cache if needed."""
+    if run_dir is None:
+        return None
+
+    cache_file = run_dir / CACHE_DIRECTORY_NAME / filename
+    legacy_file = run_dir / filename
+    if legacy_file.exists() and not cache_file.exists():
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file.replace(cache_file)
+    return cache_file
 
 
 def _load_seed_candidate(path: Path, required_keys: set[str]) -> dict[str, str]:
@@ -238,8 +257,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed_candidate", type=Path)
     parser.add_argument("--max_metric_calls", type=int, default=10)
     parser.add_argument("--run_dir", type=Path, default=None)
-    parser.add_argument("--student_model", default="gpt")
-    parser.add_argument("--teacher_model", default="gpt")
+    parser.add_argument(
+        "--student_model",
+        default="gpt",
+        help="gpt, fast, claude_sonnet, or claude_opus (default: gpt).",
+    )
+    parser.add_argument(
+        "--teacher_model",
+        default="gpt",
+        help="gpt, fast, claude_sonnet, or claude_opus (default: gpt).",
+    )
     parser.add_argument("--reflection_lm_model", default="OPEN_AI:GPT5_LATEST")
     parser.add_argument("--qe_project", default="dev-sandbox-334901")
     parser.add_argument("--qe_instance", default="glean-dev")
@@ -264,6 +291,30 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_LOOKBACK_DAYS,
         help="UTC days of Agentspan shards to search when scoring an eval run "
         "(shell-tool errors or teacher-student tool match).",
+    )
+    parser.add_argument(
+        "--eval_run_timeout_sec",
+        type=_nonnegative_int,
+        default=21600,
+        help="Maximum time to wait for one Cortex eval run (default: 6 hours).",
+    )
+    parser.add_argument(
+        "--cache_file",
+        type=Path,
+        default=None,
+        help="Persistent adapter-analysis cache. Defaults to <run_dir>/cache/glean_adapter_cache.json.",
+    )
+    parser.add_argument(
+        "--eval_run_cache_file",
+        type=Path,
+        default=None,
+        help="Persistent Cortex eval-run ID cache. Defaults to <run_dir>/cache/glean_eval_run_cache.json.",
+    )
+    parser.add_argument(
+        "--children_cache_file",
+        type=Path,
+        default=None,
+        help="Persistent generated-child cache. Defaults to <run_dir>/cache/glean_children_cache.json.",
     )
     parser.add_argument("--bigquery_project", default=None)
     parser.add_argument(
@@ -303,11 +354,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run deterministic fake eval data and prompt iterations without external Glean services.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show eval-set payloads and shell-tool action/error details.",
+    )
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    set_debug(args.debug)
 
     if args.fake_flow:
         _run_fake_flow(args)
@@ -324,11 +381,18 @@ def main() -> None:
     trainset = _make_evalset(train_versions)
     valset = _make_evalset(val_versions)
     judging_mode = cast(JudgingMode, args.judging_mode)
+    cache_file = args.cache_file or _default_cache_file(args.run_dir, ADAPTER_CACHE_FILENAME)
+    eval_run_cache_file = args.eval_run_cache_file or _default_cache_file(args.run_dir, EVAL_RUN_CACHE_FILENAME)
+    children_cache_file = args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME)
     adapter_kwargs = {
-        "runner": ALRunner(evalcli=evalcli),
+        "runner": ALRunner(
+            evalcli=evalcli,
+            cache_file=str(eval_run_cache_file) if eval_run_cache_file else None,
+            eval_run_timeout_sec=args.eval_run_timeout_sec,
+        ),
         "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         "student_model": args.student_model,
-        "cache_file": "~/eval_cache.json",
+        "cache_file": str(cache_file) if cache_file else None,
         "bigquery_client": BigQueryClient(project_id=args.bigquery_project),
         "agentspan_lookback_days": args.agentspan_lookback_days,
         "editable_modules": editable_modules,
@@ -350,25 +414,33 @@ def main() -> None:
         args.global_token_cap,
         *(MODULE_TOKEN_BUDGETS.get(name, 0) for name in adapter.editable_modules),
     )
-    proposer = EvolutionaryProposer(
-        logger=logger,
-        trainset=trainset,
-        al_adapter=adapter,
-        reflection_llm=_make_reflection_lm(
+    proposer_kwargs = {
+        "logger": logger,
+        "trainset": trainset,
+        "al_adapter": adapter,
+        "reflection_llm": _make_reflection_lm(
             args.reflection_lm_model,
             qe_project=args.qe_project,
             qe_instance=args.qe_instance,
             authenticated_email=args.qe_authenticated_email,
         ),
-        experiment_tracker=tracker,
-        model=args.student_model,
-        module_specs=module_specs,
-        global_token_cap=global_token_cap,
-        reflect_k=args.reflection_samples,
-        reflection_hamming_distance_k=args.reflection_hamming_distance_k,
-        baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
-        evalset_policy=UnseenEvalSetPolicy(),
-    )
+        "experiment_tracker": tracker,
+        "model": args.student_model,
+        "module_specs": module_specs,
+        "global_token_cap": global_token_cap,
+        "reflect_k": args.reflection_samples,
+        "reflection_hamming_distance_k": args.reflection_hamming_distance_k,
+        "baseline_prompt_hash": hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
+        "evalset_policy": UnseenEvalSetPolicy(),
+        "children_cache_file": children_cache_file,
+    }
+    if judging_mode == "teacher_student":
+        proposer = EvolutionaryProposer(
+            **proposer_kwargs,
+            high_signal_screen_mode="avg_levenshtein_decrease",
+        )
+    else:
+        proposer = EvolutionaryProposer(**proposer_kwargs)
     optimize(
         seed_candidate=seed_candidate,
         trainset=trainset,
@@ -386,7 +458,9 @@ def main() -> None:
 def _run_fake_flow(args: argparse.Namespace) -> None:
     """Execute the real GEPA lifecycle with in-memory fake evaluations."""
     seed_candidate, trainset, valset, adapter, module_specs = build_fake_flow_components()
-    print("[FAKE FLOW] Starting offline Glean GEPA flow with separate train and val sets; no external services will be called.")
+    print(
+        "[FAKE FLOW] Starting offline Glean GEPA flow with separate train and val sets; no external services will be called."
+    )
     logger = StdOutLogger()
     tracker = create_experiment_tracker()
     proposer = EvolutionaryProposer(
@@ -401,6 +475,8 @@ def _run_fake_flow(args: argparse.Namespace) -> None:
         reflect_k=3,
         baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
         evalset_policy=UnseenEvalSetPolicy(),
+        children_cache_file=args.children_cache_file
+        or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME),
     )
     result = optimize(
         seed_candidate=seed_candidate,

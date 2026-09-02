@@ -12,6 +12,9 @@ from glean_gepa.prompt import (
     prompt_format,
 )
 from glean_gepa.runner import (
+    ADAPTER_CACHE_FILENAME,
+    CACHE_DIRECTORY_NAME,
+    _default_cache_file,
     _load_seed_candidate,
     _parse_args,
     _parse_editable_modules,
@@ -109,6 +112,23 @@ def test_parse_args_accepts_all_reflection_samples_and_hamming_k():
 
     assert args.reflection_samples is None
     assert args.reflection_hamming_distance_k == 10
+
+
+def test_default_cache_files_live_in_run_cache_directory(tmp_path):
+    assert _default_cache_file(tmp_path, ADAPTER_CACHE_FILENAME) == (
+        tmp_path / CACHE_DIRECTORY_NAME / ADAPTER_CACHE_FILENAME
+    )
+
+
+def test_default_cache_file_moves_legacy_root_cache_on_resume(tmp_path):
+    legacy = tmp_path / ADAPTER_CACHE_FILENAME
+    legacy.write_text('{"cached": true}')
+
+    cache_file = _default_cache_file(tmp_path, ADAPTER_CACHE_FILENAME)
+
+    assert cache_file == tmp_path / CACHE_DIRECTORY_NAME / ADAPTER_CACHE_FILENAME
+    assert cache_file.read_text() == '{"cached": true}'
+    assert not legacy.exists()
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])

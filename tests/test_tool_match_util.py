@@ -10,14 +10,17 @@ from glean_gepa.tool_match_util import (
     NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
     aggregate_tool_match_metrics,
+    avg_levenshtein_alignment_score,
     build_tool_match_per_entry_query,
     build_tool_match_query_params,
     build_tool_match_search_params,
     compute_tool_match_score,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
+    mean_sequence_levenshtein,
     parse_tool_match_entry_metrics,
     require_compared_eval_entries,
+    sequence_levenshtein_distance,
 )
 
 
@@ -35,6 +38,44 @@ def test_compute_tool_match_score_one_side_empty():
 
 def test_compute_tool_match_score_partial_prefix():
     assert compute_tool_match_score(("search", "read"), ("search", "write")) == 0.5
+
+
+@pytest.mark.parametrize(
+    ("student", "teacher", "distance"),
+    [
+        (("search", "read"), ("search", "read"), 0),
+        (("search", "read"), ("search", "write"), 1),
+        ((), ("search", "read"), 2),
+        (("search",), ("search", "read", "write"), 2),
+        (("a", "b", "c"), ("a", "x", "c", "d"), 2),
+    ],
+)
+def test_sequence_levenshtein_distance(student, teacher, distance):
+    assert sequence_levenshtein_distance(student, teacher) == distance
+
+
+def test_mean_sequence_levenshtein_averages_requested_entries():
+    per_entry = {
+        "a": (("search", "read", "write"), ()),
+        "b": (("search",), ("search",)),
+        "c": (("read",), ("write",)),
+    }
+
+    assert mean_sequence_levenshtein(per_entry, ["a", "b"]) == 1.5
+
+
+def test_mean_sequence_levenshtein_uses_fallback_for_missing_entries():
+    per_entry = {"a": (("search", "read"), ("search",))}
+
+    assert mean_sequence_levenshtein(per_entry, ["a", "b"], fallback_distances={"b": 4}) == 2.5
+    assert mean_sequence_levenshtein(per_entry, ["a", "b"]) == float("inf")
+
+
+def test_avg_levenshtein_alignment_score_decreases_with_distance():
+    assert avg_levenshtein_alignment_score(0) == 1.0
+    assert avg_levenshtein_alignment_score(1) == 0.5
+    assert avg_levenshtein_alignment_score(float("inf")) == 0.0
+    assert avg_levenshtein_alignment_score(3) < avg_levenshtein_alignment_score(1)
 
 
 def test_build_tool_match_per_entry_query_pairs_teacher_and_student():

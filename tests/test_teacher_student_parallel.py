@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from glean_gepa.al_adapter import ALRunner, Thresholds
+from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
-from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
+from glean_gepa.teacher_student_adapter import HIGH_SIGNAL_ENTRY_LIMIT, TeacherStudentAdapter, _StartedPair
 from glean_gepa.tool_match_util import (
     EvalRunToolMatchAnalysis,
     NoComparedEvalEntriesError,
@@ -48,7 +48,7 @@ def _teacher_student_adapter(evalcli: MagicMock, cache_file: str | None = None) 
     return TeacherStudentAdapter(
         runner=ALRunner(evalcli=evalcli),
         teacher_model="gpt",
-        student_model="claude",
+        student_model="claude_sonnet",
         thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         cache_file=cache_file,
     )
@@ -140,7 +140,7 @@ def test_evaluate_many_starts_all_candidate_runs_before_waiting():
     # One shared teacher run plus one student run per candidate.
     _assert_all_creates_before_waits(events, n_creates=3, n_waits=3)
     teacher_creates = [event for event in events if event.startswith("create:") and "_gpt_" in event]
-    student_creates = [event for event in events if event.startswith("create:") and "_claude_" in event]
+    student_creates = [event for event in events if event.startswith("create:") and "_claude_sonnet_" in event]
     assert len(teacher_creates) == 1
     assert len(student_creates) == 2
 
@@ -169,7 +169,7 @@ def test_batch_evaluate_shares_teacher_run_across_children():
 
     _assert_all_creates_before_waits(events, n_creates=3, n_waits=3)
     teacher_creates = [event for event in events if event.startswith("create:") and "_gpt_" in event]
-    student_creates = [event for event in events if event.startswith("create:") and "_claude_" in event]
+    student_creates = [event for event in events if event.startswith("create:") and "_claude_sonnet_" in event]
     assert len(teacher_creates) == 1
     assert len(student_creates) == 2
 
@@ -370,6 +370,7 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
 
     assert result.summary is not None
     assert result.summary["tool_alignment"] == pytest.approx(1 / 3)
+    assert result.summary["avg_tool_levenshtein"] == pytest.approx(0.5)
     assert [score["tool_alignment"] for score in result.objective_scores] == [1.0, 0.0]
 
 
@@ -413,45 +414,35 @@ def test_finish_batch_evals_raises_when_no_entries_were_compared():
         )
 
 
-def test_launched_eval_ids_are_soft_cached_before_wait(tmp_path):
+def test_launched_eval_ids_are_tracked_in_flight_before_wait():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
-    cache_file = tmp_path / "eval_cache.json"
-    adapter = _teacher_student_adapter(evalcli, cache_file=str(cache_file))
+    adapter = _teacher_student_adapter(evalcli)
 
     with patch.object(adapter.runner, "wait", side_effect=TimeoutError("terminal timed out")):
         with pytest.raises(TimeoutError):
             adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
-    saved = json.loads(cache_file.read_text())
-    assert saved["eval_cache"] == {}
-    assert len(saved["in_flight_eval_cache"]) == 2
     create_ids = [event.split(":", 1)[1] for event in events if event.startswith("create:")]
-    assert sorted(saved["in_flight_eval_cache"].values()) == sorted(create_ids)
+    assert sorted(adapter.runner._in_flight) == sorted(create_ids)
 
 
-def test_soft_cached_eval_ids_resume_wait_instead_of_recreating(tmp_path):
-    first_events: list[str] = []
-    first_evalcli = _evalcli_with_ordered_events(first_events)
-    cache_file = tmp_path / "eval_cache.json"
-    first = _teacher_student_adapter(first_evalcli, cache_file=str(cache_file))
-    with patch.object(first.runner, "wait", side_effect=TimeoutError("terminal timed out")):
+def test_in_flight_eval_ids_resume_wait_instead_of_recreating():
+    events: list[str] = []
+    evalcli = _evalcli_with_ordered_events(events)
+    adapter = _teacher_student_adapter(evalcli)
+    with patch.object(adapter.runner, "wait", side_effect=TimeoutError("terminal timed out")):
         with pytest.raises(TimeoutError):
-            first.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
-    launched_ids = sorted(json.loads(cache_file.read_text())["in_flight_eval_cache"].values())
+            adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
+    launched_ids = sorted(adapter.runner._in_flight)
 
-    second_events: list[str] = []
-    second_evalcli = _evalcli_with_ordered_events(second_events)
-    second = _teacher_student_adapter(second_evalcli, cache_file=str(cache_file))
-    with patch.object(second, "_get_or_fetch_tool_match_analysis", return_value=_tool_match_analysis()):
-        second.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
+    with patch.object(adapter, "_get_or_fetch_tool_match_analysis", return_value=_tool_match_analysis()):
+        adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
-    assert second_evalcli.create_eval_run.call_count == 0
-    waited_ids = sorted(event.split(":", 1)[1] for event in second_events if event.startswith("wait:"))
+    assert evalcli.create_eval_run.call_count == 2
+    waited_ids = sorted(event.split(":", 1)[1] for event in events if event.startswith("wait:"))
     assert waited_ids == launched_ids
-    saved = json.loads(cache_file.read_text())
-    assert saved["in_flight_eval_cache"] == {}
-    assert sorted(saved["eval_cache"].values()) == launched_ids
+    assert adapter.runner._in_flight == {}
 
 
 def _stub_completeness_judge(evalcli: MagicMock, events: list[str], *, score: float = 0.8) -> None:
@@ -508,4 +499,42 @@ def test_completeness_judge_for_teacher_is_created_once_across_candidates():
     # One shared teacher eval plus one student eval per candidate.
     assert len(judged_eval_ids) == 3
     assert len(set(judged_eval_ids)) == 3
+
+
+def test_high_signal_batch_keeps_top_levenshtein_mismatches():
+    adapter = _teacher_student_adapter(MagicMock())
+    trajectories = []
+    for index in range(HIGH_SIGNAL_ENTRY_LIMIT + 5):
+        trajectories.append(
+            {
+                "data": EVAL_SET,
+                "output": {
+                    "entry_id": f"entry-{index:02d}",
+                    "student_tool_events": ["search"] * (index + 1),
+                    "teacher_tool_events": [],
+                },
+                "score": 0.5,
+                "objective_scores": {"tool_alignment": 0.0},
+            }
+        )
+    trajectories.append(
+        {
+            "data": EVAL_SET,
+            "output": {
+                "entry_id": "perfect",
+                "student_tool_events": ["search"] * 50,
+                "teacher_tool_events": [],
+            },
+            "score": 1.0,
+            "objective_scores": {"tool_alignment": 1.0},
+        }
+    )
+    focused = adapter.high_signal_batch(
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[])
+    )
+
+    assert focused[0]["eval_entry_ids"] == [f"entry-{index:02d}" for index in range(HIGH_SIGNAL_ENTRY_LIMIT + 4, 4, -1)]
+    assert "perfect" not in focused[0]["eval_entry_ids"]
+    assert "entry-00" not in focused[0]["eval_entry_ids"]
+
 
