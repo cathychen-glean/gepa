@@ -3,6 +3,7 @@ from datetime import date
 
 import pytest
 
+from glean_gepa.core_tools import CORE_TOOLS, CORE_TOOLS_GROUP, with_core_tool_defaults
 from glean_gepa.prompt import (
     FULL_PROMPT_KEY,
     WRITING_CODE_KEY,
@@ -38,7 +39,9 @@ def test_compile_and_materialize_splice_writing_code_when_present():
 
 def test_compile_system_prompt_leaves_writing_code_slot_when_key_absent():
     assert compile_system_prompt({}) == prompt_format
-    assert compile_system_prompt({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"}) == "PREFIX\n{WRITING_CODE}\nSUFFIX"
+    assert (
+        compile_system_prompt({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"}) == "PREFIX\n{WRITING_CODE}\nSUFFIX"
+    )
 
 
 def test_materialize_system_prompt_fills_defaults_when_modules_missing():
@@ -55,6 +58,7 @@ def test_materialize_system_prompt_fills_defaults_when_modules_missing():
         ({"WRITING_CODE": "code instructions"}, {WRITING_CODE_KEY}),
         ({"FULL_PROMPT": "full template"}, {FULL_PROMPT_KEY}),
         ({"WRITING_CODE": "patterns", "FULL_PROMPT": "template"}, {FULL_PROMPT_KEY}),
+        ({"glean_search": "Search less."}, set()),
     ],
 )
 def test_load_seed_candidate_accepts_known_keys(tmp_path, raw, required_keys):
@@ -64,20 +68,32 @@ def test_load_seed_candidate_accepts_known_keys(tmp_path, raw, required_keys):
     assert _load_seed_candidate(path, required_keys=required_keys) == raw
 
 
-@pytest.mark.parametrize(
-    "editable, expected",
-    [
-        ([FULL_PROMPT_KEY], {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}),
-        ([WRITING_CODE_KEY], {WRITING_CODE_KEY: "patterns"}),
-    ],
-)
-def test_seed_for_editable_modules(editable, expected):
-    assert _seed_for_editable_modules(SEED_BOTH, editable) == expected
+def test_seed_for_editable_modules():
+    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == with_core_tool_defaults(
+        {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
+    )
+    assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == with_core_tool_defaults(
+        {WRITING_CODE_KEY: "patterns"}
+    )
+
+    raw = {**SEED_BOTH, "glean_search": "Search less."}
+    seed = _seed_for_editable_modules(raw, [FULL_PROMPT_KEY])
+    assert seed["glean_search"] == "Search less."
+    assert seed["discover"] == with_core_tool_defaults({})["discover"]
+
+    frozen = _seed_for_editable_modules(SEED_BOTH, [])
+    assert frozen[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
+    assert WRITING_CODE_KEY not in frozen
+    assert frozen["glean_search"] == with_core_tool_defaults({})["glean_search"]
 
 
 def test_parse_editable_modules():
     assert _parse_editable_modules("FULL_PROMPT") == [FULL_PROMPT_KEY]
     assert _parse_editable_modules("WRITING_CODE,FULL_PROMPT") == [WRITING_CODE_KEY, FULL_PROMPT_KEY]
+    assert _parse_editable_modules("glean_search") == ["glean_search"]
+    assert _parse_editable_modules(CORE_TOOLS_GROUP) == list(CORE_TOOLS)
+    assert _parse_editable_modules(f"FULL_PROMPT,{CORE_TOOLS_GROUP}") == [FULL_PROMPT_KEY, *CORE_TOOLS]
+    assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},glean_search") == list(CORE_TOOLS)
     with pytest.raises(SystemExit, match="unknown editable_modules"):
         _parse_editable_modules("GLOBAL_ROLE")
 

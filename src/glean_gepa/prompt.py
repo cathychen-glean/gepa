@@ -1,6 +1,14 @@
 """Prompt encoding for the Glean assistant."""
 
 from base64 import b64encode
+from collections.abc import Sequence
+
+from glean_gepa.core_tools import (
+    CORE_TOOL_DESCRIPTIONS,
+    CORE_TOOL_TOKEN_BUDGET,
+    CORE_TOOLS,
+    compile_tool_description_overrides,
+)
 
 # Candidate key for coding instructions under "## Writing Code".
 WRITING_CODE_KEY = "WRITING_CODE"
@@ -222,11 +230,13 @@ The current date in the user's preferred timezone is [[today]]<<<[[shell_date_hi
 PROMPT_MODULE_DEFAULTS = {
     WRITING_CODE_KEY: default_writing_code,
     FULL_PROMPT_KEY: prompt_format,
+    **CORE_TOOL_DESCRIPTIONS,
 }
 KNOWN_PROMPT_KEYS = frozenset(PROMPT_MODULE_DEFAULTS)
 MODULE_TOKEN_BUDGETS = {
     WRITING_CODE_KEY: 1024,
     FULL_PROMPT_KEY: 8192,
+    **dict.fromkeys(CORE_TOOLS, CORE_TOOL_TOKEN_BUDGET),
 }
 
 
@@ -255,6 +265,19 @@ def compile_system_prompt(candidate: dict[str, str]) -> str:
 
 
 def compile_encoded_prompt(candidate: dict[str, str]) -> str:
-    """Compile candidate modules into the encoded prompt override parameter."""
+    """Compile candidate modules into encoded scParams fragments.
+
+    Always includes the coding-agent system prompt. Core-tool description
+    overrides are appended when the candidate has those modules.
+    """
     encoded_system_prompt = b64encode(compile_system_prompt(candidate).encode("utf-8")).decode("ascii")
-    return "llmo.per_prompt_overrides.coding_agent_loop_system=" + encoded_system_prompt
+    parts = ["llmo.per_prompt_overrides.coding_agent_loop_system=" + encoded_system_prompt]
+    tool_overrides = compile_tool_description_overrides(candidate)
+    if tool_overrides:
+        parts.append(tool_overrides)
+    return ",".join(parts)
+
+
+def candidate_module_names(editable_modules: Sequence[str]) -> list[str]:
+    """Editable modules plus core-tool description keys, de-duplicated in that order."""
+    return list(dict.fromkeys([*editable_modules, *CORE_TOOLS]))

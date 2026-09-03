@@ -22,9 +22,9 @@ class _ReflectionAdapter:
     def make_reflective_dataset(self, **_kwargs: object) -> dict[str, list[dict[str, str]]]:
         return {"WRITING_CODE": [{"feedback": "fix it"}]}
 
-    def propose_new_texts(self, **_kwargs: object) -> tuple[list[str], object]:
+    def propose_new_texts(self, **_kwargs: object) -> tuple[list[str], object, str]:
         self.reflection_calls += 1
-        return self.variants, None
+        return self.variants, None, ""
 
 
 class _Evaluation:
@@ -152,7 +152,7 @@ def test_prints_child_prompt_delta_against_parent(capsys) -> None:
     )
 
     output = capsys.readouterr().out
-    assert "Prompt delta for child" in output
+    assert "CHILD PROPOSAL" in output
     assert "--- parent/root/WRITING_CODE" in output
     assert "-original line" in output
     assert "+updated line" in output

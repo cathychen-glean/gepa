@@ -9,7 +9,7 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
-from glean_gepa.teacher_student_adapter import HIGH_SIGNAL_ENTRY_LIMIT, TeacherStudentAdapter, _StartedPair
+from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
 from glean_gepa.tool_match_util import (
     EvalRunToolMatchAnalysis,
     NoComparedEvalEntriesError,
@@ -75,7 +75,6 @@ def _tool_match_analysis(
             student_tools=("search",),
             teacher_tools=("read",),
             tools_match=False,
-            tool_match_score=0.5,
         )
     matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
     return EvalRunToolMatchAnalysis(
@@ -88,7 +87,6 @@ def _tool_match_analysis(
             student_eval_id=student_eval_id,
             compared_entries=len(per_entry),
             matching_entries=matching,
-            mismatching_entries=len(per_entry) - matching,
             tool_match_rate=(matching / len(per_entry)) if per_entry else 0.0,
         ),
         per_entry=per_entry,
@@ -217,7 +215,6 @@ def test_get_or_fetch_tool_match_analysis_caches_fetch():
             student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
-            mismatching_entries=1,
             tool_match_rate=0.0,
         ),
         per_entry={},
@@ -253,7 +250,6 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
             student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
-            mismatching_entries=1,
             tool_match_rate=0.5,
         ),
         per_entry={
@@ -262,7 +258,6 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
                 student_tools=("search",),
                 teacher_tools=("read",),
                 tools_match=False,
-                tool_match_score=0.5,
             )
         },
         high_signal_entry_ids=("entry-1",),
@@ -285,18 +280,18 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
         capture_traces=True,
     )
 
-    assert result.scores == pytest.approx([0.85])
-    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.5, "grounding": 1.0}]
+    assert result.scores == pytest.approx([0.7])
+    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0, "grounding": 1.0}]
     assert result.outputs[0]["student_tool_events"] == ["search"]
     assert result.outputs[0]["teacher_tool_events"] == ["read"]
     assert result.summary == {
         "completeness": 1.0,
-        "tool_alignment": 0.5,
+        "tool_alignment": 0.0,
         "grounding": 1.0,
         "teacher_completeness": 0.9,
     }
     assert result.trajectories is not None
-    assert result.trajectories[0]["score"] == pytest.approx(0.85)
+    assert result.trajectories[0]["score"] == pytest.approx(0.7)
 
 
 def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
@@ -335,7 +330,6 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
             student_eval_id="student-1",
             compared_entries=2,
             matching_entries=1,
-            mismatching_entries=1,
             tool_match_rate=0.5,
         ),
         per_entry={
@@ -344,14 +338,12 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
                 student_tools=("read",),
                 teacher_tools=("read",),
                 tools_match=True,
-                tool_match_score=1.0,
             ),
             "fresh-2": ToolMatchEntryMetrics(
                 entry_id="fresh-2",
                 student_tools=("search",),
                 teacher_tools=("read",),
                 tools_match=False,
-                tool_match_score=0.5,
             ),
         },
         high_signal_entry_ids=("fresh-1", "fresh-2"),
@@ -370,7 +362,7 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
 
     assert result.summary is not None
     assert result.summary["tool_alignment"] == pytest.approx(1 / 3)
-    assert result.summary["avg_tool_levenshtein"] == pytest.approx(0.5)
+    assert "avg_tool_levenshtein" not in result.summary
     assert [score["tool_alignment"] for score in result.objective_scores] == [1.0, 0.0]
 
 
@@ -501,40 +493,130 @@ def test_completeness_judge_for_teacher_is_created_once_across_candidates():
     assert len(set(judged_eval_ids)) == 3
 
 
-def test_high_signal_batch_keeps_top_levenshtein_mismatches():
+def test_high_signal_batch_keeps_every_first_tool_mismatch():
     adapter = _teacher_student_adapter(MagicMock())
     trajectories = []
-    for index in range(HIGH_SIGNAL_ENTRY_LIMIT + 5):
+    for index in range(25):
         trajectories.append(
             {
                 "data": EVAL_SET,
                 "output": {
-                    "entry_id": f"entry-{index:02d}",
-                    "student_tool_events": ["search"] * (index + 1),
-                    "teacher_tool_events": [],
+                    "entry_id": f"mismatch-{index:02d}",
+                    "student_tool_events": ["search"],
+                    "teacher_tool_events": ["read"],
                 },
                 "score": 0.5,
                 "objective_scores": {"tool_alignment": 0.0},
             }
         )
-    trajectories.append(
-        {
-            "data": EVAL_SET,
-            "output": {
-                "entry_id": "perfect",
-                "student_tool_events": ["search"] * 50,
-                "teacher_tool_events": [],
+    trajectories.extend(
+        [
+            {
+                "data": EVAL_SET,
+                "output": {
+                    "entry_id": "later-tools-differ",
+                    "student_tool_events": ["search", "write"],
+                    "teacher_tool_events": ["search", "read"],
+                },
+                "score": 0.5,
+                "objective_scores": {"tool_alignment": 1.0},
             },
-            "score": 1.0,
-            "objective_scores": {"tool_alignment": 1.0},
-        }
+            {
+                "data": EVAL_SET,
+                "output": {
+                    "entry_id": "perfect",
+                    "student_tool_events": ["search"],
+                    "teacher_tool_events": ["search"],
+                },
+                "score": 1.0,
+                "objective_scores": {"tool_alignment": 1.0},
+            },
+        ]
     )
     focused = adapter.high_signal_batch(
         GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[])
     )
 
-    assert focused[0]["eval_entry_ids"] == [f"entry-{index:02d}" for index in range(HIGH_SIGNAL_ENTRY_LIMIT + 4, 4, -1)]
+    assert focused[0]["eval_entry_ids"] == [f"mismatch-{index:02d}" for index in range(25)]
+    assert "later-tools-differ" not in focused[0]["eval_entry_ids"]
     assert "perfect" not in focused[0]["eval_entry_ids"]
-    assert "entry-00" not in focused[0]["eval_entry_ids"]
 
 
+def _mismatch_trajectory(entry_id: str, teacher_tools: list[str], student_tools: list[str], *, score: float = 0.5):
+    return {
+        "data": EVAL_SET,
+        "output": {
+            "entry_id": entry_id,
+            "deployment_id": "scio-prod",
+            "query": "q",
+            "student_answer": "",
+            "teacher_answer": "",
+            "student_tool_events": student_tools,
+            "teacher_tool_events": teacher_tools,
+        },
+        "score": score,
+        "objective_scores": {"tool_alignment": 0.0 if teacher_tools[:1] != student_tools[:1] else 1.0},
+    }
+
+
+def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups():
+    adapter = _teacher_student_adapter(MagicMock())
+    trajectories = (
+        [_mismatch_trajectory(f"xy-{i}", ["x"], ["y"]) for i in range(12)]
+        + [_mismatch_trajectory(f"yx-{i}", ["y"], ["x"]) for i in range(8)]
+        + [_mismatch_trajectory(f"ab-{i}", ["a"], ["b"]) for i in range(6)]
+        + [_mismatch_trajectory(f"cd-{i}", ["c"], ["d"]) for i in range(5)]
+        + [_mismatch_trajectory("match", ["search", "read"], ["search", "write"], score=1.0)]
+    )
+    examples = adapter.make_reflective_dataset(
+        {"WRITING_CODE": "prompt"},
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[]),
+        ["WRITING_CODE"],
+        k=8,
+        error_hamming_distance_k=1,
+    )["WRITING_CODE"]
+    entry_ids = [example["Inputs"]["entry_id"] for example in examples]
+    assert len(entry_ids) == 20
+    assert all(entry_id.startswith(("xy-", "yx-")) for entry_id in entry_ids)
+    assert "match" not in entry_ids
+    assert not any(entry_id.startswith(("ab-", "cd-")) for entry_id in entry_ids)
+    assert examples[0]["Feedback"].startswith("First-tool mismatch: teacher used x and student used y.")
+
+    oversized = adapter.make_reflective_dataset(
+        {"WRITING_CODE": "prompt"},
+        GleanEvaluationBatch(
+            outputs=[],
+            scores=[],
+            trajectories=[_mismatch_trajectory(f"xy-{i}", ["x"], ["y"]) for i in range(35)],
+            objective_scores=[],
+        ),
+        ["WRITING_CODE"],
+        k=8,
+    )["WRITING_CODE"]
+    assert [example["Inputs"]["entry_id"] for example in oversized] == [f"xy-{i}" for i in range(35)]
+
+
+def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches():
+    adapter = _teacher_student_adapter(MagicMock())
+    trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
+        _mismatch_trajectory(f"read-{i}", ["Glean Document Reader"], ["todo_write"]) for i in range(8)
+    ]
+    eval_batch = GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[])
+
+    examples = adapter.make_reflective_dataset(
+        {"FULL_PROMPT": "prompt"},
+        eval_batch,
+        ["FULL_PROMPT", "glean_search", "discover", "glean_document_reader"],
+        k=8,
+    )
+
+    assert len(examples["FULL_PROMPT"]) == 20
+    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
+    discover_ids = [example["Inputs"]["entry_id"] for example in examples["discover"]]
+    reader_ids = [example["Inputs"]["entry_id"] for example in examples["glean_document_reader"]]
+    assert search_ids == [f"search-{i}" for i in range(12)]
+    assert discover_ids == search_ids
+    assert reader_ids == [f"read-{i}" for i in range(8)]
+    assert examples["glean_search"][0]["Feedback"].startswith(
+        "First-tool mismatch: teacher used Glean Search and student used Discover."
+    )

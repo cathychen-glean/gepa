@@ -164,7 +164,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         captured_prompts.append(prompt)
         return "NOT_RELEVANT" if len(captured_prompts) == 1 else "rewritten code instructions"
 
-    variants, not_relevant = adapter.propose_new_texts(
+    variants, not_relevant, *_ = adapter.propose_new_texts(
         reflection_lm,
         Candidate(
             model="fast",

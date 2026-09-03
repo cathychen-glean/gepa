@@ -35,9 +35,7 @@ CORRECTNESS_INPUT_MAPPINGS = json.dumps(
 )
 
 CORRECTNESS_JUDGE_TYPE = "CORRECTNESS"
-CORRECTNESS_RUN_PARAMS = json.dumps(
-    {"Judge Type": "DIRECT_CORRECTNESS", "Llm model": "default", "Use Cache": "true"}
-)
+CORRECTNESS_RUN_PARAMS = json.dumps({"Judge Type": "DIRECT_CORRECTNESS", "Llm model": "default", "Use Cache": "true"})
 COMPLETENESS_JUDGE_TYPE = "COMPLETENESS"
 COMPLETENESS_RUN_PARAMS = json.dumps({"Llm model": "default", "Use Cache": "true"})
 
@@ -60,6 +58,10 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "Connection reset",
     "__Host-GCP_IAP_AUTH_TOKEN_",
 )
+# evalcli sometimes exits 1 with a bare "Error:" and empty stdout.
+OPAQUE_EVALCLI_ERROR_MARKER = "stderr: Error:\nstdout:"
+JUDGE_CREATE_ATTEMPTS = 4
+JUDGE_CREATE_RETRY_SEC = 30
 
 MIN_INGESTED_ENTRY_FRACTION = 0.5
 
@@ -68,9 +70,7 @@ class EvalCliError(RuntimeError):
     pass
 
 
-def min_ingested_eval_set_entries(
-    expected_count: int, *, min_fraction: float = MIN_INGESTED_ENTRY_FRACTION
-) -> int:
+def min_ingested_eval_set_entries(expected_count: int, *, min_fraction: float = MIN_INGESTED_ENTRY_FRACTION) -> int:
     """Return the fewest ingested rows that still count as a usable eval set."""
     if expected_count <= 0:
         return 1
@@ -80,11 +80,7 @@ def min_ingested_eval_set_entries(
 def _is_unreliable_ca_bundle(path: str) -> bool:
     # Cursor sandbox and some proxies inject ephemeral temp CA files that break child Python tools.
     normalized = path.lower()
-    return (
-        "/var/folders/" in path
-        or normalized.startswith("/tmp/")
-        or "socketfirewallca.crt" in normalized
-    )
+    return "/var/folders/" in path or normalized.startswith("/tmp/") or "socketfirewallca.crt" in normalized
 
 
 def _resolve_ca_bundle() -> str | None:
@@ -96,11 +92,7 @@ def _resolve_ca_bundle() -> str | None:
     defaults = ssl.get_default_verify_paths()
     if defaults.openssl_cafile and os.path.isfile(defaults.openssl_cafile):
         candidates.append(defaults.openssl_cafile)
-    if (
-        defaults.cafile
-        and os.path.isfile(defaults.cafile)
-        and not _is_unreliable_ca_bundle(defaults.cafile)
-    ):
+    if defaults.cafile and os.path.isfile(defaults.cafile) and not _is_unreliable_ca_bundle(defaults.cafile):
         candidates.append(defaults.cafile)
 
     for candidate in candidates:
@@ -128,15 +120,29 @@ def _subprocess_env() -> dict[str, str]:
 
 def _is_transient_evalcli_error(exc: EvalCliError) -> bool:
     message = str(exc)
-    return any(pattern in message for pattern in TRANSIENT_EVALCLI_PATTERNS)
+    if any(pattern in message for pattern in TRANSIENT_EVALCLI_PATTERNS):
+        return True
+    return OPAQUE_EVALCLI_ERROR_MARKER in message
 
 
-def _is_eval_complete(status: dict[str, Any]) -> bool:
+def classify_eval_run_status(status: Any) -> str:
+    """Classify a Cortex run-status payload as ongoing, usable, or missing."""
+    if not isinstance(status, dict):
+        return "missing"
     task_counts = status.get("taskCountsByStatus") or []
-    active_counts = [entry for entry in task_counts if (entry.get("count") or 0) > 0]
+    if not isinstance(task_counts, list):
+        return "missing"
+    active_counts = [entry for entry in task_counts if isinstance(entry, dict) and (entry.get("count") or 0) > 0]
     if not active_counts:
-        return False
-    return all(entry.get("status") in TERMINAL_TASK_STATUSES for entry in active_counts)
+        return "missing"
+    if any(entry.get("status") not in TERMINAL_TASK_STATUSES for entry in active_counts):
+        return "ongoing"
+    return "usable"
+
+
+def is_missing_eval_job(exc: EvalCliError) -> bool:
+    message = str(exc).lower()
+    return "no job found" in message or "not found" in message
 
 
 class EvalCliClient:
@@ -207,7 +213,7 @@ class EvalCliClient:
         *,
         poll_interval_sec: int = 60,
         timeout_sec: int | None = None,
-    ) -> None:
+    ) -> list[Any] | None:
         print(f"Waiting for eval run {eval_run_id} to complete...")
         started_at = time.monotonic()
         while True:
@@ -224,31 +230,37 @@ class EvalCliClient:
                         "Open https://dev.glean.com/internal/evaltool/runs in Chrome, then waiting to retry..."
                     )
                 else:
-                    print(
-                        f"Transient Cortex error while polling {eval_run_id}; "
-                        f"retrying in {poll_interval_sec}s..."
-                    )
+                    print(f"Transient Cortex error while polling {eval_run_id}; retrying in {poll_interval_sec}s...")
                 time.sleep(poll_interval_sec)
                 continue
 
             print(f"Eval run {eval_run_id} status: {json.dumps(statuses, sort_keys=True, default=str)}")
-            if isinstance(statuses, list) and statuses and _is_eval_complete(statuses[0]):
+            if isinstance(statuses, list) and statuses and classify_eval_run_status(statuses[0]) == "usable":
                 print(f"Eval run {eval_run_id} completed successfully")
-                return
+                return statuses
             if isinstance(statuses, list) and statuses:
                 counts = statuses[0].get("taskCountsByStatus") or []
                 summary = ", ".join(
-                    f"{entry.get('status')}={entry.get('count')}"
-                    for entry in counts
-                    if (entry.get("count") or 0) > 0
+                    f"{entry.get('status')}={entry.get('count')}" for entry in counts if (entry.get("count") or 0) > 0
                 )
                 elapsed = int(time.monotonic() - started_at)
-                print(
-                    f"Eval run {eval_run_id} still running after {elapsed}s"
-                    + (f" ({summary})" if summary else "")
-                )
+                print(f"Eval run {eval_run_id} still running after {elapsed}s" + (f" ({summary})" if summary else ""))
 
             time.sleep(poll_interval_sec)
+
+    def get_eval_run_status(self, eval_run_id: str) -> list[Any] | None:
+        """Return Cortex task status for an eval run, or None if the job is gone."""
+        try:
+            statuses = self._invoke_json("run", "status", "--id", eval_run_id)
+        except EvalCliError as exc:
+            if is_missing_eval_job(exc):
+                return None
+            raise
+        if isinstance(statuses, list):
+            return statuses
+        if isinstance(statuses, dict):
+            return [statuses]
+        return None
 
     def get_eval_set_version(self, *, eval_set_name: str, eval_set_version: str) -> dict[str, Any] | None:
         """Return the eval set version, or None when it does not exist yet."""
@@ -456,7 +468,35 @@ class EvalCliClient:
             cmd.extend(["--base-eval-run-id", base_eval_run_id])
         if input_mappings:
             cmd.extend(["--input-mappings", input_mappings])
-        return self._parse_judge_create_response(self._invoke_json(*cmd))
+        last_exc: EvalCliError | None = None
+        for attempt in range(JUDGE_CREATE_ATTEMPTS):
+            try:
+                return self._parse_judge_create_response(self._invoke_json(*cmd))
+            except EvalCliError as exc:
+                last_exc = exc
+                if not _is_transient_evalcli_error(exc):
+                    raise
+                existing = self._find_judge_run_id_after_create_error(eval_run_id, judge_type)
+                if existing:
+                    print(
+                        f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}"
+                    )
+                    return existing
+                if attempt + 1 >= JUDGE_CREATE_ATTEMPTS:
+                    break
+                print(
+                    f"Transient evalcli error creating {judge_type} judge for {eval_run_id}; "
+                    f"retrying in {JUDGE_CREATE_RETRY_SEC}s..."
+                )
+                time.sleep(JUDGE_CREATE_RETRY_SEC)
+        assert last_exc is not None
+        raise last_exc
+
+    def _find_judge_run_id_after_create_error(self, eval_run_id: str, judge_type: str) -> str | None:
+        try:
+            return self.find_judge_run_id(eval_run_id, judge_type=judge_type)
+        except EvalCliError:
+            return None
 
     def find_judge_run_id(self, eval_run_id: str, *, judge_type: str) -> str | None:
         """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list)."""

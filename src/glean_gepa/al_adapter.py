@@ -22,15 +22,20 @@ from glean_gepa.adapter_types import (
     ALTrajectory,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
+from glean_gepa.core_tools import CORE_TOOL_KEYS
 from glean_gepa.debug import debug_print
 from glean_gepa.evalcli_client import (
     CORRECTNESS_INPUT_MAPPINGS,
     CORRECTNESS_JUDGE_TYPE,
     CORRECTNESS_RUN_PARAMS,
     EvalCliClient,
+    EvalCliError,
+    classify_eval_run_status,
+    is_missing_eval_job,
 )
 from glean_gepa.focused_evalset import prepare_high_signal_eval_batch
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
+from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
 from glean_gepa.shell_tool_error_util import (
     EvalRunShellToolErrorAnalysis,
     parse_shell_tool_error_entry_metrics,
@@ -128,8 +133,14 @@ CODING_HARNESS_SC_PARAMS = (
 # Models that use the Coding Harness default (no oai_model_for_agentic_loop override).
 DEFAULT_AGENTIC_LOOP_MODELS = frozenset({"gpt", "fast"})
 # CLI aliases -> co.lo.oai_model_for_agentic_loop ChatModel enum.
+#
+# coding_agent_loop_system is only applied when the request stays on
+# coding_agent_loop and the model is allowed on the harness. QE redlists
+# CLAUDE_4_SONNET_20250514 and CLAUDE_4_5_SONNET_20250929 back to
+# o3_agentic_loop (gpt5_agentic_loop_system) even if the coding route is
+# requested. Claude 4.6+ Sonnet and Claude 5 Sonnet stay on the harness.
 AGENTIC_LOOP_MODEL_OVERRIDES = {
-    "claude_sonnet": "CLAUDE_4_5_SONNET_20250929",
+    "claude_sonnet": "CLAUDE_4_6_SONNET_20260217",
     "claude_opus": "CLAUDE_5_OPUS",
 }
 
@@ -246,7 +257,12 @@ def approx_token_len(text: str) -> int:
 
 
 def total_prompt_tokens(candidate: Candidate) -> int:
-    return sum(approx_token_len(candidate.prompt_modules.get(m, "")) for m in candidate.prompt_modules)
+    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions.
+
+    Core-tool descriptions have their own per-module budgets and must not crowd out
+    ``FULL_PROMPT`` under the global cap.
+    """
+    return sum(approx_token_len(text) for key, text in candidate.prompt_modules.items() if key not in CORE_TOOL_KEYS)
 
 
 def within_prompt_budget(candidate: Candidate) -> bool:
@@ -392,13 +408,29 @@ class ALRunner:
         self._eval_run_ids: dict[tuple[str, str, str, str, str], str] = {}
         # Started-but-not-yet-complete runs: eval_run_id -> cache_key
         self._in_flight: dict[str, tuple[str, str, str, str, str]] = {}
+        # Eval IDs created or verified in this process; disk-loaded IDs are probed.
+        self._verified_eval_ids: set[str] = set()
 
         # Load cached eval run IDs if cache file exists
         if self.cache_file:
             self._load_cache()
 
+    def _parse_cache_key(self, raw_key: Any) -> tuple[str, str, str, str, str] | None:
+        if isinstance(raw_key, list):
+            parsed = raw_key
+        elif isinstance(raw_key, str):
+            try:
+                parsed = json.loads(raw_key)
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+        if not isinstance(parsed, list) or len(parsed) != 5:
+            return None
+        return (str(parsed[0]), str(parsed[1]), str(parsed[2]), str(parsed[3]), str(parsed[4]))
+
     def _load_cache(self) -> None:
-        """Load eval run IDs cache from file."""
+        """Load completed and in-flight eval run IDs from file."""
         if not self.cache_file:
             return
 
@@ -408,26 +440,143 @@ class ALRunner:
                     return
                 with open(self.cache_file) as f:
                     data = json.load(f)
-                # Convert string keys back to tuples
-                self._eval_run_ids = {tuple(json.loads(k)): v for k, v in data.items()}
-                print(f"Loaded {len(self._eval_run_ids)} eval run IDs from cache")
+                if not isinstance(data, dict):
+                    return
+                completed_raw = data.get("completed")
+                in_flight_raw = data.get("in_flight")
+                if isinstance(completed_raw, dict) or isinstance(in_flight_raw, dict):
+                    completed_items = completed_raw if isinstance(completed_raw, dict) else {}
+                    in_flight_items = in_flight_raw if isinstance(in_flight_raw, dict) else {}
+                else:
+                    completed_items = data
+                    in_flight_items = {}
+                self._eval_run_ids = {}
+                for raw_key, eval_id in completed_items.items():
+                    cache_key = self._parse_cache_key(raw_key)
+                    if cache_key is None or not isinstance(eval_id, str):
+                        continue
+                    self._eval_run_ids[cache_key] = eval_id
+                self._in_flight = {}
+                for eval_id, raw_key in in_flight_items.items():
+                    cache_key = self._parse_cache_key(raw_key)
+                    if cache_key is None:
+                        continue
+                    self._in_flight[str(eval_id)] = cache_key
+                print(
+                    f"Loaded {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
+                    "eval run IDs from cache"
+                )
         except Exception as e:
             print(f"Failed to load cache from {self.cache_file}: {e}")
             self._eval_run_ids = {}
+            self._in_flight = {}
 
     def _save_cache(self) -> None:
-        """Save eval run IDs cache to file."""
+        """Save completed and in-flight eval run IDs to file."""
         if not self.cache_file:
             return
 
         try:
             with self._cache_lock:
-                # Convert tuple keys to strings for JSON serialization
-                data = {json.dumps(list(k)): v for k, v in self._eval_run_ids.items()}
+                data = {
+                    "completed": {json.dumps(list(k)): v for k, v in self._eval_run_ids.items()},
+                    "in_flight": {eval_id: list(cache_key) for eval_id, cache_key in self._in_flight.items()},
+                }
                 _write_json_atomically(self.cache_file, data)
-                print(f"Saved {len(self._eval_run_ids)} eval run IDs to cache")
+                print(
+                    f"Saved {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
+                    "eval run IDs to cache"
+                )
         except Exception as e:
             print(f"Failed to save cache to {self.cache_file}: {e}")
+
+    def _drop_eval(self, eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._in_flight.pop(eval_run_id, None)
+            self._verified_eval_ids.discard(eval_run_id)
+            stale_keys = [key for key, cached_id in self._eval_run_ids.items() if cached_id == eval_run_id]
+            for key in stale_keys:
+                self._eval_run_ids.pop(key, None)
+            self._save_cache()
+
+    def _promote_completed(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._eval_run_ids[cache_key] = eval_run_id
+            stale_inflight = [eid for eid, key in self._in_flight.items() if key == cache_key or eid == eval_run_id]
+            for eid in stale_inflight:
+                self._in_flight.pop(eid, None)
+            self._verified_eval_ids.add(eval_run_id)
+            self._save_cache()
+
+    def _remember_in_flight(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._in_flight[eval_run_id] = cache_key
+            self._verified_eval_ids.add(eval_run_id)
+            self._save_cache()
+
+    def _fallback_eval_state(self, eval_run_id: str) -> str:
+        if eval_run_id in self._in_flight:
+            return "ongoing"
+        if eval_run_id in self._eval_run_ids.values():
+            return "usable"
+        return "ongoing"
+
+    def _probe_eval_state(self, eval_run_id: str) -> str:
+        try:
+            statuses = self.evalcli.get_eval_run_status(eval_run_id)
+        except Exception as exc:
+            if isinstance(exc, EvalCliError) and is_missing_eval_job(exc):
+                return "missing"
+            return self._fallback_eval_state(eval_run_id)
+        if isinstance(statuses, list) and statuses:
+            return classify_eval_run_status(statuses[0])
+        if isinstance(statuses, dict):
+            return classify_eval_run_status(statuses)
+        if statuses is None:
+            return "missing"
+        return self._fallback_eval_state(eval_run_id)
+
+    def _resolve_cached_eval(self, cache_key: tuple[str, str, str, str, str]) -> tuple[str, bool] | None:
+        """Return (eval_id, wait_required) for a reusable cached run, or None to create."""
+        with self._cache_lock:
+            completed_id = self._eval_run_ids.get(cache_key)
+            in_flight_id = next(
+                (eval_id for eval_id, inflight_key in self._in_flight.items() if inflight_key == cache_key),
+                None,
+            )
+            verified = set(self._verified_eval_ids)
+        candidate = in_flight_id or completed_id
+        if candidate is None:
+            return None
+        if candidate in verified:
+            wait_required = candidate == in_flight_id and candidate != completed_id
+            if wait_required:
+                print(f"[Eval run cache HIT] Resuming in-flight eval_id: {candidate}")
+            else:
+                print(
+                    f"[Eval run cache HIT] Using cached eval_id: {candidate} "
+                    f"for {cache_key[2]}:{cache_key[3]} ({cache_key[4]})"
+                )
+            return candidate, wait_required
+
+        state = self._probe_eval_state(candidate)
+        if state == "usable":
+            self._promote_completed(cache_key, candidate)
+            print(
+                f"[Eval run cache HIT] Using completed eval_id: {candidate} "
+                f"for {cache_key[2]}:{cache_key[3]} ({cache_key[4]})"
+            )
+            return candidate, False
+        if state == "ongoing":
+            self._remember_in_flight(cache_key, candidate)
+            print(f"[Eval run cache HIT] Resuming in-flight eval_id: {candidate}")
+            return candidate, True
+        print(
+            f"[Eval run cache STALE] Dropping {candidate} for {cache_key[2]}:{cache_key[3]} "
+            f"({state}); launching a new run"
+        )
+        self._drop_eval(candidate)
+        return None
 
     def _build_sc_params(self, model: str, system_prompt: str) -> str:
         """Build scParams based on model type."""
@@ -472,20 +621,9 @@ class ALRunner:
             eval_set_version,
             run_label,
         )
-        with self._cache_lock:
-            if cache_key in self._eval_run_ids:
-                cached_eval_id = self._eval_run_ids[cache_key]
-                print(
-                    f"[Eval run cache HIT] Using cached student eval_id: {cached_eval_id} "
-                    f"for {eval_set_name}:{eval_set_version} ({run_label})"
-                )
-                return cached_eval_id, False
-            in_flight_id = next(
-                (eval_id for eval_id, inflight_key in self._in_flight.items() if inflight_key == cache_key),
-                None,
-            )
-            if in_flight_id:
-                return in_flight_id, True
+        resolved = self._resolve_cached_eval(cache_key)
+        if resolved is not None:
+            return resolved
 
         id_token = hashlib.md5("|".join(cache_key).encode()).hexdigest()[:16]
         eval_id = f"{run_label}_{model}_{id_token}_{int(time.time())}"
@@ -506,8 +644,7 @@ class ALRunner:
             sc_params=sc_params,
             eval_params=eval_params,
         )
-        with self._cache_lock:
-            self._in_flight[created_id] = cache_key
+        self._remember_in_flight(cache_key, created_id)
         if on_created is not None:
             on_created(created_id)
         return created_id, True
@@ -516,23 +653,21 @@ class ALRunner:
         """Wait for a started eval run and record it in the completed-run cache."""
         with self._cache_lock:
             cache_key = self._in_flight.get(eval_run_id)
-            if cache_key is not None and cache_key in self._eval_run_ids:
+            completed = eval_run_id in self._eval_run_ids.values()
+            verified = eval_run_id in self._verified_eval_ids
+        if completed and verified:
+            with self._cache_lock:
                 self._in_flight.pop(eval_run_id, None)
-                return
-            if eval_run_id in self._eval_run_ids.values():
-                self._in_flight.pop(eval_run_id, None)
-                return
+            return
 
         if self.eval_run_timeout_sec is None:
             self.evalcli.wait_for_eval_run(eval_run_id)
         else:
             self.evalcli.wait_for_eval_run(eval_run_id, timeout_sec=self.eval_run_timeout_sec)
-        print(f"Eval run {eval_run_id} completed successfully")
         if cache_key is not None:
-            with self._cache_lock:
-                self._eval_run_ids[cache_key] = eval_run_id
-                self._save_cache()
-                self._in_flight.pop(eval_run_id, None)
+            self._promote_completed(cache_key, eval_run_id)
+        elif eval_run_id in self._in_flight:
+            self._promote_completed(self._in_flight[eval_run_id], eval_run_id)
 
     def run(
         self,
@@ -568,20 +703,6 @@ class ALRunner:
         if wait_required:
             self.wait(eval_id)
         return eval_id
-
-    def get_eval_run_id(
-        self,
-        model: str,
-        system_prompt: str,
-        eval_set_name: str,
-        eval_set_version: str,
-        run_label: str = "gepa",
-    ) -> str | None:
-        """Get the eval run ID for a given cache key."""
-        system_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-        cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
-        with self._cache_lock:
-            return self._eval_run_ids.get(cache_key)
 
 
 class Judge:
@@ -1420,6 +1541,28 @@ class GleanAdapterBase:
 
             result[component_name] = reflective_examples
 
+        module_lines = []
+        for module_name, examples in result.items():
+            entry_ids = selected_entry_ids_from_examples(examples)
+            module_lines.append(f"  {module_name}: {', '.join(entry_ids) if entry_ids else '(none)'}")
+        k_label = "all" if k is None else str(k)
+        log_section("REFLECTION: eval entries", format_eval_entry_report(eval_batch.trajectories))
+        log_section(
+            "REFLECTION: high-signal dataset",
+            "\n".join(
+                [
+                    f"Justification: module relevance, then lowest score, up to k={k_label} examples.",
+                    (
+                        f"Near-duplicate execution errors within Hamming distance "
+                        f"{error_hamming_distance_k} are dropped."
+                        if error_hamming_distance_k is not None
+                        else "No Hamming-distance dedupe."
+                    ),
+                    "Selected entry_ids by module:",
+                    *module_lines,
+                ]
+            ),
+        )
         return result
 
     # TODO(Cathy): Implement this
@@ -1438,15 +1581,11 @@ class GleanAdapterBase:
         components_to_update: list[str],
         reflective_examples: list[ReflectiveExample],
         max_variants: int = 3,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], bool, str]:
         """
-        Returns (new_module_texts, module_marked_irrelevant). Editable
-        modules are always treated as relevant, so the second value is False.
-        Must:
-          1) merge reflections across examples
-          2) diagnose recurring failure modes tied to module
-          3) propose small patch with before/after
-          4) brief why
+        Returns (new_module_texts, module_marked_irrelevant, diagnosis).
+        Editable modules are always treated as relevant, so the second value is False.
+        ``diagnosis`` is the first-pass reflection text (failure modes and WHY).
         """
         current = candidate.prompt_modules.get(components_to_update[0], "")
 
@@ -1477,7 +1616,7 @@ class GleanAdapterBase:
                 f"FEEDBACK: {r['Feedback']}\n"
             )
         if len(components_to_update) != 1:
-            return [], False
+            return [], False, ""
         module_name = components_to_update[0]
         prompt = (
             f"You are optimizing ONLY the module {module_name}.\n"
@@ -1522,4 +1661,4 @@ class GleanAdapterBase:
             for variant in (v.strip() for v in consolidated.split("===VARIANT==="))
             if variant and variant.upper() != "NOT_RELEVANT"
         ]
-        return variants[:max_variants], False
+        return variants[:max_variants], False, raw

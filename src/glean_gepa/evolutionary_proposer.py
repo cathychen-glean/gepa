@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from gepa.core.adapter import DataInst, invoke_batch_evaluate
 from gepa.core.callbacks import GEPACallback
@@ -28,18 +28,14 @@ from glean_gepa.al_adapter import (
     within_prompt_budget,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
+from glean_gepa.core_tools import CORE_TOOL_KEYS, high_signal_core_tool_keys
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.prompt import PROMPT_MODULE_DEFAULTS
-from glean_gepa.tool_match_util import (
-    avg_levenshtein_alignment_score,
-    mean_sequence_levenshtein,
-    sequence_levenshtein_distance,
-)
+from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
 
-CHILDREN_CACHE_SCHEMA_VERSION = 4
+CHILDREN_CACHE_SCHEMA_VERSION = 6
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 1 / 3
-HighSignalScreenMode = Literal["threshold", "avg_levenshtein_decrease"]
 
 
 @dataclass
@@ -52,8 +48,25 @@ class ChildCacheRecord:
 
 
 # TODO(Cathy): pick modules based on holistic performance of the eval
-def pick_modules_to_edit(adapter: GleanAdapterBase) -> list[str]:
-    return list(adapter.editable_modules)
+def pick_modules_to_edit(
+    adapter: GleanAdapterBase,
+    eval_batch: GleanEvaluationBatch | None = None,
+) -> list[str]:
+    """Return modules the proposer should rewrite this generation.
+
+    Non-core modules listed in ``editable_modules`` are always rewritten.
+    Core-tool descriptions are eligible only when listed, and the proposer
+    only rewrites those that appear in the high-signal first-tool mismatch set.
+    """
+    eligible = list(adapter.editable_modules)
+    modules = [module for module in eligible if module not in CORE_TOOL_KEYS]
+    extra = [
+        key
+        for key in high_signal_core_tool_keys(eval_batch.trajectories if eval_batch is not None else None)
+        if key in eligible
+    ]
+    modules.extend(key for key in extra if key not in modules)
+    return modules
 
 
 def _format_child_delta(parent: Candidate, child: Candidate, module: str) -> str:
@@ -147,7 +160,11 @@ def make_children_for_generation(
         # calling the reflector so an empty/invalid response is cached too.
         cached_children = children_by_root.setdefault(parent.candidate_id, []) if children_by_root is not None else None
 
-        modules_to_edit = pick_modules_to_edit(adapter)
+        modules_to_edit = pick_modules_to_edit(adapter, parent_eval)
+        log_section(
+            f"REFLECTION START parent={parent.candidate_id}",
+            "modules_to_edit: " + (", ".join(modules_to_edit) if modules_to_edit else "(none)"),
+        )
 
         high_signal = adapter.make_reflective_dataset(
             candidate=parent,
@@ -159,12 +176,14 @@ def make_children_for_generation(
 
         # Ask the reflection model for one to three small rewrite variants.
         for module in modules_to_edit:
-            variants, _ = adapter.propose_new_texts(
+            proposed = adapter.propose_new_texts(
                 reflection_llm=reflection_llm,
                 candidate=parent,
                 components_to_update=[module],
                 reflective_examples=high_signal[module],
             )
+            variants = proposed[0]
+            diagnosis = proposed[2] if len(proposed) > 2 else ""
             if not variants:
                 print(f"Reflection produced no variants for module {module}")
                 continue
@@ -175,8 +194,15 @@ def make_children_for_generation(
                     if all(existing.prompt_modules != child.prompt_modules for existing in cached_children):
                         cached_children.append(child)
                 if append_child(child):
-                    print(
-                        f"Prompt delta for child {child.candidate_id} ({module}):\n{_format_child_delta(parent, child, module)}"
+                    log_section(
+                        f"CHILD PROPOSAL {child.candidate_id}",
+                        format_child_proposal_report(
+                            parent_id=parent.candidate_id,
+                            child_id=child.candidate_id,
+                            module=module,
+                            delta=_format_child_delta(parent, child, module),
+                            justification=diagnosis,
+                        ),
                     )
                 if len(children) >= offspring_count:
                     break
@@ -184,68 +210,16 @@ def make_children_for_generation(
     return children
 
 
-def _tool_sequences_by_entry(
-    eval_batch: GleanEvaluationBatch,
-) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
-    sequences: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
-    outputs = list(eval_batch.outputs or [])
-    for trajectory in eval_batch.trajectories or []:
-        output = trajectory.get("output")
-        if output:
-            outputs.append(output)
-    for output in outputs:
-        entry_id = output.get("entry_id")
-        if not entry_id:
-            continue
-        sequences[str(entry_id)] = (
-            tuple(output.get("student_tool_events") or []),
-            tuple(output.get("teacher_tool_events") or []),
-        )
-    return sequences
-
-
-def _requested_high_signal_entry_ids(eval_batch: GleanEvaluationBatch) -> list[str]:
+def _eval_entry_ids(eval_batch: GleanEvaluationBatch) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
-    for trajectory in eval_batch.trajectories or []:
-        for entry_id in (trajectory.get("data") or {}).get("eval_entry_ids") or []:
-            key = str(entry_id)
-            if key not in seen:
-                seen.add(key)
-                ordered.append(key)
-        if ordered:
-            return ordered
-    for output in eval_batch.outputs or []:
-        entry_id = output.get("entry_id")
-        if entry_id and str(entry_id) not in seen:
-            seen.add(str(entry_id))
-            ordered.append(str(entry_id))
-    for trajectory in eval_batch.trajectories or []:
-        entry_id = (trajectory.get("output") or {}).get("entry_id")
-        if entry_id and str(entry_id) not in seen:
-            seen.add(str(entry_id))
-            ordered.append(str(entry_id))
+    for trajectory in getattr(eval_batch, "trajectories", None) or []:
+        output = trajectory.get("output") if isinstance(trajectory, dict) else None
+        entry_id = str((output or {}).get("entry_id") or "")
+        if entry_id and entry_id not in seen:
+            seen.add(entry_id)
+            ordered.append(entry_id)
     return ordered
-
-
-def _high_signal_levenshtein_means(
-    parent_eval: GleanEvaluationBatch,
-    screen_eval: GleanEvaluationBatch,
-) -> tuple[float, float]:
-    """Return parent and child mean tool-sequence Levenshtein on the focused IDs."""
-    entry_ids = _requested_high_signal_entry_ids(screen_eval)
-    parent_sequences = _tool_sequences_by_entry(parent_eval)
-    parent_distances = {
-        entry_id: sequence_levenshtein_distance(student, teacher)
-        for entry_id, (student, teacher) in parent_sequences.items()
-    }
-    parent_mean = mean_sequence_levenshtein(parent_sequences, entry_ids)
-    child_mean = mean_sequence_levenshtein(
-        _tool_sequences_by_entry(screen_eval),
-        entry_ids,
-        fallback_distances=parent_distances,
-    )
-    return parent_mean, child_mean
 
 
 def _select_screened_children(
@@ -256,43 +230,18 @@ def _select_screened_children(
     *,
     use_high_signal_gate: bool,
     high_signal_screen_threshold: float = HIGH_SIGNAL_FIX_RATE_THRESHOLD,
-    high_signal_screen_mode: HighSignalScreenMode = "threshold",
 ) -> list[tuple[Candidate, GleanEvaluationBatch, float]]:
     """Keep every child eligible for GEPA's acceptance/selection stage."""
     selected: list[tuple[Candidate, GleanEvaluationBatch, float]] = []
-    if use_high_signal_gate and high_signal_screen_mode == "avg_levenshtein_decrease":
-        for child, screen_eval in zip(children, screen_evals, strict=True):
-            parent_mean, child_mean = _high_signal_levenshtein_means(parent_eval, screen_eval)
-            if parent_mean < float("inf") and child_mean < parent_mean:
-                selected.append((child, screen_eval, avg_levenshtein_alignment_score(child_mean)))
-        return selected
     for child, screen_eval in zip(children, screen_evals, strict=True):
-        child_score = _screening_score(adapter, parent_eval, screen_eval, use_high_signal_gate)
-        if _screening_passed(child_score, use_high_signal_gate, threshold=high_signal_screen_threshold):
+        child_score = (
+            adapter.high_signal_fix_rate(parent_eval, screen_eval)
+            if use_high_signal_gate
+            else adapter.get_screening_score(screen_eval)
+        )
+        if not use_high_signal_gate or child_score >= high_signal_screen_threshold:
             selected.append((child, screen_eval, child_score))
     return selected
-
-
-def _screening_score(
-    adapter: GleanAdapterBase,
-    parent_eval: GleanEvaluationBatch,
-    screen_eval: GleanEvaluationBatch,
-    use_high_signal_gate: bool,
-) -> float:
-    return (
-        adapter.high_signal_fix_rate(parent_eval, screen_eval)
-        if use_high_signal_gate
-        else adapter.get_screening_score(screen_eval)
-    )
-
-
-def _screening_passed(
-    screening_score: float,
-    use_high_signal_gate: bool,
-    *,
-    threshold: float = HIGH_SIGNAL_FIX_RATE_THRESHOLD,
-) -> bool:
-    return not use_high_signal_gate or screening_score >= threshold
 
 
 class EvolutionaryProposer:
@@ -337,7 +286,6 @@ class EvolutionaryProposer:
         reflection_hamming_distance_k: int | None = None,
         children_cache_file: str | os.PathLike[str] | None = None,
         high_signal_screen_threshold: float = HIGH_SIGNAL_FIX_RATE_THRESHOLD,
-        high_signal_screen_mode: HighSignalScreenMode = "threshold",
     ):
         self.logger = logger
         self.trainset = ensure_loader(trainset)
@@ -347,7 +295,6 @@ class EvolutionaryProposer:
         self.callbacks = callbacks
         self.evalset_policy = evalset_policy
         self.high_signal_screen_threshold = high_signal_screen_threshold
-        self.high_signal_screen_mode = high_signal_screen_mode
 
         # Candidate conversion config
         self.model = model
@@ -532,7 +479,6 @@ class EvolutionaryProposer:
         *,
         use_high_signal_gate: bool,
         high_signal_screen_threshold: float = HIGH_SIGNAL_FIX_RATE_THRESHOLD,
-        high_signal_screen_mode: HighSignalScreenMode = "threshold",
     ) -> list[tuple[float, bool]] | None:
         """Return complete cached screen results, or None when a child is missing one."""
         cached: list[tuple[float, bool]] = []
@@ -540,11 +486,6 @@ class EvolutionaryProposer:
             record = self._child_cache_record(train_ids, child)
             if record.screening_score is None:
                 return None
-            if high_signal_screen_mode == "avg_levenshtein_decrease":
-                if record.screening_passed is None:
-                    return None
-                cached.append((record.screening_score, record.screening_passed))
-                continue
             passed = not use_high_signal_gate or record.screening_score >= high_signal_screen_threshold
             cached.append((record.screening_score, passed))
         return cached
@@ -577,8 +518,10 @@ class EvolutionaryProposer:
     def _to_candidate(self, program: dict[str, str], parent_id: str | None = None) -> Candidate:
         """Convert a GEPA program into adapter-editable Glean prompt modules."""
         prompt_modules = dict(program)
-        for key in self.al_adapter.editable_modules:
-            prompt_modules.setdefault(key, PROMPT_MODULE_DEFAULTS[key])
+        for key in self.module_specs:
+            default = PROMPT_MODULE_DEFAULTS.get(key)
+            if default is not None:
+                prompt_modules.setdefault(key, default)
         content = json.dumps(prompt_modules, sort_keys=True)
         cand_id = hashlib.md5(content.encode()).hexdigest()[:10]
         return Candidate(
@@ -688,10 +631,8 @@ class EvolutionaryProposer:
             return []
 
         # 6. Screen children on the parent's high-signal failures first.
-        # Threshold mode keeps a child whose fix rate is at least one-third
-        # (or high_signal_screen_threshold). avg_levenshtein_decrease keeps a
-        # child whose mean tool-sequence Levenshtein on those failures is
-        # strictly lower than the parent's.
+        # Keep a child whose fix rate is at least one-third
+        # (or high_signal_screen_threshold).
         best_parent_idx = max(frontier_idxs_sorted, key=lambda idx: state.program_full_scores_val_set[idx])
         best_parent_cand_id = prog_idx_to_cand_id[best_parent_idx]
         parent_eval = frontier_evals[best_parent_cand_id]
@@ -702,7 +643,6 @@ class EvolutionaryProposer:
             valid_children,
             use_high_signal_gate=use_high_signal_gate,
             high_signal_screen_threshold=self.high_signal_screen_threshold,
-            high_signal_screen_mode=self.high_signal_screen_mode,
         )
         if cached_screening is not None:
             screen_scores = [score for score, _passed in cached_screening]
@@ -762,45 +702,46 @@ class EvolutionaryProposer:
                     capture_traces=False,
                 )
             screen_scores = []
+            screened_children = []
             for child, screen_eval in zip(valid_children, screen_evals, strict=True):
-                screen_scores.append(_screening_score(self.al_adapter, parent_eval, screen_eval, use_high_signal_gate))
-                self._record_eval_run_ids(train_slice_key, child, getattr(screen_eval, "eval_run_ids", None) or [])
-                self._record_screening_result(
-                    train_slice_key,
-                    child,
-                    screen_scores[-1],
-                    _screening_passed(
-                        screen_scores[-1],
-                        use_high_signal_gate,
-                        threshold=self.high_signal_screen_threshold,
-                    ),
+                score = (
+                    self.al_adapter.high_signal_fix_rate(parent_eval, screen_eval)
+                    if use_high_signal_gate
+                    else self.al_adapter.get_screening_score(screen_eval)
                 )
+                passed = not use_high_signal_gate or score >= self.high_signal_screen_threshold
+                screen_scores.append(score)
+                self._record_eval_run_ids(train_slice_key, child, getattr(screen_eval, "eval_run_ids", None) or [])
+                self._record_screening_result(train_slice_key, child, score, passed)
+                if passed:
+                    screened_children.append((child, screen_eval, score))
             if self.evalset_policy is not None:
                 self._save_children_cache()
-            screened_children = _select_screened_children(
-                self.al_adapter,
-                parent_eval,
-                valid_children,
-                screen_evals,
-                use_high_signal_gate=use_high_signal_gate,
-                high_signal_screen_threshold=self.high_signal_screen_threshold,
-                high_signal_screen_mode=self.high_signal_screen_mode,
-            )
+        passed_ids = {child.candidate_id for child, _eval, _score in screened_children}
+        screening_rows: list[tuple[str, float, bool, str]] = []
+        if cached_screening is not None:
+            screening_rows = [
+                (child.candidate_id, score, passed, "cached screening result")
+                for child, (score, passed) in zip(valid_children, cached_screening, strict=True)
+            ]
+        elif screen_evals:
+            for child, _screen_eval, score in zip(valid_children, screen_evals, screen_scores, strict=True):
+                detail = f"score={score:.4f}"
+                if use_high_signal_gate:
+                    detail = f"fix_rate={score:.3f}"
+                screening_rows.append((child.candidate_id, score, child.candidate_id in passed_ids, detail))
+        log_section(
+            f"SCREENING iteration={i}",
+            format_screening_report(
+                mode="fix-rate" if use_high_signal_gate else "full-train",
+                entry_ids=_eval_entry_ids(parent_eval),
+                rows=screening_rows,
+            ),
+        )
         best_child_score = max((score for _child, _eval, score in screened_children), default=float("-inf"))
 
         if not screened_children:
-            if use_high_signal_gate and self.high_signal_screen_mode == "avg_levenshtein_decrease":
-                levenshtein_means = [_high_signal_levenshtein_means(parent_eval, result) for result in screen_evals]
-                parent_mean = levenshtein_means[0][0] if levenshtein_means else float("inf")
-                best_child_mean = min(
-                    (child_mean for _parent_mean, child_mean in levenshtein_means),
-                    default=float("inf"),
-                )
-                self.logger.log(
-                    f"Iteration {i}: No child reduced average high-signal tool-sequence Levenshtein "
-                    f"(parent={parent_mean:.2f}; best child={best_child_mean:.2f})"
-                )
-            elif use_high_signal_gate:
+            if use_high_signal_gate:
                 best_fix_rate = max(screen_scores, default=0.0)
                 self.logger.log(
                     f"Iteration {i}: No child fixed at least {self.high_signal_screen_threshold:.0%} "
@@ -817,11 +758,7 @@ class EvolutionaryProposer:
         # child can proceed to full validation. Standard screens retain their
         # parent-vs-child score comparison.
         subsample_ids = train_ids
-        if self.high_signal_screen_mode == "avg_levenshtein_decrease" and screen_evals:
-            parent_mean, _child_mean = _high_signal_levenshtein_means(parent_eval, screen_evals[0])
-            parent_score = avg_levenshtein_alignment_score(parent_mean)
-        else:
-            parent_score = self.al_adapter.get_screening_score(parent_eval)
+        parent_score = self.al_adapter.get_screening_score(parent_eval)
         child_score = best_child_score
         proposal_score_before = 0.0 if use_high_signal_gate else parent_score
 

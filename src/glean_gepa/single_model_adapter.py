@@ -21,6 +21,7 @@ from glean_gepa.al_adapter import (
     log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
+from glean_gepa.core_tools import CORE_TOOL_KEYS, core_tool_reflection_prompt
 from glean_gepa.focused_evalset import ensure_focused_eval_set, resolve_eval_run_target
 from glean_gepa.prompt import WRITING_CODE_KEY, compile_encoded_prompt
 from glean_gepa.reflection_sampling import strip_stdout_sections
@@ -59,9 +60,7 @@ class SingleModelAdapter(GleanAdapterBase):
         for data in prepared:
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
             source_eval_run_id = source_run_ids.get(key)
-            enriched.append(
-                {**data, "source_eval_run_id": source_eval_run_id} if source_eval_run_id else data
-            )
+            enriched.append({**data, "source_eval_run_id": source_eval_run_id} if source_eval_run_id else data)
         return enriched
 
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
@@ -215,18 +214,14 @@ class SingleModelAdapter(GleanAdapterBase):
         output = trajectory["output"]
         shell_success_rate = trajectory.get("objective_scores", {}).get(SHELL_SUCCESS_OBJECTIVE, 1.0)
         shell_error_messages = [
-            sanitized
-            for error in output.get("shell_error_messages", [])
-            if (sanitized := strip_stdout_sections(error))
+            sanitized for error in output.get("shell_error_messages", []) if (sanitized := strip_stdout_sections(error))
         ]
         if shell_error_messages:
             # Keep the concrete text solely in ``Execution Errors``. Repeating
             # it in feedback wastes reflection context without adding signal.
             feedback = "Resolve the shell execution failures shown above."
         elif output.get("student_tool_errors", 0) > 0:
-            feedback = (
-                f"Tool errors: Student encountered {output.get('student_tool_errors', 0)} shell tool errors."
-            )
+            feedback = f"Tool errors: Student encountered {output.get('student_tool_errors', 0)} shell tool errors."
         else:
             feedback = "General shell tool reliability issue."
 
@@ -263,6 +258,8 @@ class SingleModelAdapter(GleanAdapterBase):
                 "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
                 "Use shell error examples as evidence. Propose minimal deltas."
             )
+        if module_name in CORE_TOOL_KEYS:
+            return core_tool_reflection_prompt(module_name)
         return "Focus only on this module's responsibilities."
 
     @staticmethod
@@ -358,9 +355,7 @@ class SingleModelAdapter(GleanAdapterBase):
 
             if is_focused_eval:
                 passed_entries = sum(
-                    1
-                    for entry_metrics in analysis.per_entry.values()
-                    if entry_metrics.shell_errors == 0
+                    1 for entry_metrics in analysis.per_entry.values() if entry_metrics.shell_errors == 0
                 )
                 summary_shell_rates.append(passed_entries / len(requested_entry_ids))
             else:

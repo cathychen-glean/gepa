@@ -15,6 +15,7 @@ from glean_gepa.evalcli_client import (
     EvalCliClient,
     EvalCliError,
     _subprocess_env,
+    classify_eval_run_status,
     min_ingested_eval_set_entries,
 )
 from glean_gepa.judge_metrics_util import (
@@ -43,6 +44,16 @@ def test_build_sc_params_overrides_claude_models(alias: str):
     params = runner._build_sc_params(alias, "")
 
     assert f"co.lo.oai_model_for_agentic_loop={AGENTIC_LOOP_MODEL_OVERRIDES[alias]}" in params
+
+
+def test_claude_sonnet_uses_coding_harness_allowed_model():
+    """4.0/4.5 Sonnet are redlisted off coding_agent_loop; 4.6 stays on the harness."""
+    assert AGENTIC_LOOP_MODEL_OVERRIDES["claude_sonnet"] == "CLAUDE_4_6_SONNET_20260217"
+    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
+    params = runner._build_sc_params("claude_sonnet", "")
+    assert "co.internal_looping_pyagent_default_route_override=coding_agent_loop" in params
+    assert "CLAUDE_4_5_SONNET_20250929" not in params
+    assert "CLAUDE_4_SONNET_20250514" not in params
 
 
 def test_build_sc_params_rejects_unknown_and_legacy_claude_alias():
@@ -86,7 +97,9 @@ def test_al_runner_invokes_on_created_before_waiting(tmp_path):
     def on_created(eval_run_id):
         events.append(("created", eval_run_id))
         assert eval_run_id in runner._in_flight
-        assert not cache_file.exists()
+        saved = json.loads(cache_file.read_text())
+        assert eval_run_id in saved["in_flight"]
+        assert eval_run_id not in saved["completed"].values()
 
     def wait_for_eval_run(eval_run_id):
         events.append(("wait", eval_run_id))
@@ -108,7 +121,9 @@ def test_al_runner_invokes_on_created_before_waiting(tmp_path):
         assert eval_id == "run_123"
 
     assert [event[0] for event in events] == ["created", "wait"]
-    assert list(json.loads(cache_file.read_text()).values()) == ["run_123"]
+    saved = json.loads(cache_file.read_text())
+    assert list(saved["completed"].values()) == ["run_123"]
+    assert saved["in_flight"] == {}
 
 
 def test_create_judge_run_parses_response_list():
@@ -161,6 +176,74 @@ def test_completeness_evalcli_create_list_and_metrics():
     metrics_args = mock_invoke.call_args[0]
     assert metrics_args[0:2] == ("metrics", "summary")
     assert metrics_args[metrics_args.index("--test-eval-id") + 1] == "student-run"
+
+
+OPAQUE_EVALCLI_ERROR = EvalCliError(
+    "evalcli failed (exit 1): /bin/evalcli judge create --eval-run-id student-run "
+    '--judge-type COMPLETENESS --run-params {"Llm model": "default", "Use Cache": "true"} --json\n'
+    "stderr: Error:\n"
+    "stdout: "
+)
+
+
+def test_create_judge_run_retries_opaque_error():
+    client = EvalCliClient(binary="/fake/evalcli")
+    creates = {"n": 0}
+
+    def invoke(*args):
+        if args[:2] == ("judge", "create"):
+            creates["n"] += 1
+            if creates["n"] == 1:
+                raise OPAQUE_EVALCLI_ERROR
+            return {"id": "judge_ok"}
+        if args[:2] == ("judge", "list"):
+            return []
+        raise AssertionError(args)
+
+    with (
+        patch.object(client, "_invoke_json", side_effect=invoke),
+        patch("glean_gepa.evalcli_client.time.sleep") as sleep,
+    ):
+        judge_id = client.create_judge_run(
+            eval_run_id="student-run",
+            judge_type=COMPLETENESS_JUDGE_TYPE,
+            run_params=COMPLETENESS_RUN_PARAMS,
+        )
+
+    assert judge_id == "judge_ok"
+    assert creates["n"] == 2
+    sleep.assert_called_once()
+
+
+def test_create_judge_run_reuses_existing_after_opaque_create_error():
+    client = EvalCliClient(binary="/fake/evalcli")
+
+    def invoke(*args):
+        if args[:2] == ("judge", "create"):
+            raise OPAQUE_EVALCLI_ERROR
+        if args[:2] == ("judge", "list"):
+            return {"judgeRuns": [{"id": "judge-existing", "config": {"judgeType": "COMPLETENESS"}}]}
+        raise AssertionError(args)
+
+    with patch.object(client, "_invoke_json", side_effect=invoke):
+        judge_id = client.create_judge_run(
+            eval_run_id="student-run",
+            judge_type=COMPLETENESS_JUDGE_TYPE,
+            run_params=COMPLETENESS_RUN_PARAMS,
+        )
+
+    assert judge_id == "judge-existing"
+
+
+def test_create_judge_run_raises_on_non_transient_errors():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with patch.object(client, "_invoke_json", side_effect=EvalCliError("stderr: auth failed\nstdout: ")):
+        with pytest.raises(EvalCliError, match="auth failed"):
+            client.create_judge_run(
+                eval_run_id="student-run",
+                judge_type=COMPLETENESS_JUDGE_TYPE,
+                run_params=COMPLETENESS_RUN_PARAMS,
+            )
 
 
 @pytest.mark.parametrize(
@@ -243,7 +326,9 @@ def test_list_eval_set_versions_returns_matching_and_unspecified_deployments():
 
 def test_list_eval_set_versions_returns_version_rows():
     client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(client, "_invoke_json", return_value={"evalSetVersions": [{"version": "20260827"}]}) as mock_invoke:
+    with patch.object(
+        client, "_invoke_json", return_value={"evalSetVersions": [{"version": "20260827"}]}
+    ) as mock_invoke:
         rows = client.list_eval_set_versions(eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"])
 
     assert rows == [{"version": "20260827"}]
@@ -314,6 +399,7 @@ def test_subprocess_env_preserves_existing_ssl_cert(monkeypatch):
     [
         EvalCliError("stderr: Error: API request failed: 502\nResponse: Connection refused"),
         EvalCliError("stderr: Error: Could not find valid __Host-GCP_IAP_AUTH_TOKEN_* cookie in any browser."),
+        EvalCliError("evalcli failed (exit 1): evalcli run status\nstderr: Error:\nstdout: "),
     ],
 )
 def test_wait_for_eval_run_retries_transient_errors(error, capsys):
@@ -417,3 +503,54 @@ def test_invoke_raises_on_nonzero_exit():
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="auth failed")
         with pytest.raises(EvalCliError, match="auth failed"):
             client._invoke("whoami")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (None, "missing"),
+        ({"taskCountsByStatus": []}, "missing"),
+        ({"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}, "ongoing"),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 10},
+                    {"status": "TASK_EXECUTING", "count": 1},
+                ]
+            },
+            "ongoing",
+        ),
+        ({"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 10}]}, "usable"),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 186},
+                    {"status": "TASK_FAILED", "count": 14},
+                ]
+            },
+            "usable",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 188},
+                    {"status": "TASK_FAILED", "count": 11},
+                    {"status": "TASK_TIMED_OUT", "count": 1},
+                ]
+            },
+            "usable",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 77},
+                    {"status": "TASK_CANCELLED", "count": 123},
+                ]
+            },
+            "usable",
+        ),
+        ({"taskCountsByStatus": [{"status": "TASK_CANCELLED", "count": 200}]}, "usable"),
+    ],
+)
+def test_classify_eval_run_status(status, expected):
+    assert classify_eval_run_status(status) == expected

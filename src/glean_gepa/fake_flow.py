@@ -133,7 +133,11 @@ class FakeFlowAdapter(GleanAdapterBase):
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         del candidate, error_hamming_distance_k
-        examples = [self._reflective_example(trajectory) for trajectory in (eval_batch.trajectories or []) if trajectory["score"] < 1.0]
+        examples = [
+            self._reflective_example(trajectory)
+            for trajectory in (eval_batch.trajectories or [])
+            if trajectory["score"] < 1.0
+        ]
         if k is not None:
             examples = examples[:k]
         return dict.fromkeys(components_to_update, examples)
@@ -145,7 +149,7 @@ class FakeFlowAdapter(GleanAdapterBase):
         components_to_update: list[str],
         reflective_examples: list[dict[str, Any]],
         max_variants: int = 3,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], bool, str]:
         del reflection_llm, components_to_update, reflective_examples, max_variants
         current = candidate.prompt_modules[WRITING_CODE_KEY]
         next_iteration = _iteration(candidate.prompt_modules) + 1
@@ -155,7 +159,7 @@ class FakeFlowAdapter(GleanAdapterBase):
             current,
         )
         print(f"[FAKE FLOW] proposing fake iteration={next_iteration}")
-        return [rewritten], False
+        return [rewritten], False, f"Advance fake-flow iteration marker to {next_iteration}."
 
     @staticmethod
     def _reflective_example(trajectory: dict[str, Any]) -> dict[str, Any]:

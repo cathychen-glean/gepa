@@ -6,8 +6,11 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, cast
 
+from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
     ALDataInst,
+    ALRolloutOutput,
+    ALTrajectory,
     TeacherStudentALDataInst,
     TeacherStudentALRolloutOutput,
     TeacherStudentALTrajectory,
@@ -21,6 +24,7 @@ from glean_gepa.al_adapter import (
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
+from glean_gepa.core_tools import CORE_TOOL_KEYS, core_tool_reflection_prompt, tool_description_override_key
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
@@ -28,13 +32,20 @@ from glean_gepa.judge_metrics_util import (
     wait_for_judge_metrics,
 )
 from glean_gepa.prompt import FULL_PROMPT_KEY, WRITING_CODE_KEY, compile_encoded_prompt
+from glean_gepa.run_log import (
+    format_eval_entry_report,
+    format_high_signal_selection_report,
+    log_section,
+    selected_entry_ids_from_examples,
+)
 from glean_gepa.tool_match_util import (
     EvalRunToolMatchAnalysis,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
+    first_tool_mismatch_pair,
     log_tool_match_analysis,
     require_compared_eval_entries,
-    sequence_levenshtein_distance,
+    select_first_tool_mismatch_groups,
 )
 
 PRIMARY_OBJECTIVE = "tool_alignment"
@@ -42,7 +53,6 @@ FIXED_GROUNDING = 1.0
 COMPLETENESS_WEIGHT = 0.5
 TOOL_ALIGNMENT_WEIGHT = 0.3
 GROUNDING_WEIGHT = 0.2
-HIGH_SIGNAL_ENTRY_LIMIT = 20
 POINTWISE_JUDGES: tuple[tuple[str, str], ...] = ((COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),)
 
 
@@ -109,7 +119,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             )
         self._tool_match_cache[cache_key] = analysis
         self._save_cache()
-        print(f"[Cache MISS] Cached tool match analysis for {teacher_eval_id} vs {student_eval_id}")
+        print(f"[Cache MISS] Fetched tool match analysis for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 
     def _evaluate_teacher_student(
@@ -148,7 +158,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             run_label=run_label,
         )
         if wait_required:
-            print(f"[Cache MISS] Started {role} eval_id: {eval_id}")
+            print(f"Waiting on {role} eval_id: {eval_id}")
         else:
             print(f"[Cache HIT] Using cached {role} eval_id: {eval_id} ({run_label})")
         return eval_id, wait_required
@@ -239,7 +249,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _wait_pending_evals(self, pending_waits: dict[str, tuple[tuple[str, ...], str]]) -> None:
         for eval_id, (_cache_key, role) in pending_waits.items():
             self.runner.wait(eval_id)
-            print(f"[Cache MISS] Cached {role} eval_id: {eval_id}")
+            print(f"Recorded completed {role} eval_id: {eval_id}")
             for judge_type, run_params in POINTWISE_JUDGES:
                 self._ensure_judge(eval_id, judge_type=judge_type, run_params=run_params)
 
@@ -387,32 +397,29 @@ class TeacherStudentAdapter(GleanAdapterBase):
         return [self._finish_batch_evals(started, capture_traces) for started in all_started]
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
-        """Keep the 20 parent failures with the largest tool-sequence edit distance."""
-        ranked: list[tuple[int, str, TeacherStudentALDataInst]] = []
+        """Keep every parent entry whose first scored tools disagree."""
+        grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
         seen: set[str] = set()
         for trajectory in eval_batch.trajectories or []:
-            if trajectory["score"] >= 1.0:
-                continue
             data = trajectory["data"]
             output = trajectory["output"]
             entry_id = output.get("entry_id")
             if not entry_id or entry_id in seen:
                 continue
+            if (
+                first_tool_mismatch_pair(
+                    output.get("teacher_tool_events"),
+                    output.get("student_tool_events"),
+                )
+                is None
+            ):
+                continue
             seen.add(entry_id)
-            distance = sequence_levenshtein_distance(
-                output.get("student_tool_events") or [],
-                output.get("teacher_tool_events") or [],
-            )
-            ranked.append((distance, entry_id, data))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        selected = ranked[:HIGH_SIGNAL_ENTRY_LIMIT]
-        if selected:
-            print(f"[High-signal] Selected {len(selected)}/{len(ranked)} entries by tool-sequence Levenshtein")
-
-        grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
-        for _distance, entry_id, data in selected:
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
             grouped.setdefault(key, []).append(entry_id)
+        if grouped:
+            count = sum(len(ids) for ids in grouped.values())
+            print(f"[High-signal] Selected {count} first-tool mismatch entries for screening")
         return [
             {
                 "eval_set_name": eval_set_name,
@@ -424,20 +431,82 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items()
         ]
 
-    @staticmethod
-    def _check_primary_tool_mismatch(output: TeacherStudentALRolloutOutput) -> bool:
-        student_tools = output.get("student_tool_events", [])
-        teacher_tools = output.get("teacher_tool_events", [])
-        if not student_tools or not teacher_tools:
-            return len(student_tools) != len(teacher_tools)
-        return student_tools[0] != teacher_tools[0]
+    def make_reflective_dataset(
+        self,
+        candidate: dict[str, str],
+        eval_batch: EvaluationBatch[ALTrajectory, ALRolloutOutput],
+        components_to_update: list[str],
+        k: int | None,
+        error_hamming_distance_k: int | None = None,
+    ) -> dict[str, list[ReflectiveExample]]:
+        """Build reflection examples from the most frequent first-tool mismatch groups.
+
+        ``k`` and ``error_hamming_distance_k`` are ignored: the proposer only sees
+        this frequency-capped mismatch set (at most 20 entries, or the full
+        most-frequent group if that group is larger).
+        """
+        del k, error_hamming_distance_k
+        if not eval_batch.trajectories:
+            return {comp: [] for comp in components_to_update}
+
+        trajectories = [cast(TeacherStudentALTrajectory, trajectory) for trajectory in eval_batch.trajectories]
+        mismatch_keys = [
+            first_tool_mismatch_pair(
+                trajectory["output"].get("teacher_tool_events"),
+                trajectory["output"].get("student_tool_events"),
+            )
+            for trajectory in trajectories
+        ]
+        selected_indices, selected_groups = select_first_tool_mismatch_groups(mismatch_keys)
+        selected = [trajectories[index] for index in selected_indices]
+        selected_pairs = [mismatch_keys[index] for index in selected_indices]
+        examples: dict[str, list[ReflectiveExample]] = {}
+        for component_name in components_to_update:
+            chosen = selected
+            if component_name in CORE_TOOL_KEYS:
+                chosen = [
+                    trajectory
+                    for trajectory, pair in zip(selected, selected_pairs, strict=True)
+                    if pair is not None
+                    and any(tool_description_override_key(name) == component_name for name in pair if name)
+                ]
+            examples[component_name] = [
+                self._build_reflective_example(component_name, trajectory, candidate) for trajectory in chosen
+            ]
+        mismatch_count = sum(pair is not None for pair in mismatch_keys)
+        selected_entry_ids = [
+            str(trajectory["output"].get("entry_id", ""))
+            for trajectory in selected
+            if trajectory["output"].get("entry_id")
+        ]
+        log_section(
+            "REFLECTION: teacher vs student tool sequences",
+            format_eval_entry_report(trajectories),
+        )
+        log_section(
+            "REFLECTION: high-signal dataset",
+            format_high_signal_selection_report(
+                selected_groups=selected_groups,
+                selected_entry_ids=selected_entry_ids,
+                selected_count=len(selected_indices),
+                total_mismatch_count=mismatch_count,
+                module_entry_ids={
+                    module: selected_entry_ids_from_examples(module_examples)
+                    for module, module_examples in examples.items()
+                },
+            ),
+        )
+        return examples
 
     def _create_failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         output = trajectory["output"]
         tool_alignment = trajectory.get("objective_scores", {}).get("tool_alignment", 1.0)
         return (
             int(tool_alignment < 0.7),
-            int(self._check_primary_tool_mismatch(output)),
+            int(
+                first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
+                is not None
+            ),
             int(output.get("student_tool_errors", 0) > 0),
         )
 
@@ -453,10 +522,15 @@ class TeacherStudentAdapter(GleanAdapterBase):
         completeness = objective_scores.get("completeness", 0.0)
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
+        mismatch = first_tool_mismatch_pair(teacher_tools, student_tools)
         feedback_parts = []
-        if self._check_primary_tool_mismatch(output):
-            feedback_parts.append(f"Tool mismatch: student used {student_tools[:3]} vs teacher {teacher_tools[:3]}.")
-        if tool_alignment < 0.7:
+        if mismatch is not None:
+            teacher_first, student_first = mismatch
+            feedback_parts.append(
+                f"First-tool mismatch: teacher used {teacher_first or '(none)'} "
+                f"and student used {student_first or '(none)'}."
+            )
+        if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
         if completeness < 0.7:
             feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
@@ -491,9 +565,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
             return (
                 "You are editing the ENTIRE student system prompt as a single string. Any section "
                 "may change — routing, execution discipline, coding instructions, tool surface, "
-                "or response guidelines — if it improves tool-choice alignment with the teacher. "
+                "or response guidelines — if it improves first-tool alignment with the teacher. "
                 "Preserve [[placeholder]] tokens. Propose a complete updated prompt with minimal deltas."
             )
+        if module_name in CORE_TOOL_KEYS:
+            return core_tool_reflection_prompt(module_name)
         return "Focus only on this module's responsibilities."
 
     @staticmethod
@@ -513,7 +589,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
         all_trajectories: list[TeacherStudentALTrajectory] | None = [] if capture_traces else None
         all_objective_scores: list[dict[str, float]] = []
         focused_alignment_rates: list[float] = []
-        focused_levenshtein_avgs: list[float] = []
         all_eval_run_ids: list[EvalRunIds] = []
 
         for pair in started:
@@ -532,12 +607,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
             if is_focused_eval:
                 matching = sum(1 for metrics in tool_match_analysis.per_entry.values() if metrics.tools_match)
                 focused_alignment_rates.append(matching / len(requested_entry_ids))
-                distances = [
-                    sequence_levenshtein_distance(metrics.student_tools, metrics.teacher_tools)
-                    for metrics in tool_match_analysis.per_entry.values()
-                ]
-                if distances:
-                    focused_levenshtein_avgs.append(sum(distances) / len(distances))
                 if not tool_match_analysis.per_entry:
                     continue
             else:
@@ -555,7 +624,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for entry_id, tool_match in tool_match_analysis.per_entry.items():
                 student_tools = list(tool_match.student_tools)
                 teacher_tools = list(tool_match.teacher_tools)
-                tool_alignment = float(tool_match.tools_match) if is_focused_eval else tool_match.tool_match_score
+                tool_alignment = float(tool_match.tools_match)
                 completeness = student_completeness.per_entry.get(entry_id, student_completeness.aggregate)
                 output: TeacherStudentALRolloutOutput = {
                     "deployment_id": deployment_id,
@@ -611,11 +680,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
             if summary is None:
                 summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
             summary["tool_alignment"] = sum(focused_alignment_rates) / len(focused_alignment_rates)
-        if focused_levenshtein_avgs:
-            if summary is None:
-                summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
-            summary["avg_tool_levenshtein"] = sum(focused_levenshtein_avgs) / len(focused_levenshtein_avgs)
-            print(f"[High-signal] Average tool-sequence Levenshtein={summary['avg_tool_levenshtein']:.2f}")
         if summary is not None and started:
             teacher_scores = [
                 self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE).aggregate for pair in started

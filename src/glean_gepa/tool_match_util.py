@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -15,7 +16,11 @@ from glean_gepa.shell_tool_error_util import (
     resolve_eval_run_date_range,
 )
 
-SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve"})
+REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT = 20
+SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool"})
+_EXECUTE_ACTION_FILTER = (
+    "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
+)
 
 
 class NoComparedEvalEntriesError(RuntimeError):
@@ -28,13 +33,6 @@ class ToolMatchEntryMetrics:
     student_tools: tuple[str, ...]
     teacher_tools: tuple[str, ...]
     tools_match: bool
-    tool_match_score: float
-    student_trace_id: str | None = None
-    teacher_trace_id: str | None = None
-
-    @property
-    def has_mismatch(self) -> bool:
-        return not self.tools_match
 
 
 @dataclass(frozen=True)
@@ -43,7 +41,6 @@ class ToolMatchMetrics:
     student_eval_id: str
     compared_entries: int
     matching_entries: int
-    mismatching_entries: int
     tool_match_rate: float
 
 
@@ -58,19 +55,11 @@ class EvalRunToolMatchAnalysis:
     high_signal_entry_ids: tuple[str, ...]
 
 
-def _execute_action_filter_sql() -> str:
-    return (
-        "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') "
-        "AND jsonPayload.action.execution_mode = 'EXECUTE'"
-    )
-
-
 def build_tool_match_time_bounds_query(
     *,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
     """Find min/max Execute Action timestamps for a teacher/student eval pair."""
-    action_filter = _execute_action_filter_sql()
     return f"""
 SELECT
   MIN(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS min_start_ms,
@@ -79,7 +68,7 @@ FROM `{agentspan_table}`
 WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
   BETWEEN @search_start_date AND @search_end_date
   AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
-  AND {action_filter}
+  AND {_EXECUTE_ACTION_FILTER}
 """.strip()
 
 
@@ -88,7 +77,6 @@ def build_tool_match_per_entry_query(
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
     """Build SQL that pairs teacher and student tool sequences per eval entry."""
-    action_filter = _execute_action_filter_sql()
     skipped = ", ".join(f"'{name}'" for name in sorted(SKIPPED_TOOL_NAMES))
     return f"""
 WITH tool_spans AS (
@@ -98,38 +86,34 @@ WITH tool_spans AS (
       jsonPayload.context.eval.entry_uuid,
       CAST(jsonPayload.context.eval.entry_id AS STRING)
     ) AS entry_id,
-    jsonPayload.context.agent_trace.trace_id AS trace_id,
     REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') AS tool_name,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{agentspan_table}`
   WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
     BETWEEN @start_date AND @end_date
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
-    AND {action_filter}
+    AND {_EXECUTE_ACTION_FILTER}
     AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN ({skipped})
 ),
 per_role AS (
   SELECT
     entry_id,
     eval_id,
-    ARRAY_AGG(tool_name IGNORE NULLS ORDER BY start_ms) AS tools,
-    ARRAY_AGG(trace_id IGNORE NULLS ORDER BY start_ms LIMIT 1)[SAFE_OFFSET(0)] AS trace_id
+    ARRAY_AGG(tool_name IGNORE NULLS ORDER BY start_ms) AS tools
   FROM tool_spans
   WHERE entry_id IS NOT NULL
   GROUP BY entry_id, eval_id
 ),
 student AS (
-  SELECT entry_id, tools, trace_id FROM per_role WHERE eval_id = @student_eval_id
+  SELECT entry_id, tools FROM per_role WHERE eval_id = @student_eval_id
 ),
 teacher AS (
-  SELECT entry_id, tools, trace_id FROM per_role WHERE eval_id = @teacher_eval_id
+  SELECT entry_id, tools FROM per_role WHERE eval_id = @teacher_eval_id
 )
 SELECT
   COALESCE(student.entry_id, teacher.entry_id) AS entry_id,
   IFNULL(student.tools, ARRAY<STRING>[]) AS student_tools,
-  IFNULL(teacher.tools, ARRAY<STRING>[]) AS teacher_tools,
-  student.trace_id AS student_trace_id,
-  teacher.trace_id AS teacher_trace_id
+  IFNULL(teacher.tools, ARRAY<STRING>[]) AS teacher_tools
 FROM student
 FULL OUTER JOIN teacher
   ON student.entry_id = teacher.entry_id
@@ -137,115 +121,72 @@ ORDER BY entry_id
 """.strip()
 
 
-def build_tool_match_search_params(
+def scored_tool_sequence(tools: Sequence[str] | None) -> tuple[str, ...]:
+    """Return tool names used for sequence matching, dropping Shell and other skipped tools."""
+    return tuple(str(name) for name in (tools or []) if name and str(name) not in SKIPPED_TOOL_NAMES)
+
+
+def first_tool_name(tools: Sequence[str] | None) -> str:
+    """Return the first scored tool name, or an empty string when none remain."""
+    scored = scored_tool_sequence(tools)
+    return scored[0] if scored else ""
+
+
+def first_tool_mismatch_pair(
+    teacher_tools: Sequence[str] | None,
+    student_tools: Sequence[str] | None,
+) -> tuple[str, str] | None:
+    """Return ``(teacher_first, student_first)`` when they differ, else ``None``."""
+    teacher = first_tool_name(teacher_tools)
+    student = first_tool_name(student_tools)
+    if teacher == student:
+        return None
+    return (teacher, student)
+
+
+def select_first_tool_mismatch_groups(
+    mismatch_keys: Sequence[tuple[str, str] | None],
     *,
-    teacher_eval_id: str,
-    student_eval_id: str,
-    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-    end_date: date | None = None,
-) -> list[QueryParameter]:
-    search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
-    return [
-        QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
-        QueryParameter("search_start_date", "DATE", search_start.isoformat()),
-        QueryParameter("search_end_date", "DATE", search_end.isoformat()),
-    ]
+    max_entries: int = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
+) -> tuple[list[int], list[tuple[str, str, int]]]:
+    """Select first-tool mismatch indices by descending ``(teacher, student)`` frequency.
 
+    The most frequent group is always included in full, even when it exceeds
+    ``max_entries``. Later whole groups are added while they still fit in the
+    cap; groups that would overflow are skipped so later smaller groups can
+    still be included.
 
-def build_tool_match_query_params(
-    *,
-    teacher_eval_id: str,
-    student_eval_id: str,
-    start_date: date,
-    end_date: date,
-) -> list[QueryParameter]:
-    return [
-        QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
-        QueryParameter("student_eval_id", "STRING", student_eval_id),
-        QueryParameter("teacher_eval_id", "STRING", teacher_eval_id),
-        QueryParameter("start_date", "DATE", start_date.isoformat()),
-        QueryParameter("end_date", "DATE", end_date.isoformat()),
-    ]
-
-
-def compute_tool_match_score(student_tools: Sequence[str], teacher_tools: Sequence[str]) -> float:
-    """Return a 0-1 score for ordered tool-name alignment."""
-    if not student_tools and not teacher_tools:
-        return 1.0
-    if not student_tools or not teacher_tools:
-        return 0.0
-    if tuple(student_tools) == tuple(teacher_tools):
-        return 1.0
-    compared = max(len(student_tools), len(teacher_tools))
-    matches = 0
-    for index, student_tool in enumerate(student_tools):
-        if index < len(teacher_tools) and student_tool == teacher_tools[index]:
-            matches += 1
-    return matches / compared
-
-
-def avg_levenshtein_alignment_score(average_distance: float) -> float:
-    """Map mean tool-sequence edit distance onto (0, 1]; lower distance scores higher."""
-    if average_distance == float("inf"):
-        return 0.0
-    return 1.0 / (1.0 + average_distance)
-
-
-def mean_sequence_levenshtein(
-    per_entry_tools: Mapping[str, tuple[Sequence[str], Sequence[str]]],
-    entry_ids: Sequence[str],
-    *,
-    fallback_distances: Mapping[str, int] | None = None,
-) -> float:
-    """Return the mean token-level Levenshtein distance over ``entry_ids``.
-
-    Missing entries use ``fallback_distances`` when provided so a child cannot
-    look better by dropping rows. If an id is still missing, the mean is
-    undefined and this returns ``inf``.
+    Returns ``(selected_indices, selected_groups)`` where each group is
+    ``(teacher_tool, student_tool, taken_count)``.
     """
-    if not entry_ids:
-        return float("inf")
-    distances: list[int] = []
-    for entry_id in entry_ids:
-        pair = per_entry_tools.get(entry_id)
-        if pair is not None:
-            distances.append(sequence_levenshtein_distance(pair[0], pair[1]))
-        elif fallback_distances is not None and entry_id in fallback_distances:
-            distances.append(fallback_distances[entry_id])
-        else:
-            return float("inf")
-    return sum(distances) / len(distances)
-
-
-def sequence_levenshtein_distance(left: Sequence[str], right: Sequence[str]) -> int:
-    """Return the token-level edit distance between two ordered tool-name lists."""
-    if tuple(left) == tuple(right):
-        return 0
-    if not left:
-        return len(right)
-    if not right:
-        return len(left)
-    previous = list(range(len(right) + 1))
-    for i, left_item in enumerate(left, start=1):
-        current = [i]
-        for j, right_item in enumerate(right, start=1):
-            substitution = previous[j - 1] + int(left_item != right_item)
-            current.append(min(previous[j] + 1, current[-1] + 1, substitution))
-        previous = current
-    return previous[-1]
+    if max_entries < 0:
+        raise ValueError("max_entries must be non-negative")
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, key in enumerate(mismatch_keys):
+        if key is None:
+            continue
+        groups[key].append(index)
+    ranked = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0], item[0][1]))
+    selected: list[int] = []
+    selected_groups: list[tuple[str, str, int]] = []
+    for (teacher_tool, student_tool), indices in ranked:
+        if selected and len(selected) + len(indices) > max_entries:
+            continue
+        selected.extend(indices)
+        selected_groups.append((teacher_tool, student_tool, len(indices)))
+        if len(selected) >= max_entries:
+            break
+    return selected, selected_groups
 
 
 def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics:
-    student_tools = tuple(str(name) for name in (row.get("student_tools") or []) if name)
-    teacher_tools = tuple(str(name) for name in (row.get("teacher_tools") or []) if name)
+    student_tools = scored_tool_sequence(row.get("student_tools"))
+    teacher_tools = scored_tool_sequence(row.get("teacher_tools"))
     return ToolMatchEntryMetrics(
         entry_id=str(row.get("entry_id") or ""),
         student_tools=student_tools,
         teacher_tools=teacher_tools,
-        tools_match=student_tools == teacher_tools,
-        tool_match_score=compute_tool_match_score(student_tools, teacher_tools),
-        student_trace_id=str(row["student_trace_id"]) if row.get("student_trace_id") else None,
-        teacher_trace_id=str(row["teacher_trace_id"]) if row.get("teacher_trace_id") else None,
+        tools_match=(student_tools[:1] == teacher_tools[:1]),
     )
 
 
@@ -261,7 +202,6 @@ def aggregate_tool_match_metrics(
         student_eval_id=student_eval_id,
         compared_entries=compared,
         matching_entries=matching,
-        mismatching_entries=compared - matching,
         tool_match_rate=(matching / compared) if compared else 0.0,
     )
 
@@ -294,14 +234,14 @@ def fetch_eval_run_tool_match_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> EvalRunToolMatchAnalysis:
+    search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
     bounds_rows = client.query(
         build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
-        params=build_tool_match_search_params(
-            teacher_eval_id=teacher_eval_id,
-            student_eval_id=student_eval_id,
-            lookback_days=lookback_days,
-            end_date=end_date,
-        ),
+        params=[
+            QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
+            QueryParameter("search_start_date", "DATE", search_start.isoformat()),
+            QueryParameter("search_end_date", "DATE", search_end.isoformat()),
+        ],
     )
     date_range = resolve_eval_run_date_range(
         bounds_rows[0] if bounds_rows else None,
@@ -319,12 +259,13 @@ def fetch_eval_run_tool_match_analysis(
     start_date, resolved_end = date_range
     per_entry_rows = client.query(
         build_tool_match_per_entry_query(agentspan_table=agentspan_table),
-        params=build_tool_match_query_params(
-            teacher_eval_id=teacher_eval_id,
-            student_eval_id=student_eval_id,
-            start_date=start_date,
-            end_date=resolved_end,
-        ),
+        params=[
+            QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
+            QueryParameter("student_eval_id", "STRING", student_eval_id),
+            QueryParameter("teacher_eval_id", "STRING", teacher_eval_id),
+            QueryParameter("start_date", "DATE", start_date.isoformat()),
+            QueryParameter("end_date", "DATE", resolved_end.isoformat()),
+        ],
     )
     per_entry = {
         metrics.entry_id: metrics
@@ -340,7 +281,7 @@ def fetch_eval_run_tool_match_analysis(
         aggregate=aggregate_tool_match_metrics(teacher_eval_id, student_eval_id, per_entry),
         per_entry=per_entry,
         high_signal_entry_ids=tuple(
-            sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.has_mismatch)
+            sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.tools_match)
         ),
     )
 
@@ -364,7 +305,7 @@ def log_tool_match_analysis(analysis: EvalRunToolMatchAnalysis) -> None:
     aggregate = analysis.aggregate
     print(
         f"[Tool Match] {analysis.student_eval_id} vs {analysis.teacher_eval_id}: "
-        f"{aggregate.tool_match_rate:.2%} exact match "
+        f"{aggregate.tool_match_rate:.2%} first-tool match "
         f"({aggregate.matching_entries}/{aggregate.compared_entries})"
     )
     for entry_id in analysis.high_signal_entry_ids[:5]:
