@@ -146,7 +146,10 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
     # aggregate (75%), not the high-signal entry's 50% score.
     assert full_val_result.scores == [0.75]
     assert full_val_result.objective_scores == [{SHELL_SUCCESS_OBJECTIVE: 0.75}]
-    assert "[Validation] Reading full-validation shell results for AI Answers Small 20260403: run_123" in capsys.readouterr().out
+    assert (
+        "[Validation] Reading full-validation shell results for AI Answers Small 20260403: run_123"
+        in capsys.readouterr().out
+    )
 
     assert result.trajectories[0]["data"]["eval_entry_id"] == "entry-1"
     assert result.trajectories[0]["data"]["eval_run_id"] == "run_123"
@@ -236,6 +239,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
 
     ensure.assert_called_once()
     assert get_analysis.call_args.kwargs["include_error_examples"] is False
+    assert get_analysis.call_args.kwargs["include_per_entry"] is True
     assert run_eval.call_args.kwargs["eval_set_name"] == "gepa-high-signal-source"
     assert run_eval.call_args.kwargs["eval_set_version"] == "v1_hs_abc"
     assert run_eval.call_args.kwargs["run_label"] == "gepa_high_signal"
@@ -589,6 +593,8 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     assert without_traces.trajectories is None
     create_eval_run.assert_called_once()
     fetch.assert_called_once()
+    assert fetch.call_args.kwargs["include_error_examples"] is False
+    assert fetch.call_args.kwargs["include_per_entry"] is False
 
     second_evalcli = EvalCliClient(binary="/fake/evalcli")
     second_runner = ALRunner(evalcli=second_evalcli, cache_file=str(runner_cache_file))
@@ -601,12 +607,16 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     )
     with (
         patch.object(second_evalcli, "create_eval_run") as create_eval_run,
-        patch("glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis") as fetch,
+        patch(
+            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
+        ) as fetch,
     ):
         with_traces = second.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=True)
 
     create_eval_run.assert_not_called()
-    fetch.assert_not_called()
+    fetch.assert_called_once()
+    assert fetch.call_args.kwargs["include_error_examples"] is True
+    assert fetch.call_args.kwargs["include_per_entry"] is True
     assert with_traces.trajectories is not None
     trace_output = with_traces.trajectories[0]["output"]
     assert trace_output["shell_error_messages"] == ["command exited with status 1"]
@@ -755,6 +765,78 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
         pytest.raises(ShellToolTelemetryPendingError, match="refusing to score 0/0"),
     ):
         adapter.evaluate(batch, {"WRITING_CODE": "prompt"})
+
+
+def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
+    analysis = EvalRunShellToolErrorAnalysis(
+        eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
+        start_date=date(2026, 9, 2),
+        end_date=date(2026, 9, 2),
+        aggregate=ShellToolErrorMetrics(
+            eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
+            shell_executions=560,
+            shell_errors=38,
+            shell_error_rate=0.0679,
+            shell_error_pct=6.79,
+            recent_error_examples=(
+                ShellToolErrorExample(
+                    started_at="2026-09-02T05:27:00Z",
+                    project_id="scio-prod",
+                    entry_id="entry-1",
+                    eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
+                    run_id="execution-1",
+                    trace_id="trace-1",
+                    span_id="span-1",
+                    span_name="Execute Action: Shell",
+                    action_id="Shell",
+                    action_status="ERROR",
+                    span_status="ERROR",
+                    provider_status="failed",
+                    output_status_code="1",
+                    error_str="command exited with status 1",
+                    action_run_id="call-1",
+                ),
+            ),
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+    evalcli = EvalCliClient(binary="/fake/evalcli")
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=evalcli),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+
+    with (
+        patch.object(adapter, "_get_or_run_student_eval", return_value="gepa_gpt_5a0754e0543e49fc_1788306729"),
+        patch(
+            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis",
+            return_value=analysis,
+        ) as fetch,
+        patch.object(evalcli, "get_analysis_trace") as get_trace,
+    ):
+        result = adapter.evaluate(
+            [
+                {
+                    "eval_set_name": "Glean Chat V2 Medium",
+                    "eval_set_version": "20260815",
+                    "deployment_ids": ["scio-prod"],
+                    "status": "active",
+                    "cached_student_eval_run_id": "gepa_gpt_5a0754e0543e49fc_1788306729",
+                }
+            ],
+            {"WRITING_CODE": "prompt"},
+            capture_traces=False,
+        )
+
+    fetch.assert_called_once()
+    assert fetch.call_args.kwargs["include_error_examples"] is False
+    assert fetch.call_args.kwargs["include_per_entry"] is False
+    get_trace.assert_not_called()
+    assert result.scores == [pytest.approx(1 - 0.0679)]
+    assert result.trajectories is None
 
 
 def test_persisted_zero_shell_analysis_is_refetched(tmp_path):

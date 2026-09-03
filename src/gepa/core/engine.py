@@ -526,6 +526,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             linear_pareto_front_program_idx=linear_pareto_front_program_idx,
             valset_size=len(valset),
             val_evaluation_policy=self.val_evaluation_policy,
+            iteration=iteration,
         )
 
         # Log candidate table row with instructions and metadata

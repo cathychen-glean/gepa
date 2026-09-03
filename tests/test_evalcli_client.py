@@ -197,6 +197,27 @@ def test_wait_for_eval_run_raises_on_non_transient_errors():
             client.wait_for_eval_run("run_123", poll_interval_sec=0)
 
 
+def test_wait_for_eval_set_entries_includes_listing_error_on_timeout():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(
+            client,
+            "list_eval_set_entries",
+            side_effect=EvalCliError('Eval set version "n:v" not found'),
+        ),
+        patch("glean_gepa.evalcli_client.time.sleep"),
+        pytest.raises(EvalCliError, match="Last listing error"),
+    ):
+        client.wait_for_eval_set_entries(
+            eval_set_name="n",
+            eval_set_version="v",
+            deployment_ids=["prod"],
+            expected_count=2,
+            poll_interval_sec=1,
+            timeout_sec=1,
+        )
+
+
 def test_invoke_raises_on_nonzero_exit():
     client = EvalCliClient(binary="/fake/evalcli")
     with patch("glean_gepa.evalcli_client.subprocess.run") as mock_run:

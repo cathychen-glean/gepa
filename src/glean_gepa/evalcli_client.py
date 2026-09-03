@@ -319,6 +319,7 @@ class EvalCliClient:
         print(f"Waiting for eval set {eval_set_name}:{eval_set_version} to ingest {expected_count} entries...")
         elapsed = 0
         entries: list[dict[str, Any]] = []
+        last_list_error: EvalCliError | None = None
         while elapsed < timeout_sec:
             try:
                 entries = self.list_eval_set_entries(
@@ -326,7 +327,11 @@ class EvalCliClient:
                     eval_set_version=eval_set_version,
                     deployment_ids=deployment_ids,
                 )
-            except EvalCliError:
+                last_list_error = None
+            except EvalCliError as exc:
+                if last_list_error is None or str(exc) != str(last_list_error):
+                    print(f"Eval set {eval_set_name}:{eval_set_version} is not listable yet: {exc}")
+                last_list_error = exc
                 entries = []
 
             if len(entries) >= expected_count:
@@ -336,9 +341,10 @@ class EvalCliClient:
             time.sleep(poll_interval_sec)
             elapsed += poll_interval_sec
 
+        extra = f" Last listing error: {last_list_error}" if last_list_error else ""
         raise EvalCliError(
             f"Eval set {eval_set_name}:{eval_set_version} only ingested {len(entries)}/{expected_count} "
-            f"entries after {timeout_sec}s"
+            f"entries after {timeout_sec}s.{extra}"
         )
 
     def create_judge_run(self, *, student_eval_id: str, teacher_eval_id: str) -> str:
