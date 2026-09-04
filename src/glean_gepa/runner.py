@@ -16,9 +16,7 @@ from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import StdOutLogger
 from glean_gepa.adapter_types import ALDataInst, JudgingMode
 from glean_gepa.al_adapter import (
-    MODULES,
     ALRunner,
-    Judge,
     ModuleSpec,
     Thresholds,
 )
@@ -30,7 +28,19 @@ from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
-from glean_gepa.prompt import WRITING_CODE_KEY
+from glean_gepa.prompt import candidate_module_names, materialize_system_prompt, with_core_tool_defaults
+from glean_gepa.prompt_constants import (
+    CORE_TOOL_KEYS,
+    CORE_TOOLS,
+    CORE_TOOLS_GROUP,
+    FULL_PROMPT_KEY,
+    KNOWN_PROMPT_KEYS,
+    MODULE_TOKEN_BUDGETS,
+    PROMPT_MODULE_DEFAULTS,
+    WRITING_CODE_KEY,
+)
+from glean_gepa.run_log import capture_run_log, log_section
+from glean_gepa.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
@@ -38,6 +48,7 @@ CACHE_DIRECTORY_NAME = "cache"
 ADAPTER_CACHE_FILENAME = "glean_adapter_cache.json"
 EVAL_RUN_CACHE_FILENAME = "glean_eval_run_cache.json"
 CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
+RUN_LOG_FILENAME = "gepa_run.log"
 EVALSET_SCHEDULE_FILENAME = "glean_evalset_schedule.json"
 
 
@@ -55,18 +66,73 @@ def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
 
 
 def _load_seed_candidate(path: Path) -> dict[str, str]:
+    """Load prompt-module overrides. Omitted keys use ``PROMPT_MODULE_DEFAULTS``."""
     if not path.is_file():
         raise SystemExit(f"seed_candidate file not found: {path}")
     raw = json.loads(path.read_text())
-    if not isinstance(raw, dict) or not raw:
-        raise SystemExit("seed_candidate must be a non-empty JSON object")
+    if not isinstance(raw, dict):
+        raise SystemExit("seed_candidate must be a JSON object")
 
-    if set(raw) != {WRITING_CODE_KEY}:
-        raise SystemExit(f"seed_candidate must contain only {WRITING_CODE_KEY!r}")
-    writing_code = raw[WRITING_CODE_KEY]
-    if not isinstance(writing_code, str):
-        raise SystemExit(f"{WRITING_CODE_KEY} must be a string. Got type={type(writing_code)}")
-    return {WRITING_CODE_KEY: writing_code}
+    unknown = set(raw) - KNOWN_PROMPT_KEYS
+    if unknown:
+        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
+        raise SystemExit(f"seed_candidate has unknown keys: {unknown_list}")
+
+    seed: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            raise SystemExit(f"{key} must be a string. Got type={type(value)}")
+        seed[key] = value
+    return seed
+
+
+def _parse_editable_modules(raw: str) -> list[str]:
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise SystemExit("editable_modules must list at least one prompt key")
+    modules: list[str] = []
+    unknown: list[str] = []
+    for part in parts:
+        if part == CORE_TOOLS_GROUP:
+            for key in CORE_TOOLS:
+                if key not in modules:
+                    modules.append(key)
+        elif part in KNOWN_PROMPT_KEYS:
+            if part not in modules:
+                modules.append(part)
+        else:
+            unknown.append(part)
+    if unknown:
+        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
+        known_list = ", ".join(sorted([*KNOWN_PROMPT_KEYS, CORE_TOOLS_GROUP]))
+        raise SystemExit(f"unknown editable_modules: {unknown_list}. Known keys: {known_list}")
+    return modules
+
+
+def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str]) -> dict[str, str]:
+    """Build the GEPA candidate dict for the requested editable modules.
+
+    ``FULL_PROMPT`` is a fully stitched system prompt when that key is editable.
+    When neither ``FULL_PROMPT`` nor ``WRITING_CODE`` is editable, the materialized
+    seed prompt is still attached so evals keep a frozen system prompt. Core-tool
+    descriptions are always attached so evals can override ``schema.description``.
+    ``RULES_EXT`` is copied from the seed when listed; compile time splices it into
+    the ``{RULES_EXT}`` slot after Writing Code **Rules:**. Keys omitted from
+    ``raw`` use ``PROMPT_MODULE_DEFAULTS``.
+    """
+    seed: dict[str, str] = {}
+    for key in editable_modules:
+        if key == FULL_PROMPT_KEY:
+            seed[key] = materialize_system_prompt(raw)
+        elif key not in CORE_TOOL_KEYS:
+            seed[key] = raw.get(key, PROMPT_MODULE_DEFAULTS[key])
+    editing_system_prompt = any(key in {FULL_PROMPT_KEY, WRITING_CODE_KEY} for key in editable_modules)
+    if not editing_system_prompt:
+        seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
+    for key in CORE_TOOLS:
+        if key in raw:
+            seed.setdefault(key, raw[key])
+    return with_core_tool_defaults(seed)
 
 
 def _make_reflection_lm(
@@ -184,9 +250,7 @@ def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient
         train_versions = _parse_eval_versions(args.train_eval_versions, argument_name="--train_eval_versions")
         val_versions = _parse_eval_versions(args.val_eval_versions, argument_name="--val_eval_versions")
     else:
-        rows = evalcli.list_eval_set_versions(
-            eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"]
-        )
+        rows = evalcli.list_eval_set_versions(eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"])
         train_versions, val_versions = _select_recent_train_and_val_versions(
             rows,
             today=date.today(),
@@ -209,11 +273,24 @@ def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optimize Glean prompts with GEPA's low-level engine.")
-    parser.add_argument("--seed_candidate", type=Path)
+    parser.add_argument(
+        "--seed_candidate",
+        type=Path,
+        help="JSON object of prompt-module overrides. Omitted keys use the Python defaults "
+        "in glean_gepa.prompt_constants (WRITING_CODE, FULL_PROMPT, RULES_EXT, core-tool descriptions).",
+    )
     parser.add_argument("--max_metric_calls", type=int, default=10)
     parser.add_argument("--run_dir", type=Path, default=None)
-    parser.add_argument("--student_model", default="gpt")
-    parser.add_argument("--teacher_model", default="gpt")
+    parser.add_argument(
+        "--student_model",
+        default="gpt",
+        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus (default: gpt).",
+    )
+    parser.add_argument(
+        "--teacher_model",
+        default="gpt",
+        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus (default: gpt).",
+    )
     parser.add_argument("--reflection_lm_model", default="OPEN_AI:GPT5_LATEST")
     parser.add_argument("--qe_project", default="dev-sandbox-334901")
     parser.add_argument("--qe_instance", default="glean-dev")
@@ -232,6 +309,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Drop later examples whose isolated execution errors are within Hamming distance k.",
     )
     parser.add_argument("--evalcli", default=None)
+    parser.add_argument(
+        "--agentspan_lookback_days",
+        type=int,
+        default=DEFAULT_LOOKBACK_DAYS,
+        help="UTC days of Agentspan shards to search when scoring an eval run "
+        "(shell-tool errors or teacher-student tool match).",
+    )
     parser.add_argument(
         "--eval_run_timeout_sec",
         type=_nonnegative_int,
@@ -256,7 +340,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Persistent generated-child cache. Defaults to <run_dir>/cache/glean_children_cache.json.",
     )
-    parser.add_argument("--shell_error_lookback_days", type=int, default=7)
+    parser.add_argument(
+        "--log_file",
+        type=Path,
+        default=None,
+        help="Append all terminal output plus reflection/child reports. "
+        "Defaults to <run_dir>/gepa_run.log when --run_dir is set.",
+    )
     parser.add_argument("--bigquery_project", default=None)
     parser.add_argument(
         "--train_eval_versions",
@@ -285,6 +375,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="single_model",
     )
     parser.add_argument(
+        "--editable_modules",
+        default=WRITING_CODE_KEY,
+        help="Comma-separated prompt keys to edit (WRITING_CODE, FULL_PROMPT, CORE_TOOLS, "
+        "RULES_EXT, or individual core-tool keys). CORE_TOOLS expands to all core-tool "
+        "descriptions; the proposer only rewrites those involved in high-signal first-tool "
+        "mismatches. RULES_EXT is at most two bullets after Writing Code **Rules:**.",
+    )
+    parser.add_argument(
         "--fake_flow",
         action="store_true",
         help="Run deterministic fake eval data and prompt iterations without external Glean services.",
@@ -297,22 +395,56 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_log_file(args: argparse.Namespace) -> Path | None:
+    if args.log_file is not None:
+        return args.log_file
+    if args.run_dir is not None:
+        return args.run_dir / RUN_LOG_FILENAME
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     set_debug(args.debug)
+    log_file = _resolve_log_file(args)
+    if log_file is None:
+        _run_from_args(args)
+        return
+    with capture_run_log(log_file):
+        print(f"[Run log] Writing all terminal output to {log_file}")
+        _run_from_args(args)
 
+
+def _run_from_args(args: argparse.Namespace) -> None:
     if args.fake_flow:
         _run_fake_flow(args)
         return
 
     if args.seed_candidate is None:
         raise SystemExit("--seed_candidate is required unless --fake_flow is set")
-    seed_candidate = _load_seed_candidate(args.seed_candidate)
+    editable_modules = _parse_editable_modules(args.editable_modules)
+    judging_mode = cast(JudgingMode, args.judging_mode)
+    raw_seed = _load_seed_candidate(args.seed_candidate)
+    seed_candidate = _seed_for_editable_modules(raw_seed, editable_modules)
+    log_section(
+        "RUN CONFIG",
+        "\n".join(
+            [
+                f"judging_mode={judging_mode}",
+                f"student_model={args.student_model}",
+                f"teacher_model={args.teacher_model}",
+                f"editable_modules={','.join(editable_modules)}",
+                f"seed_candidate={args.seed_candidate}",
+                f"run_dir={args.run_dir}",
+                f"max_metric_calls={args.max_metric_calls}",
+                f"candidate_keys={','.join(sorted(seed_candidate))}",
+            ]
+        ),
+    )
     evalcli = EvalCliClient(binary=args.evalcli)
     train_versions, val_versions = _resolve_eval_version_split(args, evalcli)
     trainset = _make_evalset(train_versions)
     valset = _make_evalset(val_versions)
-    judging_mode = cast(JudgingMode, args.judging_mode)
     cache_file = args.cache_file or _default_cache_file(args.run_dir, ADAPTER_CACHE_FILENAME)
     eval_run_cache_file = args.eval_run_cache_file or _default_cache_file(args.run_dir, EVAL_RUN_CACHE_FILENAME)
     children_cache_file = args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME)
@@ -326,39 +458,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         "student_model": args.student_model,
         "cache_file": str(cache_file) if cache_file else None,
+        "bigquery_client": BigQueryClient(project_id=args.bigquery_project),
+        "agentspan_lookback_days": args.agentspan_lookback_days,
+        "editable_modules": editable_modules,
     }
     if judging_mode == "teacher_student":
-        adapter = TeacherStudentAdapter(**adapter_kwargs, teacher_model=args.teacher_model, judge=Judge(evalcli))
-    else:
-        adapter = SingleModelAdapter(
+        adapter = TeacherStudentAdapter(
             **adapter_kwargs,
-            bigquery_client=BigQueryClient(project_id=args.bigquery_project),
-            shell_error_lookback_days=args.shell_error_lookback_days,
+            teacher_model=args.teacher_model,
         )
+    else:
+        adapter = SingleModelAdapter(**adapter_kwargs)
 
     logger = StdOutLogger()
     tracker = create_experiment_tracker()
-    module_specs = {name: ModuleSpec(name, "free_text", 1024) for name in MODULES}
-    proposer = EvolutionaryProposer(
-        logger=logger,
-        trainset=trainset,
-        al_adapter=adapter,
-        reflection_llm=_make_reflection_lm(
+    spec_names = candidate_module_names(adapter.editable_modules)
+    module_specs = {name: ModuleSpec(name, "free_text", MODULE_TOKEN_BUDGETS.get(name, 1024)) for name in spec_names}
+    global_token_cap = max(
+        args.global_token_cap,
+        *(MODULE_TOKEN_BUDGETS.get(name, 0) for name in adapter.editable_modules),
+    )
+    proposer_kwargs = {
+        "logger": logger,
+        "trainset": trainset,
+        "al_adapter": adapter,
+        "reflection_llm": _make_reflection_lm(
             args.reflection_lm_model,
             qe_project=args.qe_project,
             qe_instance=args.qe_instance,
             authenticated_email=args.qe_authenticated_email,
         ),
-        experiment_tracker=tracker,
-        model=args.student_model,
-        module_specs=module_specs,
-        global_token_cap=args.global_token_cap,
-        reflect_k=args.reflection_samples,
-        reflection_hamming_distance_k=args.reflection_hamming_distance_k,
-        baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
-        evalset_policy=UnseenEvalSetPolicy(state_file=evalset_schedule_file),
-        children_cache_file=children_cache_file,
-    )
+        "experiment_tracker": tracker,
+        "model": args.student_model,
+        "module_specs": module_specs,
+        "global_token_cap": global_token_cap,
+        "reflect_k": args.reflection_samples,
+        "reflection_hamming_distance_k": args.reflection_hamming_distance_k,
+        "baseline_prompt_hash": hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
+        "evalset_policy": UnseenEvalSetPolicy(state_file=evalset_schedule_file),
+        "children_cache_file": children_cache_file,
+    }
+    proposer = EvolutionaryProposer(**proposer_kwargs)
     optimize(
         seed_candidate=seed_candidate,
         trainset=trainset,
@@ -393,8 +533,7 @@ def _run_fake_flow(args: argparse.Namespace) -> None:
         reflect_k=3,
         baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
         evalset_policy=UnseenEvalSetPolicy(state_file=_default_cache_file(args.run_dir, EVALSET_SCHEDULE_FILENAME)),
-        children_cache_file=args.children_cache_file
-        or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME),
+        children_cache_file=args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME),
     )
     result = optimize(
         seed_candidate=seed_candidate,

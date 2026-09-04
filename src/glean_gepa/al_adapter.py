@@ -23,8 +23,28 @@ from glean_gepa.adapter_types import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.debug import debug_print
-from glean_gepa.evalcli_client import EvalCliClient
+from glean_gepa.evalcli_client import (
+    CORRECTNESS_INPUT_MAPPINGS,
+    CORRECTNESS_JUDGE_TYPE,
+    CORRECTNESS_RUN_PARAMS,
+    EvalCliClient,
+    EvalCliError,
+    classify_eval_run_status,
+    is_missing_eval_job,
+)
+from glean_gepa.focused_evalset import prepare_high_signal_eval_batch
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.reflection_prompts import (
+    CONSOLIDATE_LENGTH_EMPTY,
+    CONSOLIDATE_LENGTH_NONEMPTY,
+    EMPTY_DIAGNOSIS_FALLBACK,
+    LENGTH_RULE_EMPTY,
+    LENGTH_RULE_NONEMPTY,
+    consolidate_prompt,
+    diagnosis_prompt,
+)
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
+from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
 from glean_gepa.shell_tool_error_util import (
     EvalRunShellToolErrorAnalysis,
     parse_shell_tool_error_entry_metrics,
@@ -56,6 +76,82 @@ def _write_json_atomically(path: str, data: Any) -> None:
                 pass
         raise
 
+
+# The scParams backing the Coding Harness evalcli preset. Keep nested values
+# percent-encoded: scParams itself is comma-delimited, so decoding them would
+# change the meaning of the nested agentic-loop configuration.
+CODING_HARNESS_SC_PARAMS = (
+    "co.lo.mo.slwo.disabled=1,"
+    "ro.scholastic_required=true,"
+    "db.disable_usr=true,"
+    "db.filter_query_debug_results=true,"
+    "db.filter_bad_query_jiras=true,"
+    "db.include_final_scores=true,"
+    "ro.ro.fetch_supplemental_results=false,"
+    "db.ranking_only=true,"
+    "db.debug_mode=1,"
+    "co.debug_only_disabled_tools_list=gmail_search;outlook_search;respond;think;curl,"
+    "db.get_doc_metadata=true,"
+    "co.lo.enable_agent_recommendation=false,"
+    "ro.feso.slso.drop_slack_native=false,"
+    "ro.feso.slso.rts_count=0,"
+    "ro.feso.slso.skip_inline_rts=true,"
+    "co.disable_full_document_content=true,"
+    "wo.plan_only_dry_run_for_write_actions=true,"
+    "wo.plan_only_dry_run_for_write_actions_in_actas=true,"
+    "co.internal_looping_pyagent_default_route_override=coding_agent_loop,"
+    "co.lo.cao.agentic_loop_sc_params=co.so.enable_for_agentic_loop%3D1%2C"
+    "co.so.enable_programmatic_tool_calling%3D1%2C"
+    "co.so.ptc_allowed_tools%3D_none%2C"
+    "co.so.ptc_only_tools%3Dglean_search%253Bglean_document_reader%253Buser_activity_retrieve%253B"
+    "email_search_v2%253Bmeeting_lookup%253Bdiscover%253Btodo_write%253Bemployee_search%253B"
+    "ask_user_questions%253Bcode_search%253Bimage_generation%253Bcode_repository_agent%253B"
+    "web_search%253Bretrieve_personalized_writing_context%253Bcreate_image_collection%253Bcreate_ppt%253B"
+    "create_presentation_pdf%253Bsalesforce_context_selector%253Bjira_schema_reader%2C"
+    "co.so.enable_dynamic_tools_in_ptc%3D1%2C"
+    "co.lo.enable_todo%3D1%2C"
+    "co.enable_skill_reader_for_o3_agentic_loop%3D1%2C"
+    "co.cito.enable_mcp_citations_prompt%3D1%2C"
+    "co.lo.enable_artifacts%3Dtrue%2C"
+    "co.lo.artifact_per_type_skills%3Dtrue%2C"
+    "co.so.enable_approval_required_tools_in_ptc%3D1%2C"
+    "acto.enable_preview_and_cta_in_hitl_banner%3D1%2C"
+    "co.so.enable_ptc_tool_output_to_afs%3D1%2C"
+    "co.lo.enable_ask_user_questions%3D1%2C"
+    "co.use_discovery_layer%3D1%2C"
+    "co.so.enable_dev_message_at_max_turns%3Dtrue%2C"
+    "co.so.compact_max_chars%3D50000%2C"
+    "co.so.compact_max_chars_per_tool%3Dglean_document_reader%3A320000%3Bglean_search%3A160000%3B"
+    "code_search%3A160000%3Bemail_search_v2%3A160000%3Buser_activity_retrieve%3A160000%3B"
+    "meeting_lookup%3A160000%2C"
+    "co.so.upload_llm_rendered_to_afs%3Dtrue%2C"
+    "co.lo.cao.use_auto_mode%3Dtrue%2C"
+    "co.lo.cao.use_knowledge_tool%3D0%2C"
+    "co.lo.suppress_shell_step_when_detailed_message%3D1%2C"
+    "co.so.omit_file_path_when_no_compaction%3Dtrue%2C"
+    "co.enable_run_tool_action_summary_event_response%3D1%2C"
+    "co.lo.cao.bare_tool_configs%3DCode%2520Search%253ASearch%2520company%2520code%252C%2520configs%252C%2520schemas%252C%2520commits%252C%2520and%2520snippets.%2520Primary%2520tool%2520for%2520any%2520technical%2520question%2520about%2520implementation%2520ground%2520truth%252C%2520system%2520behavior%252C%2520code%2520locations%252C%2520bugs%252C%2520errors%252C%2520config%2520keys%252C%2520APIs%252C%2520data%2520models%252C%2520feature%2520flags%252C%2520or%2520how%252Fwhere%252Fwhy%2520something%2520is%2520implemented.%253BUser%2520Activity%2520Retrieve%253ARetrieves%2520all%2520cross-app%2520work%2520activities%2520over%2520a%2520date%2520range%253BMap%253ARuns%2520parallel%2520subtasks%2520across%2520multiple%2520inputs.%2520Use%2520sparingly.%253BCode%2520Repository%2520Agent%253AMakes%2520code%2520changes%2520and%2520creates%2520PRs%253BEmail%2520Search%2520V2%253ASearches%2520over%2520the%2520user%2527s%2520emails%253BSandbox%2520File%2520View%253AView%2520image%2520files%2520%28.jpg%252F.jpeg%252F.png%29%2520from%2520the%2520sandbox%2520for%2520visual%2520inspection%253BData%2520Analysis%253AUse%2520for%2520ANY%2520SQL%252C%2520analytics%252C%2520BI%252C%2520metrics%252C%2520KPI%252C%2520reporting%252C%2520pipeline%252FCRM%252C%2520or%2520data-lookup%2520query.%2520Returns%2520a%2520routing%2520playbook%2520across%2520the%2520connected%2520data%2520sources.%2520Always%2520run%2520it%2520first%252C%2520before%2520drilling%2520into%2520a%2520specific%2520data%2520source.%2520It%2520requires%2520zero%2520args%2520%25E2%2580%2594%2520just%2520use%2520%2560print%2528asyncio.run%2528data_analysis%2528%2529%2529%2529%2560%2520directly%2520%2528skip%2520%2560help%2560for%2520this%2520tool%2529.%2C"
+    "co.lo.warm_start_discover_skills_header_override%3DSuggested%2520skills%2520%2528read%2520only%2520if%2520CLEARLY%2520relevant%2529%253A%2C"
+    "llmo.per_prompt_overrides.intermediary_updates_instructions%3DIyMjIEludGVybWVkaWFyeSBVcGRhdGVzCldoaWxlIHdvcmtpbmcsIGVtaXQgQlJJRUYgYW5kIHNpbXBsZSAoMS0yIHNlbnRlbmNlKSBzdGF0dXMgdXBkYXRlcyBhdCBiaWcgbWlsZXN0b25lcy4KUnVsZXM6Ci0gVXBkYXRlcyBhcmUgb2JzZXJ2YXRpb25hbCwgbm90IGRlY2lzaW9uYWwuIERvIG5vdCB1c2UgdXBkYXRlcyB0byBkZXRlcm1pbmUgd2hhdCB0byBkbyBuZXh0LgotIERvIG5vdCBuYXJyYXRlIHRvb2wgY2FsbCBvciBza2lsbCB1c2FnZS4gVXBkYXRlIG9ubHkgd2hlbiB5b3UgZm91bmQgc3Vic3RhbnRpYWwgaW5mb3JtYXRpb24uCi0gQWZ0ZXIgY29tcGxldGluZyBhIHNlYXJjaCBvciB0b29sIGNhbGwsIGNoZWNrIHdoZXRoZXIgdGhlIHVzZXIncyBvcmlnaW5hbCByZXF1ZXN0IGlzIGZ1bGx5IHNhdGlzZmllZCBiZWZvcmUgY29uc2lkZXJpbmcgdGhlIHRhc2sgZG9uZS4gRmluZGluZyBpbmZvcm1hdGlvbiBpcyBub3QgdGhlIHNhbWUgYXMgZGVsaXZlcmluZyB0aGUgZmluYWwgb3V0cHV0Lg%3D%3D%2C"
+    "co.lo.cao.hide_shell_tool_output_file_path%3Dtrue%2C"
+    "co.lo.cao.enable_split_tool_sdk%3D1%2C"
+    "co.use_gateway_for_discovery%3D1%2C"
+    "co.lo.cao.bare_tools_redlist%3Dsalesforce_context_selector%253Bjira_schema_reader"
+)
+
+# Models that use the Coding Harness default (no oai_model_for_agentic_loop override).
+DEFAULT_AGENTIC_LOOP_MODELS = frozenset({"gpt", "fast"})
+# CLI aliases -> co.lo.oai_model_for_agentic_loop ChatModel enum.
+#
+# coding_agent_loop_system is only applied when the request stays on
+# coding_agent_loop and the model is allowed on the harness. QE redlists
+# CLAUDE_4_SONNET_20250514 and CLAUDE_4_5_SONNET_20250929 back to
+# o3_agentic_loop (gpt5_agentic_loop_system) even if the coding route is
+# requested. Claude 4.6+ Sonnet and Claude 5 Sonnet stay on the harness.
+AGENTIC_LOOP_MODEL_OVERRIDES = {
+    "claude_sonnet": "CLAUDE_4_6_SONNET_20260217",
+    "claude_opus": "CLAUDE_5_OPUS",
+}
 
 # The scParams backing the Coding Harness evalcli preset. Keep nested values
 # percent-encoded: scParams itself is comma-delimited, so decoding them would
@@ -153,8 +249,8 @@ class ModuleSpec:
 
 @dataclass
 class Candidate:
-    model: str  # "claude" | "gemini" etc
-    prompt_modules: dict[str, str]  # Single editable key: {"WRITING_CODE": "..."}
+    model: str  # "gpt" | "fast" | "claude_sonnet" | "claude_opus"
+    prompt_modules: dict[str, str]  # Editable keys, e.g. {"FULL_PROMPT": "..."}
     module_specs: dict[str, ModuleSpec]
     global_token_cap: int  # relative to baseline prompt for that model
     baseline_prompt_hash: str  # used to define "relative cap"
@@ -170,7 +266,12 @@ def approx_token_len(text: str) -> int:
 
 
 def total_prompt_tokens(candidate: Candidate) -> int:
-    return sum(approx_token_len(candidate.prompt_modules.get(m, "")) for m in candidate.prompt_modules)
+    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions.
+
+    Core-tool descriptions have their own per-module budgets and must not crowd out
+    ``FULL_PROMPT`` under the global cap.
+    """
+    return sum(approx_token_len(text) for key, text in candidate.prompt_modules.items() if key not in CORE_TOOL_KEYS)
 
 
 def within_prompt_budget(candidate: Candidate) -> bool:
@@ -249,6 +350,8 @@ class ReflectiveExampleMetrics(TypedDict):
     score: float
     shell_success_rate: NotRequired[float]
     correctness: NotRequired[float]
+    completeness: NotRequired[float]
+    tool_alignment: NotRequired[float]
 
 
 # TypedDict with keys containing spaces must use functional form
@@ -290,6 +393,9 @@ class ALRunner:
     Triggers eval runs and manages eval run IDs for the judge.
 
     Uses evalcli to create eval runs and poll until completion.
+    `start` submits a run without waiting so teacher and student can overlap;
+    `wait` polls until that run finishes. `run` is start-then-wait for callers
+    that need a completed eval before continuing.
     All execution data (answers, tool events, tokens, etc.) is retrieved later by the Judge
     via evalcli analyze commands.
     """
@@ -309,13 +415,31 @@ class ALRunner:
 
         # Track eval run IDs: cache_key -> eval_run_id
         self._eval_run_ids: dict[tuple[str, str, str, str, str], str] = {}
+        # Started-but-not-yet-complete runs: eval_run_id -> cache_key
+        self._in_flight: dict[str, tuple[str, str, str, str, str]] = {}
+        # Eval IDs created or verified in this process; disk-loaded IDs are probed.
+        self._verified_eval_ids: set[str] = set()
 
         # Load cached eval run IDs if cache file exists
         if self.cache_file:
             self._load_cache()
 
+    def _parse_cache_key(self, raw_key: Any) -> tuple[str, str, str, str, str] | None:
+        if isinstance(raw_key, list):
+            parsed = raw_key
+        elif isinstance(raw_key, str):
+            try:
+                parsed = json.loads(raw_key)
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+        if not isinstance(parsed, list) or len(parsed) != 5:
+            return None
+        return (str(parsed[0]), str(parsed[1]), str(parsed[2]), str(parsed[3]), str(parsed[4]))
+
     def _load_cache(self) -> None:
-        """Load eval run IDs cache from file."""
+        """Load completed and in-flight eval run IDs from file."""
         if not self.cache_file:
             return
 
@@ -325,26 +449,143 @@ class ALRunner:
                     return
                 with open(self.cache_file) as f:
                     data = json.load(f)
-                # Convert string keys back to tuples
-                self._eval_run_ids = {tuple(json.loads(k)): v for k, v in data.items()}
-                print(f"Loaded {len(self._eval_run_ids)} eval run IDs from cache")
+                if not isinstance(data, dict):
+                    return
+                completed_raw = data.get("completed")
+                in_flight_raw = data.get("in_flight")
+                if isinstance(completed_raw, dict) or isinstance(in_flight_raw, dict):
+                    completed_items = completed_raw if isinstance(completed_raw, dict) else {}
+                    in_flight_items = in_flight_raw if isinstance(in_flight_raw, dict) else {}
+                else:
+                    completed_items = data
+                    in_flight_items = {}
+                self._eval_run_ids = {}
+                for raw_key, eval_id in completed_items.items():
+                    cache_key = self._parse_cache_key(raw_key)
+                    if cache_key is None or not isinstance(eval_id, str):
+                        continue
+                    self._eval_run_ids[cache_key] = eval_id
+                self._in_flight = {}
+                for eval_id, raw_key in in_flight_items.items():
+                    cache_key = self._parse_cache_key(raw_key)
+                    if cache_key is None:
+                        continue
+                    self._in_flight[str(eval_id)] = cache_key
+                print(
+                    f"Loaded {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
+                    "eval run IDs from cache"
+                )
         except Exception as e:
             print(f"Failed to load cache from {self.cache_file}: {e}")
             self._eval_run_ids = {}
+            self._in_flight = {}
 
     def _save_cache(self) -> None:
-        """Save eval run IDs cache to file."""
+        """Save completed and in-flight eval run IDs to file."""
         if not self.cache_file:
             return
 
         try:
             with self._cache_lock:
-                # Convert tuple keys to strings for JSON serialization
-                data = {json.dumps(list(k)): v for k, v in self._eval_run_ids.items()}
+                data = {
+                    "completed": {json.dumps(list(k)): v for k, v in self._eval_run_ids.items()},
+                    "in_flight": {eval_id: list(cache_key) for eval_id, cache_key in self._in_flight.items()},
+                }
                 _write_json_atomically(self.cache_file, data)
-                print(f"Saved {len(self._eval_run_ids)} eval run IDs to cache")
+                print(
+                    f"Saved {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
+                    "eval run IDs to cache"
+                )
         except Exception as e:
             print(f"Failed to save cache to {self.cache_file}: {e}")
+
+    def _drop_eval(self, eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._in_flight.pop(eval_run_id, None)
+            self._verified_eval_ids.discard(eval_run_id)
+            stale_keys = [key for key, cached_id in self._eval_run_ids.items() if cached_id == eval_run_id]
+            for key in stale_keys:
+                self._eval_run_ids.pop(key, None)
+            self._save_cache()
+
+    def _promote_completed(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._eval_run_ids[cache_key] = eval_run_id
+            stale_inflight = [eid for eid, key in self._in_flight.items() if key == cache_key or eid == eval_run_id]
+            for eid in stale_inflight:
+                self._in_flight.pop(eid, None)
+            self._verified_eval_ids.add(eval_run_id)
+            self._save_cache()
+
+    def _remember_in_flight(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+        with self._cache_lock:
+            self._in_flight[eval_run_id] = cache_key
+            self._verified_eval_ids.add(eval_run_id)
+            self._save_cache()
+
+    def _fallback_eval_state(self, eval_run_id: str) -> str:
+        if eval_run_id in self._in_flight:
+            return "ongoing"
+        if eval_run_id in self._eval_run_ids.values():
+            return "usable"
+        return "ongoing"
+
+    def _probe_eval_state(self, eval_run_id: str) -> str:
+        try:
+            statuses = self.evalcli.get_eval_run_status(eval_run_id)
+        except Exception as exc:
+            if isinstance(exc, EvalCliError) and is_missing_eval_job(exc):
+                return "missing"
+            return self._fallback_eval_state(eval_run_id)
+        if isinstance(statuses, list) and statuses:
+            return classify_eval_run_status(statuses[0])
+        if isinstance(statuses, dict):
+            return classify_eval_run_status(statuses)
+        if statuses is None:
+            return "missing"
+        return self._fallback_eval_state(eval_run_id)
+
+    def _resolve_cached_eval(self, cache_key: tuple[str, str, str, str, str]) -> tuple[str, bool] | None:
+        """Return (eval_id, wait_required) for a reusable cached run, or None to create."""
+        with self._cache_lock:
+            completed_id = self._eval_run_ids.get(cache_key)
+            in_flight_id = next(
+                (eval_id for eval_id, inflight_key in self._in_flight.items() if inflight_key == cache_key),
+                None,
+            )
+            verified = set(self._verified_eval_ids)
+        candidate = in_flight_id or completed_id
+        if candidate is None:
+            return None
+        if candidate in verified:
+            wait_required = candidate == in_flight_id and candidate != completed_id
+            if wait_required:
+                print(f"[Eval run cache HIT] Resuming in-flight eval_id: {candidate}")
+            else:
+                print(
+                    f"[Eval run cache HIT] Using cached eval_id: {candidate} "
+                    f"for {cache_key[2]}:{cache_key[3]} ({cache_key[4]})"
+                )
+            return candidate, wait_required
+
+        state = self._probe_eval_state(candidate)
+        if state == "usable":
+            self._promote_completed(cache_key, candidate)
+            print(
+                f"[Eval run cache HIT] Using completed eval_id: {candidate} "
+                f"for {cache_key[2]}:{cache_key[3]} ({cache_key[4]})"
+            )
+            return candidate, False
+        if state == "ongoing":
+            self._remember_in_flight(cache_key, candidate)
+            print(f"[Eval run cache HIT] Resuming in-flight eval_id: {candidate}")
+            return candidate, True
+        print(
+            f"[Eval run cache STALE] Dropping {candidate} for {cache_key[2]}:{cache_key[3]} "
+            f"({state}); launching a new run"
+        )
+        self._drop_eval(candidate)
+        return None
 
     def _build_sc_params(self, model: str, system_prompt: str) -> str:
         """Build scParams based on model type."""
@@ -352,10 +593,10 @@ class ALRunner:
         # because nested values intentionally contain encoded commas.
         base_params = [CODING_HARNESS_SC_PARAMS]
 
-        # Model-specific configuration
-        if model == "claude":
-            base_params.append("co.lo.oai_model_for_agentic_loop=CLAUDE_4_5_SONNET_20250929")
-        elif model != "gpt" and model != "fast":
+        override = AGENTIC_LOOP_MODEL_OVERRIDES.get(model)
+        if override:
+            base_params.append(f"co.lo.oai_model_for_agentic_loop={override}")
+        elif model not in DEFAULT_AGENTIC_LOOP_MODELS:
             raise ValueError(f"Unknown model: {model}")
 
         # Add system prompt override if provided (and not the placeholder)
@@ -365,7 +606,7 @@ class ALRunner:
 
         return ",".join(base_params)
 
-    def run(
+    def start(
         self,
         model: str,
         system_prompt: str,
@@ -374,43 +615,29 @@ class ALRunner:
         deployment_ids: list[str],
         run_label: str = "gepa",
         on_created: Callable[[str], None] | None = None,
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
-        Trigger an eval run and return the eval_run_id.
-
-        Args:
-            model: "claude" or "gpt"
-            system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
-            eval_set_name: Name of the eval set
-            eval_set_version: Version of the eval set
-            deployment_ids: List of deployment IDs to use
-            run_label: Prefix for eval run id / cache key (e.g. gepa vs verify_<hash>)
-            on_created: Optional callback invoked after the eval run is created and cached,
-                but before polling for completion.
+        Create an eval run without waiting for it to finish.
 
         Returns:
-            eval_run_id string
+            (eval_run_id, wait_required). wait_required is False when a completed
+            run was already cached.
         """
-        system_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-        cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
+        cache_key = (
+            model,
+            hashlib.md5(system_prompt.encode()).hexdigest()[:16],
+            eval_set_name,
+            eval_set_version,
+            run_label,
+        )
+        resolved = self._resolve_cached_eval(cache_key)
+        if resolved is not None:
+            return resolved
 
-        with self._cache_lock:
-            cached_eval_id = self._eval_run_ids.get(cache_key)
-        if cached_eval_id is not None:
-            print(
-                f"[Eval run cache HIT] Using cached student eval_id: {cached_eval_id} "
-                f"for {eval_set_name}:{eval_set_version} ({run_label})"
-            )
-            # The ID is cached at creation, so a cached run may still be in
-            # flight: an interrupted process leaves its eval run polling from
-            # here on resume instead of reading a half-finished run's results.
-            self._wait_for_eval_run(cached_eval_id)
-            return cached_eval_id
-
-        eval_id = f"{run_label}_{model}_{system_prompt_hash}_{int(time.time())}"
-
+        id_token = hashlib.md5("|".join(cache_key).encode()).hexdigest()[:16]
+        eval_id = f"{run_label}_{model}_{id_token}_{int(time.time())}"
         sc_params = self._build_sc_params(model, system_prompt)
-        eval_params = "experimental_queue=temp-system-prompt-optimization"
+        eval_params = "experimental_queue=eval-experimental-2"
         if model == "fast":
             eval_params += ",gleanchat_agent=FAST"
         else:
@@ -426,39 +653,65 @@ class ALRunner:
             sc_params=sc_params,
             eval_params=eval_params,
         )
-        with self._cache_lock:
-            self._eval_run_ids[cache_key] = created_id
-            self._save_cache()
-        print(
-            f"[Eval run cache] Cached student eval_id at creation: {created_id} "
-            f"for {eval_set_name}:{eval_set_version} ({run_label})"
-        )
+        self._remember_in_flight(cache_key, created_id)
         if on_created is not None:
             on_created(created_id)
+        return created_id, True
 
-        self._wait_for_eval_run(created_id)
+    def wait(self, eval_run_id: str) -> None:
+        """Wait for a started eval run and record it in the completed-run cache."""
+        with self._cache_lock:
+            cache_key = self._in_flight.get(eval_run_id)
+            completed = eval_run_id in self._eval_run_ids.values()
+            verified = eval_run_id in self._verified_eval_ids
+        if completed and verified:
+            with self._cache_lock:
+                self._in_flight.pop(eval_run_id, None)
+            return
 
-        return created_id
-
-    def _wait_for_eval_run(self, eval_run_id: str) -> None:
         if self.eval_run_timeout_sec is None:
             self.evalcli.wait_for_eval_run(eval_run_id)
         else:
             self.evalcli.wait_for_eval_run(eval_run_id, timeout_sec=self.eval_run_timeout_sec)
+        if cache_key is not None:
+            self._promote_completed(cache_key, eval_run_id)
+        elif eval_run_id in self._in_flight:
+            self._promote_completed(self._in_flight[eval_run_id], eval_run_id)
 
-    def get_eval_run_id(
+    def run(
         self,
         model: str,
         system_prompt: str,
         eval_set_name: str,
         eval_set_version: str,
+        deployment_ids: list[str],
         run_label: str = "gepa",
-    ) -> str | None:
-        """Get the eval run ID for a given cache key."""
-        system_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-        cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
-        with self._cache_lock:
-            return self._eval_run_ids.get(cache_key)
+    ) -> str:
+        """
+        Trigger an eval run, wait for completion, and return the eval_run_id.
+
+        Args:
+            model: "gpt", "fast", "claude_sonnet", or "claude_opus"
+            system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
+            eval_set_name: Name of the eval set
+            eval_set_version: Version of the eval set
+            deployment_ids: List of deployment IDs to use
+            run_label: Prefix for eval run id / cache key (e.g. gepa vs verify_<hash>)
+
+        Returns:
+            eval_run_id string
+        """
+        eval_id, wait_required = self.start(
+            model,
+            system_prompt,
+            eval_set_name,
+            eval_set_version,
+            deployment_ids,
+            run_label=run_label,
+        )
+        if wait_required:
+            self.wait(eval_id)
+        return eval_id
 
 
 class Judge:
@@ -498,8 +751,11 @@ class Judge:
         if not skip_trigger:
             print(f"Triggering judge run for {teacher_eval_id} vs {student_eval_id}...")
             judge_run_id = self.evalcli.create_judge_run(
-                student_eval_id=student_eval_id,
-                teacher_eval_id=teacher_eval_id,
+                eval_run_id=student_eval_id,
+                judge_type=CORRECTNESS_JUDGE_TYPE,
+                run_params=CORRECTNESS_RUN_PARAMS,
+                base_eval_run_id=teacher_eval_id,
+                input_mappings=CORRECTNESS_INPUT_MAPPINGS,
             )
             self.evalcli.wait_for_judge_run(judge_run_id)
         else:
@@ -941,6 +1197,7 @@ class GleanAdapterBase:
         failure_label: str,
         primary_objective: str,
         default_frontier_type: str,
+        editable_modules: list[str],
         cache_file: str | None = None,
     ):
         self.runner = runner
@@ -948,6 +1205,7 @@ class GleanAdapterBase:
         self.student_model = student_model
         self.primary_objective = primary_objective
         self.default_frontier_type = default_frontier_type
+        self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
         self._cache_lock = threading.RLock()
         self._evaluate_fn = evaluate_fn
@@ -989,11 +1247,11 @@ class GleanAdapterBase:
                 with open(self.cache_file) as f:
                     data = json.load(f)
 
-                # Load judge triggered cache
                 judge_triggered_data = data.get("judge_triggered", [])
                 self._judge_triggered = {tuple(item) for item in judge_triggered_data}
 
                 self._load_eval_analysis_cache(data.get("eval_analysis_cache", {}))
+                self._load_extra_cache(data)
                 print(
                     f"[GleanAdapter] Loaded {len(self._eval_analysis_cache)} error analyses and "
                     f"{len(self._judge_triggered)} judge triggers from cache: {self.cache_file}"
@@ -1010,7 +1268,6 @@ class GleanAdapterBase:
 
         try:
             with self._cache_lock:
-                # Build cache data structure
                 data = {
                     "judge_triggered": [list(pair) for pair in self._judge_triggered],
                     "eval_analysis_cache": {
@@ -1018,6 +1275,7 @@ class GleanAdapterBase:
                         for eval_id, analysis in self._eval_analysis_cache.items()
                     },
                 }
+                data.update(self._extra_cache_payload())
                 _write_json_atomically(self.cache_file, data)
                 print(
                     f"[GleanAdapter] Saved {len(self._eval_analysis_cache)} error analyses and "
@@ -1025,6 +1283,12 @@ class GleanAdapterBase:
                 )
         except Exception as e:
             print(f"[GleanAdapter] Failed to save cache to {self.cache_file}: {e}")
+
+    def _extra_cache_payload(self) -> dict[str, Any]:
+        return {}
+
+    def _load_extra_cache(self, data: dict[str, Any]) -> None:
+        return None
 
     @staticmethod
     def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
@@ -1097,8 +1361,9 @@ class GleanAdapterBase:
         *,
         capture_traces: bool = True,
     ) -> list[GleanEvaluationBatch]:
-        """Run independent candidate evaluations concurrently, preserving input order."""
-        if len(items) < 2:
+        """Run focused child screens concurrently; leave ordinary evals serial."""
+        is_focused = any(data.get("eval_entry_ids") for _candidate, batch in items for data in batch)
+        if not is_focused or len(items) < 2:
             return [self.evaluate(batch, candidate, capture_traces=capture_traces) for candidate, batch in items]
 
         with ThreadPoolExecutor(max_workers=len(items)) as executor:
@@ -1108,9 +1373,25 @@ class GleanAdapterBase:
             ]
             return [future.result() for future in futures]
 
+    def evaluate_many(
+        self,
+        batch: list[ALDataInst],
+        candidates: list[dict[str, str]],
+        capture_traces: bool = False,
+    ) -> list[GleanEvaluationBatch]:
+        """Evaluate many candidates on the same batch. Override to overlap eval runs."""
+        return [self.evaluate(batch, candidate, capture_traces) for candidate in candidates]
+
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Prepare a high-signal batch once before its child candidates are screened."""
-        return batch
+        """Upload/reuse focused eval sets once before concurrent child screening."""
+        evalcli = getattr(getattr(self, "runner", None), "evalcli", None)
+        if evalcli is None:
+            return batch
+        return prepare_high_signal_eval_batch(
+            evalcli,
+            batch,
+            bigquery_client=getattr(self, "bigquery_client", None),
+        )
 
     def attach_cached_eval_run_ids(self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]) -> list[ALDataInst]:
         """Attach persisted eval IDs to matching eval-set items for reuse."""
@@ -1270,6 +1551,28 @@ class GleanAdapterBase:
 
             result[component_name] = reflective_examples
 
+        module_lines = []
+        for module_name, examples in result.items():
+            entry_ids = selected_entry_ids_from_examples(examples)
+            module_lines.append(f"  {module_name}: {', '.join(entry_ids) if entry_ids else '(none)'}")
+        k_label = "all" if k is None else str(k)
+        log_section("REFLECTION: eval entries", format_eval_entry_report(eval_batch.trajectories))
+        log_section(
+            "REFLECTION: high-signal dataset",
+            "\n".join(
+                [
+                    f"Justification: module relevance, then lowest score, up to k={k_label} examples.",
+                    (
+                        f"Near-duplicate execution errors within Hamming distance "
+                        f"{error_hamming_distance_k} are dropped."
+                        if error_hamming_distance_k is not None
+                        else "No Hamming-distance dedupe."
+                    ),
+                    "Selected entry_ids by module:",
+                    *module_lines,
+                ]
+            ),
+        )
         return result
 
     # TODO(Cathy): Implement this
@@ -1288,17 +1591,17 @@ class GleanAdapterBase:
         components_to_update: list[str],
         reflective_examples: list[ReflectiveExample],
         max_variants: int = 3,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], bool, str]:
         """
-        Returns (new_module_texts, module_marked_irrelevant). The sole
-        WRITING_CODE module is always relevant, so the second value is False.
-        Must:
-          1) merge reflections across examples
-          2) diagnose recurring failure modes tied to module
-          3) propose small patch with before/after
-          4) brief why
+        Returns (new_module_texts, module_marked_irrelevant, diagnosis).
+        Editable modules are always treated as relevant, so the second value is False.
+        ``diagnosis`` is the first-pass reflection text (failure modes and WHY).
         """
         current = candidate.prompt_modules.get(components_to_update[0], "")
+        if current.strip():
+            length_rule, consolidate_length = LENGTH_RULE_NONEMPTY, CONSOLIDATE_LENGTH_NONEMPTY
+        else:
+            length_rule, consolidate_length = LENGTH_RULE_EMPTY, CONSOLIDATE_LENGTH_EMPTY
 
         ex_blocks = []
         for r in reflective_examples:
@@ -1327,49 +1630,36 @@ class GleanAdapterBase:
                 f"FEEDBACK: {r['Feedback']}\n"
             )
         if len(components_to_update) != 1:
-            return [], False
+            return [], False, ""
         module_name = components_to_update[0]
-        prompt = (
-            f"You are optimizing ONLY the module {module_name}.\n"
-            f"MODULE RESPONSIBILITY:\n{self._reflection_prompt_fn(module_name)}\n\n"
-            f"CURRENT MODULE TEXT:\n<<<\n{current}\n>>>\n\n"
-            f"{self._failure_label}:\n{''.join(ex_blocks)}\n\n"
-            f"Task:\n"
-            f"1) Identify recurring failure modes that are plausibly caused by {module_name}.\n"
-            f"2) Propose 1-2 SMALL patches (delta edits), each with:\n"
-            f"   - BEFORE: quoted snippet from current module\n"
-            f"   - AFTER: revised snippet\n"
-            f"   - WHY: one sentence\n"
-            f"3) Every supplied example is relevant evidence for {module_name}; use it to propose a variant.\n"
-            f"4) Make only generalizable changes; do not overfit to individual examples.\n"
-            f"5) Keep the revised module succinct: each candidate must be strictly less than 1.1 times "
-            f"the current module's character length.\n"
+        prompt = diagnosis_prompt(
+            module_name=module_name,
+            responsibility=self._reflection_prompt_fn(module_name),
+            current=current,
+            failure_label=self._failure_label,
+            example_blocks="".join(ex_blocks),
+            length_rule=length_rule,
         )
 
         raw = reflection_llm(prompt).strip()
         if raw.upper() == "NOT_RELEVANT" or not raw:
-            raw = (
-                "No module-specific diagnosis was returned. Propose a conservative rewrite that addresses "
-                "the supplied failure evidence while preserving the current instructions."
-            )
+            raw = EMPTY_DIAGNOSIS_FALLBACK
 
         # Simple parser strategy:
         # In production, parse structured JSON/YAML, or ask LLM to output patches in JSON.
         # Here we just return one consolidated rewrite request for a second pass:
-        consolidate_prompt = (
-            f"Consolidate the following patch suggestions into up to {max_variants} candidate rewrites "
-            f"of the module {module_name}. Preserve good behavior, incorporate consistent changes only, "
-            f"and make only generalizable changes. Each variant must be succinct and strictly less than 1.1 "
-            f"times the current module's character length. "
-            f"Output each variant separated by '\n===VARIANT===\n'.\n\n"
-            f"CURRENT:\n<<<\n{current}\n>>>\n\n"
-            f"EVIDENCE (every example is relevant):\n{''.join(ex_blocks)}\n\n"
-            f"SUGGESTIONS:\n{raw}\n"
+        consolidate_text = consolidate_prompt(
+            module_name=module_name,
+            max_variants=max_variants,
+            consolidate_length=consolidate_length,
+            current=current,
+            example_blocks="".join(ex_blocks),
+            suggestions=raw,
         )
-        consolidated = reflection_llm(consolidate_prompt).strip()
+        consolidated = reflection_llm(consolidate_text).strip()
         variants = [
             variant
             for variant in (v.strip() for v in consolidated.split("===VARIANT==="))
             if variant and variant.upper() != "NOT_RELEVANT"
         ]
-        return variants[:max_variants], False
+        return variants[:max_variants], False, raw

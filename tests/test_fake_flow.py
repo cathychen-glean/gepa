@@ -1,7 +1,7 @@
 import pytest
 
 from glean_gepa.fake_flow import FakeFlowAdapter, fake_evalset, fake_seed_candidate
-from glean_gepa.prompt import WRITING_CODE_KEY
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.runner import _parse_args
 
 
@@ -26,6 +26,4 @@ def test_fake_flow_has_distinct_train_and_validation_sets():
     trainset = fake_evalset("train")
     valset = fake_evalset("val")
 
-    assert {item["eval_set_version"] for item in trainset}.isdisjoint(
-        item["eval_set_version"] for item in valset
-    )
+    assert {item["eval_set_version"] for item in trainset}.isdisjoint(item["eval_set_version"] for item in valset)

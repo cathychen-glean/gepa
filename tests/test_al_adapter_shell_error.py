@@ -17,7 +17,7 @@ from glean_gepa.al_adapter import (
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
-from glean_gepa.focused_evalset import FocusedEvalSet
+from glean_gepa.focused_evalset import FocusedEvalSet, SESSION_BUCKET_TYPE
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
@@ -167,7 +167,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         captured_prompts.append(prompt)
         return "NOT_RELEVANT" if len(captured_prompts) == 1 else "rewritten code instructions"
 
-    variants, not_relevant = adapter.propose_new_texts(
+    variants, not_relevant, *_ = adapter.propose_new_texts(
         reflection_lm,
         Candidate(
             model="fast",
@@ -217,7 +217,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     )
     with (
         patch(
-            "glean_gepa.single_model_adapter.ensure_focused_eval_set",
+            "glean_gepa.focused_evalset.ensure_focused_eval_set",
             return_value=FocusedEvalSet("gepa-high-signal-source", "v1_hs_abc", 1),
         ) as ensure,
         patch.object(adapter, "_get_or_run_student_eval", return_value="focused-run") as run_eval,
@@ -291,6 +291,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     assert resolve_entries.call_args.kwargs["eval_run_id"] == "parent-run"
     assert ensure.call_args.kwargs["entry_ids"] == ["source-entry"]
     assert ensure.call_args.kwargs["source_entries"] == source_entries
+    assert ensure.call_args.kwargs["bucket_type"] == SESSION_BUCKET_TYPE
     assert prepared[0]["focused_eval_set_name"] == "gepa-high-signal-source"
     assert prepared[0]["eval_entry_ids"] == ["source-entry"]
 
@@ -615,8 +616,8 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         with_traces = second.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=True)
 
     create_eval_run.assert_not_called()
-    # The ID was cached at creation, so a resumed run must confirm the run finished.
-    wait_for_eval_run.assert_called_once_with("run_123")
+    # Completed cache hits skip wait; in-flight IDs still wait on resume.
+    wait_for_eval_run.assert_not_called()
     fetch.assert_called_once()
     assert fetch.call_args.kwargs["include_error_examples"] is True
     assert fetch.call_args.kwargs["include_per_entry"] is True
@@ -953,3 +954,34 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         assert adapter._get_or_fetch_shell_error_analysis("run_legacy") is refreshed
 
     fetch.assert_called_once()
+
+
+def test_launched_student_eval_is_resumed_from_in_flight_after_timeout():
+    evalcli = MagicMock()
+    evalcli.create_eval_run.side_effect = lambda **kwargs: kwargs["eval_run_id"]
+    runner = ALRunner(evalcli=evalcli)
+    adapter = SingleModelAdapter(
+        runner=runner,
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    eval_kwargs = {
+        "eval_set_name": "set",
+        "eval_set_version": "v1",
+        "deployment_ids": ["prod"],
+        "system_prompt": "prompt",
+    }
+    with patch.object(runner, "wait", side_effect=TimeoutError("terminal timed out")):
+        with pytest.raises(TimeoutError):
+            adapter._get_or_run_student_eval(**eval_kwargs)
+
+    launched_id = evalcli.create_eval_run.call_args.kwargs["eval_run_id"]
+    assert launched_id in runner._in_flight
+
+    with patch.object(runner, "wait") as wait:
+        eval_id = adapter._get_or_run_student_eval(**eval_kwargs)
+
+    evalcli.create_eval_run.assert_called_once()
+    wait.assert_called_once_with(launched_id)
+    assert eval_id == launched_id

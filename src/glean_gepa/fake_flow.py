@@ -14,7 +14,8 @@ from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.al_adapter import MODULES, Candidate, GleanAdapterBase, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.prompt import WRITING_CODE_KEY
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import FAKE_FLOW_RESPONSIBILITY
 
 FAKE_FLOW_MARKER = "[fake-flow iteration="
 
@@ -63,11 +64,12 @@ class FakeFlowAdapter(GleanAdapterBase):
             evaluate_fn=lambda *_args: self.evaluate(*_args),
             failure_pattern_fn=lambda _module, trajectory: (trajectory["output"]["entry_id"],),
             reflective_example_fn=lambda _module, trajectory, _candidate: self._reflective_example(trajectory),
-            reflection_prompt_fn=lambda _module: "Improve the fake coding instructions using the failed examples.",
+            reflection_prompt_fn=lambda _module: FAKE_FLOW_RESPONSIBILITY,
             reflective_metrics_fn=lambda metrics: f"fake score={metrics['score']:.2f}",
             failure_label="Fake eval evidence",
             primary_objective="fake_score",
             default_frontier_type="objective",
+            editable_modules=list(MODULES),
         )
 
     def evaluate(
@@ -132,7 +134,11 @@ class FakeFlowAdapter(GleanAdapterBase):
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         del candidate, error_hamming_distance_k
-        examples = [self._reflective_example(trajectory) for trajectory in (eval_batch.trajectories or []) if trajectory["score"] < 1.0]
+        examples = [
+            self._reflective_example(trajectory)
+            for trajectory in (eval_batch.trajectories or [])
+            if trajectory["score"] < 1.0
+        ]
         if k is not None:
             examples = examples[:k]
         return dict.fromkeys(components_to_update, examples)
@@ -144,7 +150,7 @@ class FakeFlowAdapter(GleanAdapterBase):
         components_to_update: list[str],
         reflective_examples: list[dict[str, Any]],
         max_variants: int = 3,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], bool, str]:
         del reflection_llm, components_to_update, reflective_examples, max_variants
         current = candidate.prompt_modules[WRITING_CODE_KEY]
         next_iteration = _iteration(candidate.prompt_modules) + 1
@@ -154,7 +160,7 @@ class FakeFlowAdapter(GleanAdapterBase):
             current,
         )
         print(f"[FAKE FLOW] proposing fake iteration={next_iteration}")
-        return [rewritten], False
+        return [rewritten], False, f"Advance fake-flow iteration marker to {next_iteration}."
 
     @staticmethod
     def _reflective_example(trajectory: dict[str, Any]) -> dict[str, Any]:

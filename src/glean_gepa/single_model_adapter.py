@@ -21,8 +21,10 @@ from glean_gepa.al_adapter import (
     log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.focused_evalset import ensure_focused_eval_set
+from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
 from glean_gepa.prompt import compile_encoded_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import single_model_reflection_prompt
 from glean_gepa.reflection_sampling import strip_stdout_sections
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
@@ -63,7 +65,11 @@ class SingleModelAdapter(GleanAdapterBase):
         return enriched
 
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Upload/reuse focused eval sets once, before concurrent child screening."""
+        """Upload/reuse focused eval sets once, before concurrent child screening.
+
+        Uses ``SESSION`` so child screens restore the parent ``stt`` and can
+        reproduce the same shell errors. Teacher-student uses ``QUERY_CANONICAL``.
+        """
         prepared: list[ALDataInst] = []
         for data in batch:
             entry_ids = data.get("eval_entry_ids")
@@ -100,6 +106,7 @@ class SingleModelAdapter(GleanAdapterBase):
                 deployment_ids=data["deployment_ids"],
                 entry_ids=resolved_entry_ids,
                 source_entries=source_entries,
+                bucket_type=SESSION_BUCKET_TYPE,
             )
             if focused is None:
                 return None
@@ -122,13 +129,14 @@ class SingleModelAdapter(GleanAdapterBase):
         student_model: str,
         *,
         bigquery_client: Any | None = None,
-        shell_error_lookback_days: int = 7,
+        agentspan_lookback_days: int = 1,
+        editable_modules: list[str] | None = None,
         cache_file: str | None = None,
     ):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
         self.bigquery_client = bigquery_client
-        self.shell_error_lookback_days = shell_error_lookback_days
+        self.agentspan_lookback_days = agentspan_lookback_days
         super().__init__(
             runner=runner,
             thresholds=thresholds,
@@ -136,11 +144,12 @@ class SingleModelAdapter(GleanAdapterBase):
             evaluate_fn=self._evaluate_single_model,
             failure_pattern_fn=self._create_failure_pattern,
             reflective_example_fn=self._build_reflective_example,
-            reflection_prompt_fn=self._reflection_prompt,
+            reflection_prompt_fn=single_model_reflection_prompt,
             reflective_metrics_fn=self._format_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES",
             primary_objective=SHELL_SUCCESS_OBJECTIVE,
             default_frontier_type="objective",
+            editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
             cache_file=cache_file,
         )
 
@@ -163,7 +172,7 @@ class SingleModelAdapter(GleanAdapterBase):
         analysis = fetch_eval_run_shell_tool_error_analysis(
             self.bigquery_client,
             eval_id=eval_id,
-            lookback_days=self.shell_error_lookback_days,
+            lookback_days=self.agentspan_lookback_days,
             include_error_examples=include_error_examples,
             include_per_entry=include_per_entry,
         )
@@ -258,16 +267,6 @@ class SingleModelAdapter(GleanAdapterBase):
         }
 
     @staticmethod
-    def _reflection_prompt(module_name: str) -> str:
-        if module_name == "WRITING_CODE":
-            return (
-                "Focus ONLY on coding instructions that affect shell tool reliability: SDK call patterns, "
-                "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
-                "Use shell error examples as evidence. Propose minimal deltas."
-            )
-        return "Focus only on this module's responsibilities."
-
-    @staticmethod
     def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str | None:
         return None
 
@@ -297,36 +296,23 @@ class SingleModelAdapter(GleanAdapterBase):
         total_high_signal_entries = 0
 
         for al_data_inst in batch:
-            base_eval_set_version = al_data_inst.get("eval_set_version", "")
-            base_eval_set_name = al_data_inst.get("eval_set_name", "")
             deployment_ids = al_data_inst.get("deployment_ids", [])
             requested_entry_ids = al_data_inst.get("eval_entry_ids")
-            eval_set_name = base_eval_set_name
-            eval_set_version = base_eval_set_version
-            run_label = "gepa"
-
-            if requested_entry_ids:
-                focused_eval_set_name = al_data_inst.get("focused_eval_set_name")
-                focused_eval_set_version = al_data_inst.get("focused_eval_set_version")
-                if focused_eval_set_name and focused_eval_set_version:
-                    eval_set_name = focused_eval_set_name
-                    eval_set_version = focused_eval_set_version
-                else:
-                    focused_eval_set = ensure_focused_eval_set(
-                        self.runner.evalcli,
-                        base_eval_set_name=base_eval_set_name,
-                        base_eval_set_version=base_eval_set_version,
-                        deployment_ids=deployment_ids,
-                        entry_ids=requested_entry_ids,
-                    )
-                    if focused_eval_set is None:
-                        # Do not fall back to the full eval set: a failed focused
-                        # setup must not let a candidate bypass the gate.
-                        summary_shell_rates.append(0.0)
-                        continue
-                    eval_set_name = focused_eval_set.name
-                    eval_set_version = focused_eval_set.version
-                run_label = "gepa_high_signal"
+            target = resolve_eval_run_target(
+                self.runner.evalcli,
+                al_data_inst,
+                bigquery_client=self.bigquery_client,
+                bucket_type=SESSION_BUCKET_TYPE,
+            )
+            if target is None:
+                # Do not fall back to the full eval set: a failed focused
+                # setup must not let a candidate bypass the gate.
+                summary_shell_rates.append(0.0)
+                continue
+            eval_set_name = target.eval_set_name
+            eval_set_version = target.eval_set_version
+            run_label = target.run_label
+            is_focused_eval = target.is_focused
 
             student_eval_id = al_data_inst.get("cached_student_eval_run_id")
             if student_eval_id:
@@ -346,8 +332,6 @@ class SingleModelAdapter(GleanAdapterBase):
                     "student_eval_run_id": student_eval_id,
                 }
             )
-
-            is_focused_eval = bool(requested_entry_ids)
             if not is_focused_eval:
                 evaluation_kind = "Trace evaluation" if capture_traces else "Validation"
                 print(

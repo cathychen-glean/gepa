@@ -63,75 +63,37 @@ def test_cached_eval_run_id_is_attached_to_matching_eval_set():
     assert attached[0]["cached_student_eval_run_id"] == "run-cached"
 
 
-def test_high_signal_fix_rate_requires_error_free_entries():
+def test_high_signal_fix_rate():
     adapter = GleanAdapterBase.__new__(GleanAdapterBase)
     parent = _batch([0.0, 0.0, 0.0, 1.0])
-    # A focused child eval contains only the three parent failures.
-    child = _batch([1.0, 1.0, 0.0])
 
-    assert adapter.high_signal_fix_rate(parent, child) == 2 / 3
-
-
-def test_high_signal_fix_rate_is_zero_without_parent_failures():
-    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
-
+    assert adapter.high_signal_fix_rate(parent, _batch([1.0, 1.0, 0.0])) == 2 / 3
     assert adapter.high_signal_fix_rate(_batch([1.0]), _batch([1.0])) == 0.0
 
 
-def test_high_signal_screen_keeps_children_at_or_above_one_third():
-    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
-    parent = _batch([0.0, 0.0, 0.0, 0.0])
-    children = [object(), object(), object()]
-    evaluations = [
-        _batch([1.0, 1.0, 1.0, 0.0]),
-        _batch([1.0, 1.0, 0.0, 0.0]),
-        _batch([1.0, 1.0, 1.0, 1.0]),
-    ]
-
-    selected = _select_screened_children(
-        adapter,
-        parent,
-        children,  # type: ignore[arg-type]
-        evaluations,
-        use_high_signal_gate=True,
-    )
-
-    assert [(child, score) for child, _evaluation, score in selected] == [
-        (children[0], 0.75),
-        (children[1], 0.5),
-        (children[2], 1.0),
-    ]
-
-
-def test_high_signal_screen_returns_empty_when_every_child_is_rejected():
-    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
-    parent = _batch([0.0, 0.0, 0.0, 0.0])
-
-    selected = _select_screened_children(
-        adapter,
-        parent,
-        [object(), object()],  # type: ignore[list-item]
-        [_batch([1.0, 0.0, 0.0, 0.0]), _batch([0.0, 0.0, 0.0, 0.0])],
-        use_high_signal_gate=True,
-    )
-
-    assert selected == []
-
-
-def test_high_signal_screen_accepts_exactly_one_third():
+def test_high_signal_screen_threshold():
     adapter = GleanAdapterBase.__new__(GleanAdapterBase)
     parent = _batch([0.0, 0.0, 0.0])
+    keep, reject, exact = object(), object(), object()
 
-    selected = _select_screened_children(
+    kept = _select_screened_children(
         adapter,
         parent,
-        [object()],  # type: ignore[list-item]
-        [_batch([1.0, 0.0, 0.0])],
+        [keep, reject, exact],  # type: ignore[arg-type]
+        [_batch([1.0, 1.0, 0.0]), _batch([0.0, 0.0, 0.0]), _batch([1.0, 0.0, 0.0])],
         use_high_signal_gate=True,
     )
+    assert [(child, score) for child, _evaluation, score in kept] == [(keep, 2 / 3), (exact, 1 / 3)]
 
-    assert len(selected) == 1
-    assert selected[0][2] == 1 / 3
+    below_custom = _select_screened_children(
+        adapter,
+        parent,
+        [keep],  # type: ignore[arg-type]
+        [_batch([1.0, 1.0, 0.0])],
+        use_high_signal_gate=True,
+        high_signal_screen_threshold=0.8,
+    )
+    assert below_custom == []
 
 
 def test_high_signal_batch_evaluation_dispatches_children_concurrently():
@@ -164,12 +126,10 @@ def test_high_signal_batch_evaluation_dispatches_children_concurrently():
     assert len(results) == 2
 
 
-def test_full_validation_batch_evaluation_dispatches_children_concurrently():
+def test_full_validation_batch_evaluation_runs_non_focused_items():
     adapter = GleanAdapterBase.__new__(GleanAdapterBase)
-    barrier = threading.Barrier(2)
 
     def evaluate_fn(_batch_data, _candidate, _capture_traces):
-        barrier.wait(timeout=1)
         return _batch([1.0])
 
     adapter._evaluate_fn = evaluate_fn

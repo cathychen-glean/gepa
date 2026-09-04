@@ -14,6 +14,7 @@ from glean_gepa.evolutionary_proposer import EvolutionaryProposer, make_children
 
 class _ReflectionAdapter:
     def __init__(self, variants: list[str] | None = None) -> None:
+        self.editable_modules = ["WRITING_CODE"]
         self.reflection_calls = 0
         self.variants = variants if variants is not None else ["cached rewrite 1", "cached rewrite 2"]
 
@@ -23,9 +24,9 @@ class _ReflectionAdapter:
     def make_reflective_dataset(self, **_kwargs: object) -> dict[str, list[dict[str, str]]]:
         return {"WRITING_CODE": [{"feedback": "fix it"}]}
 
-    def propose_new_texts(self, **_kwargs: object) -> tuple[list[str], object]:
+    def propose_new_texts(self, **_kwargs: object) -> tuple[list[str], object, str]:
         self.reflection_calls += 1
-        return self.variants, None
+        return self.variants, None, ""
 
 
 class _Evaluation:
@@ -44,6 +45,13 @@ class _ProposerAdapter(_ReflectionAdapter):
     def evaluate(self, _batch, _candidate, capture_traces=False):
         self.root_evaluation_calls += 1
         return _Evaluation()
+
+    def evaluate_many(self, _batch, candidates, capture_traces=False):
+        if capture_traces:
+            self.root_evaluation_calls += len(candidates)
+            return [_Evaluation() for _ in candidates]
+        self.screen_evaluation_calls += 1
+        return [GleanEvaluationBatch(outputs=[{}], scores=[1.0], summary={"objective": 1.0}) for _ in candidates]
 
     def batch_evaluate(self, items, *, capture_traces=True):
         self.screen_evaluation_calls += 1
@@ -84,6 +92,17 @@ class _OneSliceLoader:
 
     def __len__(self):
         return 1
+
+
+class _TwoSliceLoader:
+    def all_ids(self):
+        return [0, 1]
+
+    def fetch(self, _ids):
+        return [{}]
+
+    def __len__(self):
+        return 2
 
 
 def _candidate(candidate_id: str, text: str = "original") -> Candidate:
@@ -144,7 +163,7 @@ def test_prints_child_prompt_delta_against_parent(capsys) -> None:
     )
 
     output = capsys.readouterr().out
-    assert "Prompt delta for child" in output
+    assert "CHILD PROPOSAL" in output
     assert "--- parent/root/WRITING_CODE" in output
     assert "-original line" in output
     assert "+updated line" in output
@@ -324,6 +343,16 @@ def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_pat
             self.capture_traces_requests.append(capture_traces)
             return super().evaluate(_batch, _candidate, capture_traces=capture_traces)
 
+        def evaluate_many(self, _batch, candidates, capture_traces=False):
+            self.capture_traces_requests.append(capture_traces)
+            self.root_evaluation_calls += len(candidates)
+            if capture_traces:
+                return [_Evaluation() for _ in candidates]
+            return [
+                GleanEvaluationBatch(outputs=[{}], scores=[1.0], summary={"objective": 1.0})
+                for _ in candidates
+            ]
+
     first_adapter = _TraceRecordingAdapter()
     first_proposer = _proposer(first_adapter, cache_file)
     first_proposer.trainset = _OneSliceLoader()
@@ -343,6 +372,52 @@ def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_pat
     assert replay_adapter.capture_traces_requests == [False]
     assert replay_adapter.reflection_calls == 0
     assert replay_adapter.screen_evaluation_calls == 0
+
+
+def test_resume_skips_slices_whose_passing_children_are_already_in_the_pool(tmp_path) -> None:
+    cache_file = str(tmp_path / "children.json")
+    root = _candidate("root")
+
+    class _FreshState:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 1
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    first_adapter = _ProposerAdapter()
+    first_adapter.variants = ["slice-0 rewrite"]
+    first_proposer = _proposer(first_adapter, cache_file)
+    first_proposer.trainset = _TwoSliceLoader()
+    first_proposals = first_proposer.propose(_FreshState())
+    assert first_proposals
+    accepted_child = first_proposals[0].candidate
+
+    class _ResumedState:
+        i = 0
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules, accepted_child]
+        total_num_evals = 0
+        num_full_ds_evals = 2
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0, 0.9]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0, 1}}
+
+    second_adapter = _ProposerAdapter()
+    second_adapter.variants = ["slice-1 rewrite"]
+    second_proposer = _proposer(second_adapter, cache_file)
+    second_proposer.trainset = _TwoSliceLoader()
+    second_proposals = second_proposer.propose(_ResumedState())
+
+    assert second_adapter.reflection_calls >= 1
+    assert second_proposals
+    assert all(proposal.candidate != accepted_child for proposal in second_proposals)
+    assert second_proposals[0].candidate["WRITING_CODE"] == "slice-1 rewrite"
 
 
 def test_high_signal_screen_uses_zero_baseline_before_full_validation(tmp_path) -> None:

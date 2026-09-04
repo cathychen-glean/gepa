@@ -11,6 +11,7 @@ from glean_gepa.shell_tool_error_util import (
     SHELL_SPAN_NAMES,
     ShellToolErrorEntryMetrics,
     ShellToolErrorMetrics,
+    build_eval_entry_uuid_tracking_query,
     build_eval_run_search_params,
     build_high_signal_source_entries_query,
     build_shell_tool_error_per_entry_query,
@@ -20,6 +21,7 @@ from glean_gepa.shell_tool_error_util import (
     empty_shell_tool_error_metrics,
     fetch_eval_run_shell_tool_error_analysis,
     fetch_high_signal_evalset_entries,
+    fetch_evalset_entry_tracking,
     fetch_shell_tool_error_metrics,
     is_shell_tool_error,
     parse_shell_tool_error_example,
@@ -72,7 +74,10 @@ def test_build_shell_tool_error_rate_query_includes_eval_and_shell_filters():
     assert "jsonPayload.span_info.execution_status.user_message" in sql
     assert "NULLIF(jsonPayload.action.action_run_id, '')" in sql
     assert "NULLIF(jsonPayload.context.agent_trace.span_id, '')" in sql
-    assert "TO_JSON_STRING(jsonPayload)" in sql
+    assert "TO_JSON_STRING(STRUCT(" in sql
+    assert "TO_JSON_STRING(jsonPayload)" not in sql
+    assert "PARSE_DATE" not in sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "action_run_id," in sql
     assert "recent_error_examples" in sql
 
@@ -450,6 +455,85 @@ def test_fetch_shell_tool_error_metrics_returns_empty_when_no_rows():
     assert metrics.shell_executions == 0
     assert metrics.shell_error_rate == 0.0
     mock_client.query.assert_called_once()
+
+
+def test_build_eval_entry_uuid_tracking_query_filters_entry_uuid():
+    sql = build_eval_entry_uuid_tracking_query()
+
+    assert "entry_uuid IN UNNEST(@entry_ids)" in sql
+    assert "session_tracking_token" in sql
+    assert "scrubbed_agentspan" in sql
+    assert "PARSE_DATE" not in sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
+
+
+def test_fetch_evalset_entry_tracking_uses_agentspan_stt():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [
+            {
+                "id": "e1",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "eval-run",
+                "traceId": "eval-trace",
+            }
+        ],
+        [],
+    ]
+
+    tracking = fetch_evalset_entry_tracking(
+        mock_client,
+        eval_set_name="Glean Chat V2 Medium",
+        eval_set_version="20260817",
+        entry_ids=["e1"],
+        deployment_ids=["prod"],
+    )
+
+    assert tracking == {
+        "e1": {
+            "deploymentId": "prod",
+            "stt": "stt-1",
+        }
+    }
+    assert mock_client.query.call_count == 2
+    first_sql = mock_client.query.call_args_list[0].args[0]
+    assert "entry_uuid IN UNNEST(@entry_ids)" in first_sql
+
+
+def test_fetch_evalset_entry_tracking_prefers_original_run_id_from_fact():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [
+            {
+                "id": "e1",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "eval-run",
+                "traceId": "eval-trace",
+            }
+        ],
+        [
+            {
+                "id": "bq-id",
+                "deploymentId": "prod",
+                "stt": "stt-1",
+                "runId": "orig-run",
+            }
+        ],
+    ]
+
+    tracking = fetch_evalset_entry_tracking(
+        mock_client,
+        eval_set_name="Glean Chat V2 Medium",
+        eval_set_version="20260817",
+        entry_ids=["e1"],
+        deployment_ids=["prod"],
+    )
+
+    assert tracking["e1"]["runId"] == "orig-run"
+    assert tracking["e1"]["stt"] == "stt-1"
+    assert "traceId" not in tracking["e1"]
 
 
 def test_bigquery_client_wraps_query_failures():

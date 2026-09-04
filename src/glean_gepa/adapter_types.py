@@ -14,6 +14,9 @@ class EvalSetALDataInst(TypedDict):
     eval_set_version: str
     deployment_ids: list[str]
     status: str
+    eval_entry_ids: NotRequired[list[str]]
+    focused_eval_set_name: NotRequired[str]
+    focused_eval_set_version: NotRequired[str]
 
 
 class SingleModelALDataInst(EvalSetALDataInst):

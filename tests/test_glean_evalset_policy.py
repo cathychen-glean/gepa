@@ -35,6 +35,10 @@ def test_restarted_run_continues_after_the_versions_it_already_used(tmp_path):
     resumed = UnseenEvalSetPolicy(state_file=state_file)
     assert resumed.take_unseen(loader, purpose="screening", attempt=2) == [2]
 
+    skipped = UnseenEvalSetPolicy(state_file=tmp_path / "skipped.json")
+    skipped.skip_consumed_prefix(loader, 2)
+    assert skipped.take_unseen(loader, purpose="screening") == [2]
+
 
 def test_generation_interrupted_before_it_finished_replays_its_slice(tmp_path):
     state_file = tmp_path / "schedule.json"

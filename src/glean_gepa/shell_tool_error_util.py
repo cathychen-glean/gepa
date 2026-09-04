@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any
 
 DEFAULT_AGENTS_SPAN_TABLE = "scio-apps.scrubbed_agentspan.scrubbed_agentspan_*"
 DEFAULT_EVALSET_ENTRIES_TABLE = "scio-apps.fact.evalset_entries"
+DEFAULT_LOOKBACK_DAYS = 1
 DEFAULT_EVAL_WORKFLOW_RUNS_TABLE = "scio-apps.fact.eval_workflow_runs"
 SHELL_SUCCESS_OBJECTIVE = "shell_success_rate"
 SHELL_SPAN_NAMES = ("Execute Action: Shell", "Execute Action: Shell Tool")
@@ -107,6 +109,33 @@ def is_shell_tool_error(
     )
 
 
+def wildcard_shard_filter(start_date_param: str, end_date_param: str, *, table_alias: str = "") -> str:
+    """Restrict a ``table_*`` wildcard to UTC date shards.
+
+    Compare ``_TABLE_SUFFIX`` as a string. Wrapping it in ``PARSE_DATE`` can stop
+    BigQuery from eliminating shards, which scans the full Agentspan history.
+    ``FORMAT_DATE`` on query parameters is constant-folded.
+    """
+    suffix = f"{table_alias}._TABLE_SUFFIX" if table_alias else "_TABLE_SUFFIX"
+    return f"{suffix} BETWEEN FORMAT_DATE('%Y%m%d', @{start_date_param}) AND FORMAT_DATE('%Y%m%d', @{end_date_param})"
+
+
+def _shell_execution_id_sql() -> str:
+    """Stable execution id without serializing the full ``jsonPayload`` blob."""
+    return """COALESCE(
+      NULLIF(jsonPayload.action.action_run_id, ''),
+      NULLIF(jsonPayload.context.agent_trace.span_id, ''),
+      -- Some eval spans omit both IDs. Count the observed span instead of
+      -- letting COUNT(DISTINCT NULL) turn a real execution into 0/0.
+      TO_JSON_STRING(STRUCT(
+        jsonPayload.context.eval.entry_uuid,
+        jsonPayload.context.eval.entry_id,
+        jsonPayload.span_info.span_name,
+        jsonPayload.span_info.start_end_timestamps.start_time_millis
+      ))
+    )"""
+
+
 def _shell_span_filter_sql(table_alias: str = "") -> str:
     prefix = f"{table_alias}." if table_alias else ""
     span_names = ", ".join(f"'{name}'" for name in SHELL_SPAN_NAMES)
@@ -122,13 +151,7 @@ def _shell_spans_select_sql() -> str:
     return f"""
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
-    COALESCE(
-      NULLIF(jsonPayload.action.action_run_id, ''),
-      NULLIF(jsonPayload.context.agent_trace.span_id, ''),
-      -- Some eval spans omit both IDs. Count the observed span instead of
-      -- letting COUNT(DISTINCT NULL) turn a real execution into 0/0.
-      TO_JSON_STRING(jsonPayload)
-    ) AS shell_execution_id,
+    {_shell_execution_id_sql()} AS shell_execution_id,
     jsonPayload.context.eval.entry_uuid AS entry_uuid,
     CAST(jsonPayload.context.eval.entry_id AS STRING) AS entry_id,
     resource.labels.project_id AS project_id,
@@ -160,8 +183,7 @@ def _shell_spans_select_sql() -> str:
     ) AS output_status_code,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{{agentspan_table}}`
-  WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-    BETWEEN @start_date AND @end_date
+  WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id = @eval_id
     AND {shell_filter}
     AND jsonPayload.action.execution_mode = 'EXECUTE'
@@ -179,8 +201,7 @@ SELECT
   MIN(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS min_start_ms,
   MAX(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS max_start_ms
 FROM `{agentspan_table}`
-WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-  BETWEEN @search_start_date AND @search_end_date
+WHERE {wildcard_shard_filter("search_start_date", "search_end_date")}
   AND jsonPayload.context.eval.eval_id = @eval_id
   AND {shell_filter}
   AND jsonPayload.action.execution_mode = 'EXECUTE'
@@ -354,6 +375,12 @@ GROUP BY eval_id
 """.strip()
 
 
+def _evalset_entries_deployment_filter(deployment_ids: Sequence[str] | None) -> str:
+    if deployment_ids:
+        return "AND project_id IN UNNEST(@deployment_ids)"
+    return ""
+
+
 def build_high_signal_source_entries_query(
     *,
     evalset_entries_table: str = DEFAULT_EVALSET_ENTRIES_TABLE,
@@ -361,9 +388,7 @@ def build_high_signal_source_entries_query(
     deployment_ids: Sequence[str] | None = None,
 ) -> str:
     """Resolve source evalset rows from an eval run's trace-side entry UUIDs."""
-    deployment_filter = ""
-    if deployment_ids:
-        deployment_filter = "AND project_id IN UNNEST(@deployment_ids)"
+    deployment_filter = _evalset_entries_deployment_filter(deployment_ids)
     return f"""
 WITH runtime_entries AS (
   SELECT
@@ -390,6 +415,48 @@ WHERE evalset_entries.eval_set_name = @eval_set_name
   {deployment_filter}
 QUALIFY ROW_NUMBER() OVER (PARTITION BY runtime_entries.entry_uuid ORDER BY evalset_entries.log_ts DESC) = 1
 ORDER BY id
+""".strip()
+
+
+def build_eval_entry_uuid_tracking_query(
+    *,
+    agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+    deployment_ids: Sequence[str] | None = None,
+) -> str:
+    """Resolve SESSION tracking tokens from eval spans keyed by entry_uuid.
+
+    Cortex eval-set entry ids match Agentspan ``entry_uuid``, not
+    ``fact.evalset_entries.entry_id``. Eval replays keep the original session
+    tracking token, which is what SESSION uploads need.
+    """
+    deployment_filter = ""
+    if deployment_ids:
+        deployment_filter = "AND resource.labels.project_id IN UNNEST(@deployment_ids)"
+    return f"""
+SELECT
+  COALESCE(
+    jsonPayload.context.eval.entry_uuid,
+    CAST(jsonPayload.context.eval.entry_id AS STRING)
+  ) AS id,
+  resource.labels.project_id AS deploymentId,
+  jsonPayload.span_info.session_info.session_tracking_token AS stt,
+  jsonPayload.context.workflow.run_id AS runId,
+  jsonPayload.context.agent_trace.trace_id AS traceId
+FROM `{agentspan_table}`
+WHERE {wildcard_shard_filter("start_date", "end_date")}
+  AND (
+    jsonPayload.context.eval.entry_uuid IN UNNEST(@entry_ids)
+    OR CAST(jsonPayload.context.eval.entry_id AS STRING) IN UNNEST(@entry_ids)
+  )
+  AND LENGTH(jsonPayload.span_info.session_info.session_tracking_token) > 0
+  {deployment_filter}
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY COALESCE(
+    jsonPayload.context.eval.entry_uuid,
+    CAST(jsonPayload.context.eval.entry_id AS STRING)
+  )
+  ORDER BY SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) DESC
+) = 1
 """.strip()
 
 
@@ -468,7 +535,117 @@ def fetch_high_signal_evalset_entries(
     source_rows = [row for row in source_rows if row.get("id") and row.get("deploymentId") and row.get("stt")]
     if not source_rows:
         return []
+    trace_ids = _historical_trace_ids(client, source_rows, agentspan_table=agentspan_table)
+    return [
+        {
+            "id": str(row["id"]),
+            "deploymentId": str(row["deploymentId"]),
+            "stt": str(row["stt"]),
+            "runId": str(row.get("runId") or ""),
+            "traceId": trace_ids[str(row["id"])],
+        }
+        for row in source_rows
+        if str(row["id"]) in trace_ids and row.get("runId")
+    ]
 
+
+def _eval_set_version_search_window(eval_set_version: str) -> tuple[date, date]:
+    """Search Agentspan from the eval-set version date through today (UTC)."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+    if len(eval_set_version) >= 8:
+        parsed = _parse_bigquery_date(f"{eval_set_version[:4]}-{eval_set_version[4:6]}-{eval_set_version[6:8]}")
+        if parsed is not None:
+            start = parsed
+    if start > end:
+        start = end
+    return start, end
+
+
+def fetch_evalset_entry_tracking(
+    client: Any,
+    *,
+    eval_set_name: str,
+    eval_set_version: str,
+    entry_ids: Sequence[str],
+    deployment_ids: Sequence[str] | None = None,
+    evalset_entries_table: str = DEFAULT_EVALSET_ENTRIES_TABLE,
+    agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+) -> dict[str, dict[str, Any]]:
+    """Map Cortex eval-set entry ids to SESSION upload fields.
+
+    Entry ids from EvalCLI / Agentspan ``entry_uuid`` do not match
+    ``fact.evalset_entries.entry_id``. Resolve ``stt`` from eval spans, then
+    optionally replace the eval ``runId`` with the original session's
+    ``workflow_run_id`` from the fact table.
+    """
+    wanted = sorted({str(entry_id) for entry_id in entry_ids if entry_id})
+    if not wanted:
+        return {}
+    start_date, end_date = _eval_set_version_search_window(eval_set_version)
+    span_params = [
+        QueryParameter("entry_ids", "STRING", wanted),
+        QueryParameter("start_date", "DATE", start_date.isoformat()),
+        QueryParameter("end_date", "DATE", end_date.isoformat()),
+    ]
+    if deployment_ids:
+        span_params.append(QueryParameter("deployment_ids", "STRING", list(deployment_ids)))
+    span_rows = [
+        row
+        for row in client.query(
+            build_eval_entry_uuid_tracking_query(
+                agentspan_table=agentspan_table,
+                deployment_ids=deployment_ids,
+            ),
+            params=span_params,
+        )
+        if row.get("id") and row.get("stt")
+    ]
+    if not span_rows:
+        return {}
+
+    tokens = sorted({str(row["stt"]) for row in span_rows})
+    fact_params = [
+        QueryParameter("eval_set_name", "STRING", eval_set_name),
+        QueryParameter("eval_set_version", "STRING", eval_set_version),
+        QueryParameter("session_tracking_tokens", "STRING", tokens),
+    ]
+    if deployment_ids:
+        fact_params.append(QueryParameter("deployment_ids", "STRING", list(deployment_ids)))
+    fact_by_stt = {
+        str(row["stt"]): row
+        for row in client.query(
+            build_high_signal_source_entries_query(
+                evalset_entries_table=evalset_entries_table,
+                deployment_ids=deployment_ids,
+            ),
+            params=fact_params,
+        )
+        if row.get("stt")
+    }
+
+    tracking: dict[str, dict[str, Any]] = {}
+    for row in span_rows:
+        entry_id = str(row["id"])
+        source = fact_by_stt.get(str(row["stt"])) or {}
+        payload: dict[str, Any] = {
+            "deploymentId": str(source.get("deploymentId") or row.get("deploymentId") or ""),
+            "stt": str(row["stt"]),
+        }
+        if source.get("runId"):
+            payload["runId"] = str(source["runId"])
+        if payload["deploymentId"]:
+            tracking[entry_id] = payload
+    return tracking
+
+
+def _historical_trace_ids(
+    client: Any,
+    source_rows: Sequence[Mapping[str, Any]],
+    *,
+    agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+) -> dict[str, str]:
+    """Return entry id -> non-eval historical trace id when Agentspan can resolve one."""
     source_dates = [
         parsed_date
         for row in source_rows
@@ -476,7 +653,7 @@ def fetch_high_signal_evalset_entries(
         if parsed_date is not None
     ]
     if not source_dates:
-        return []
+        return {}
     start_suffix = (min(source_dates) - timedelta(days=1)).strftime("%Y%m%d")
     end_suffix = (max(source_dates) + timedelta(days=1)).strftime("%Y%m%d")
     trace_rows = client.query(
@@ -502,17 +679,7 @@ def fetch_high_signal_evalset_entries(
             QueryParameter("end_suffix", "STRING", end_suffix),
         ],
     )
-    return [
-        {
-            "id": str(row["id"]),
-            "deploymentId": str(row["deploymentId"]),
-            "stt": str(row["stt"]),
-            "runId": str(row["runId"]),
-            "traceId": str(row["traceId"]),
-        }
-        for row in trace_rows
-        if row.get("id") and row.get("deploymentId") and row.get("stt") and row.get("runId") and row.get("traceId")
-    ]
+    return {str(row["id"]): str(row["traceId"]) for row in trace_rows if row.get("id") and row.get("traceId")}
 
 
 def _parse_bigquery_date(value: Any) -> date | None:
@@ -533,7 +700,7 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def default_date_range(*, lookback_days: int = 7, end_date: date | None = None) -> tuple[date, date]:
+def default_date_range(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None) -> tuple[date, date]:
     search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
     return search_start, search_end
 
@@ -547,7 +714,7 @@ def _search_window(*, lookback_days: int, end_date: date | None) -> tuple[date, 
 def build_eval_run_search_params(
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
 ) -> list[QueryParameter]:
     search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
@@ -704,7 +871,7 @@ def fetch_eval_run_shell_tool_error_analysis(
     client: Any,
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     include_error_examples: bool = True,
@@ -828,7 +995,7 @@ def fetch_shell_tool_error_metrics(
     client: Any,
     *,
     eval_id: str,
-    lookback_days: int = 7,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> ShellToolErrorMetrics:
