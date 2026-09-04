@@ -161,6 +161,33 @@ def _source_session_token(source_entry: Mapping[str, Any]) -> str | None:
     return str(token) if token else None
 
 
+def _is_eval_set_already_exists_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "already exists" in message and "eval set" in message
+
+
+def _upload_focused_eval_set(
+    evalcli: EvalCliClient,
+    *,
+    name: str,
+    version: str,
+    entries: Sequence[Mapping[str, Any]],
+    bucket_type: str,
+    base_eval_set_name: str,
+    base_eval_set_version: str,
+) -> None:
+    request = build_upload_eval_set_request(
+        name=name,
+        version=version,
+        entries=entries,
+        bucket_type=bucket_type,
+        base_eval_set_name=base_eval_set_name,
+        base_eval_set_version=base_eval_set_version,
+    )
+    print(f"[Focused eval set] Uploading {name}:{version} with {len(entries)} entries")
+    evalcli.upload_eval_set(request)
+
+
 def build_upload_entry(
     source_entry: Mapping[str, Any],
     *,
@@ -374,15 +401,6 @@ def ensure_focused_eval_set(
         )
         return None
 
-    request = build_upload_eval_set_request(
-        name=name,
-        version=version,
-        entries=upload_entries,
-        bucket_type=bucket_type,
-        base_eval_set_name=base_eval_set_name,
-        base_eval_set_version=base_eval_set_version,
-    )
-    print(f"[Focused eval set] Uploading {name}:{version} with {len(upload_entries)} entries")
     print(
         f"[Focused eval set] {bucket_type} payload "
         f"stt={sum(1 for entry in upload_entries if entry.get('stt'))} "
@@ -391,11 +409,38 @@ def ensure_focused_eval_set(
         f"query={sum(1 for entry in upload_entries if entry.get('query'))}"
     )
     try:
-        evalcli.upload_eval_set(request)
+        _upload_focused_eval_set(
+            evalcli,
+            name=name,
+            version=version,
+            entries=upload_entries,
+            bucket_type=bucket_type,
+            base_eval_set_name=base_eval_set_name,
+            base_eval_set_version=base_eval_set_version,
+        )
     except EvalCliError as exc:
-        if "already exists" not in str(exc).lower():
+        if not _is_eval_set_already_exists_error(exc):
             raise
-        print(f"[Focused eval set] {name}:{version} was created concurrently; reusing it")
+        # Cortex upload uniqueness is a SQL name:version row. GET/entries can still
+        # 404 when that row was reserved by a failed or unpublished prior upload.
+        if evalcli.get_eval_set_version(eval_set_name=name, eval_set_version=version) is not None:
+            print(f"[Focused eval set] {name}:{version} was created concurrently; reusing it")
+        else:
+            retry_version = focused_eval_set_retry_version(version)
+            print(
+                f"[Focused eval set] {name}:{version} already exists in Cortex SQL but is not readable; "
+                f"uploading {retry_version} instead"
+            )
+            version = retry_version
+            _upload_focused_eval_set(
+                evalcli,
+                name=name,
+                version=version,
+                entries=upload_entries,
+                bucket_type=bucket_type,
+                base_eval_set_name=base_eval_set_name,
+                base_eval_set_version=base_eval_set_version,
+            )
 
     try:
         ingested = evalcli.wait_for_eval_set_entries(

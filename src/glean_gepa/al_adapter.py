@@ -1106,6 +1106,7 @@ def enrich_shell_error_action_inputs(
     if not grouped:
         return analysis
 
+    print(f"[Shell Tool] Fetching action inputs for {len(grouped)} traces on eval {analysis.eval_id}")
     resolved: dict[tuple[str, str, str], str] = {}
     for (deployment_id, trace_id), trace_examples in grouped.items():
         timestamps = [

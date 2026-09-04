@@ -526,6 +526,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             linear_pareto_front_program_idx=linear_pareto_front_program_idx,
             valset_size=len(valset),
             val_evaluation_policy=self.val_evaluation_policy,
+            iteration=iteration,
         )
 
         # Log candidate table row with instructions and metadata
@@ -973,6 +974,13 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Main loop
         last_pbar_val = 0
+        if self._should_stop(state):
+            remaining = self._get_remaining_budget(state)
+            budget = f", remaining budget={remaining}" if remaining is not None else ""
+            self.logger.log(
+                f"Stop condition already met before the optimization loop "
+                f"(metric calls used={state.total_num_evals}{budget}); no new iterations will run."
+            )
         while not self._should_stop(state):
             if self.display_progress_bar and progress_bar is not None:
                 delta = state.total_num_evals - last_pbar_val

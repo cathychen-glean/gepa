@@ -52,6 +52,7 @@ ADAPTER_CACHE_FILENAME = "glean_adapter_cache.json"
 EVAL_RUN_CACHE_FILENAME = "glean_eval_run_cache.json"
 CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
 RUN_LOG_FILENAME = "gepa_run.log"
+EVALSET_SCHEDULE_FILENAME = "glean_evalset_schedule.json"
 
 
 def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
@@ -446,6 +447,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
     cache_file = args.cache_file or _default_cache_file(args.run_dir, ADAPTER_CACHE_FILENAME)
     eval_run_cache_file = args.eval_run_cache_file or _default_cache_file(args.run_dir, EVAL_RUN_CACHE_FILENAME)
     children_cache_file = args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME)
+    evalset_schedule_file = _default_cache_file(args.run_dir, EVALSET_SCHEDULE_FILENAME)
     adapter_kwargs = {
         "runner": ALRunner(
             evalcli=evalcli,
@@ -492,7 +494,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         "reflect_k": args.reflection_samples,
         "reflection_hamming_distance_k": args.reflection_hamming_distance_k,
         "baseline_prompt_hash": hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
-        "evalset_policy": UnseenEvalSetPolicy(),
+        "evalset_policy": UnseenEvalSetPolicy(state_file=evalset_schedule_file),
         "children_cache_file": children_cache_file,
     }
     proposer = EvolutionaryProposer(**proposer_kwargs)
@@ -529,7 +531,7 @@ def _run_fake_flow(args: argparse.Namespace) -> None:
         global_token_cap=4096,
         reflect_k=3,
         baseline_prompt_hash=hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
-        evalset_policy=UnseenEvalSetPolicy(),
+        evalset_policy=UnseenEvalSetPolicy(state_file=_default_cache_file(args.run_dir, EVALSET_SCHEDULE_FILENAME)),
         children_cache_file=args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME),
     )
     result = optimize(

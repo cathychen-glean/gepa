@@ -17,7 +17,9 @@ from glean_gepa.shell_tool_error_util import (
     build_shell_tool_error_per_entry_query,
     build_shell_tool_error_query_params,
     build_shell_tool_error_rate_query,
+    default_date_range,
     empty_shell_tool_error_metrics,
+    fetch_eval_run_shell_tool_error_analysis,
     fetch_high_signal_evalset_entries,
     fetch_evalset_entry_tracking,
     fetch_shell_tool_error_metrics,
@@ -171,7 +173,56 @@ def test_build_eval_run_search_params_uses_lookback_window():
 
     assert param_map["eval_id"] == "run_123"
     assert param_map["search_start_date"] == "2026-08-08"
-    assert param_map["search_end_date"] == "2026-08-11"
+    assert param_map["search_end_date"] == "2026-08-12"
+
+
+def test_default_date_range_uses_utc_today_not_host_local():
+    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 3)):
+        assert default_date_range(lookback_days=7) == (date(2026, 8, 27), date(2026, 9, 4))
+
+
+def test_default_date_range_always_includes_next_utc_shard():
+    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 2)):
+        assert default_date_range(lookback_days=7) == (date(2026, 8, 26), date(2026, 9, 3))
+
+
+def test_resolve_eval_run_date_range_includes_next_utc_shard_when_today_is_local():
+    eval_start_utc = int(datetime(2026, 9, 3, 2, 8, tzinfo=timezone.utc).timestamp() * 1000)
+    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 2)):
+        resolved = resolve_eval_run_date_range(
+            {"min_start_ms": eval_start_utc, "max_start_ms": eval_start_utc},
+            lookback_days=7,
+        )
+
+    assert resolved == (date(2026, 9, 3), date(2026, 9, 3))
+
+
+def test_fetch_analysis_can_skip_per_entry_query():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = [
+        [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
+        [
+            {
+                "eval_id": "run_123",
+                "shell_executions": 6,
+                "shell_errors": 2,
+                "shell_error_rate": 1 / 3,
+                "shell_error_pct": 33.33,
+                "recent_error_examples": [],
+            }
+        ],
+    ]
+
+    analysis = fetch_eval_run_shell_tool_error_analysis(
+        mock_client,
+        eval_id="run_123",
+        end_date=date(2026, 8, 12),
+        include_per_entry=False,
+    )
+
+    assert analysis.aggregate.shell_executions == 6
+    assert analysis.per_entry == {}
+    assert mock_client.query.call_count == 2
 
 
 def test_resolve_eval_run_date_range_uses_utc_for_bigquery_shards():
@@ -184,6 +235,18 @@ def test_resolve_eval_run_date_range_uses_utc_for_bigquery_shards():
     )
 
     assert resolved == (date(2026, 8, 30), date(2026, 8, 30))
+
+
+def test_resolve_eval_run_date_range_does_not_clamp_away_padded_utc_shard():
+    just_after_midnight_utc = int(datetime(2026, 9, 3, 0, 30, tzinfo=timezone.utc).timestamp() * 1000)
+
+    resolved = resolve_eval_run_date_range(
+        {"min_start_ms": just_after_midnight_utc, "max_start_ms": just_after_midnight_utc},
+        lookback_days=7,
+        end_date=date(2026, 9, 2),
+    )
+
+    assert resolved == (date(2026, 9, 3), date(2026, 9, 3))
 
 
 def test_shell_error_free_rate():

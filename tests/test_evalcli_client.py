@@ -126,6 +126,26 @@ def test_al_runner_invokes_on_created_before_waiting(tmp_path):
     assert saved["in_flight"] == {}
 
 
+def test_al_runner_waits_for_an_eval_run_cached_by_an_interrupted_process(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(client, "create_eval_run", return_value="run_123"),
+        patch.object(client, "wait_for_eval_run"),
+    ):
+        ALRunner(evalcli=client, cache_file=str(cache_file)).run("fast", "prompt", "eval-set", "v1", ["scio-prod"])
+
+    resumed = ALRunner(evalcli=client, cache_file=str(cache_file))
+    with (
+        patch.object(client, "create_eval_run") as create_eval_run,
+        patch.object(client, "wait_for_eval_run") as wait_for_eval_run,
+    ):
+        assert resumed.run("fast", "prompt", "eval-set", "v1", ["scio-prod"]) == "run_123"
+
+    create_eval_run.assert_not_called()
+    wait_for_eval_run.assert_not_called()
+
+
 def test_create_judge_run_parses_response_list():
     client = EvalCliClient(binary="/fake/evalcli")
     with patch.object(client, "_invoke_json", return_value=[{"id": "judge_456", "status": "SUBMITTED"}]) as mock_invoke:
@@ -495,6 +515,27 @@ def test_min_ingested_eval_set_entries_is_half_rounded_up():
     assert min_ingested_eval_set_entries(20) == 10
     assert min_ingested_eval_set_entries(19) == 10
     assert min_ingested_eval_set_entries(1) == 1
+
+
+def test_wait_for_eval_set_entries_includes_listing_error_on_timeout():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(
+            client,
+            "list_eval_set_entries",
+            side_effect=EvalCliError('Eval set version "n:v" not found'),
+        ),
+        patch("glean_gepa.evalcli_client.time.sleep"),
+        pytest.raises(EvalCliError, match="Last listing error"),
+    ):
+        client.wait_for_eval_set_entries(
+            eval_set_name="n",
+            eval_set_version="v",
+            deployment_ids=["prod"],
+            expected_count=2,
+            poll_interval_sec=1,
+            timeout_sec=1,
+        )
 
 
 def test_invoke_raises_on_nonzero_exit():

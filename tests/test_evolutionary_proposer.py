@@ -3,6 +3,8 @@ from typing import ClassVar
 from unittest.mock import MagicMock
 
 from gepa.core.engine import GEPAEngine
+from gepa.core.state import ValsetEvaluation
+from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
 from gepa.strategies.acceptance import StrictImprovementAcceptance
 from glean_gepa.al_adapter import Candidate, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
@@ -307,6 +309,62 @@ def test_same_root_and_training_slice_reuses_children_and_screen(tmp_path) -> No
     assert second_adapter.screen_evaluation_calls == 0
 
 
+def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_path) -> None:
+    """Root traces feed reflection and screening; a replay needs neither."""
+    root = _candidate("root")
+    cache_file = str(tmp_path / "children.json")
+
+    class _State:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 1
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    class _TraceRecordingAdapter(_HighSignalProposerAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capture_traces_requests: list[bool] = []
+
+        def evaluate(self, _batch, _candidate, capture_traces=False):
+            self.capture_traces_requests.append(capture_traces)
+            return super().evaluate(_batch, _candidate, capture_traces=capture_traces)
+
+        def evaluate_many(self, _batch, candidates, capture_traces=False):
+            self.capture_traces_requests.append(capture_traces)
+            self.root_evaluation_calls += len(candidates)
+            if capture_traces:
+                return [_Evaluation() for _ in candidates]
+            return [
+                GleanEvaluationBatch(outputs=[{}], scores=[1.0], summary={"objective": 1.0})
+                for _ in candidates
+            ]
+
+    first_adapter = _TraceRecordingAdapter()
+    first_proposer = _proposer(first_adapter, cache_file)
+    first_proposer.trainset = _OneSliceLoader()
+    assert first_proposer.propose(_State())
+    assert first_adapter.capture_traces_requests == [True]
+
+    # The root score is what makes a replay skip evaluation entirely, so drop it
+    # to force the root eval and assert it no longer asks for error examples.
+    del first_proposer._root_screening_scores_by_train_slice[(0,)]
+    first_proposer._save_children_cache()
+
+    replay_adapter = _TraceRecordingAdapter()
+    replay_proposer = _proposer(replay_adapter, cache_file)
+    replay_proposer.trainset = _OneSliceLoader()
+    assert replay_proposer.propose(_State())
+
+    assert replay_adapter.capture_traces_requests == [False]
+    assert replay_adapter.reflection_calls == 0
+    assert replay_adapter.screen_evaluation_calls == 0
+
+
 def test_high_signal_screen_uses_zero_baseline_before_full_validation(tmp_path) -> None:
     """A high-signal fix rate must not be compared to the parent's full score."""
     root = _candidate("root")
@@ -357,3 +415,45 @@ def test_engine_keeps_the_stamped_full_eval_iteration_during_validation() -> Non
     _State.full_program_trace.append({"display_iteration": 1})
     _State.num_full_ds_evals += 1
     assert GEPAEngine._display_iteration(engine, _State()) == 1
+
+
+def test_new_program_metrics_log_display_iteration_not_proposal_attempts() -> None:
+    logger = MagicMock()
+    experiment_tracker = MagicMock()
+    val_evaluation_policy = MagicMock()
+    val_evaluation_policy.get_best_program.return_value = 1
+    val_evaluation_policy.get_valset_score.return_value = 0.5
+
+    state = MagicMock()
+    state.i = 8
+    state.pareto_front_valset = {"a": 0.5}
+    state.objective_pareto_front = {}
+    state.program_at_pareto_front_valset = {"a": {1}}
+    state.program_at_pareto_front_objectives = {}
+    state.program_full_scores_val_set = [0.4, 0.5]
+    state.prog_candidate_val_subscores = [{}, {"a": 0.5}]
+    state.parent_program_for_candidate = [None, [0]]
+    state.prog_candidate_objective_scores = [{}, {}]
+    state.total_num_evals = 12
+
+    log_detailed_metrics_after_discovering_new_program(
+        logger=logger,
+        gepa_state=state,
+        new_program_idx=1,
+        valset_evaluation=ValsetEvaluation(outputs_by_val_id={}, scores_by_val_id={"a": 0.5}),
+        objective_scores={},
+        experiment_tracker=experiment_tracker,
+        linear_pareto_front_program_idx=1,
+        valset_size=1,
+        val_evaluation_policy=val_evaluation_policy,
+        iteration=5,
+    )
+
+    logged = [call.args[0] for call in logger.log.call_args_list]
+    assert logged
+    assert all(message.startswith("Iteration 5:") for message in logged)
+    assert not any("Iteration 9:" in message for message in logged)
+    experiment_tracker.log_metrics.assert_called_once()
+    metrics, kwargs = experiment_tracker.log_metrics.call_args
+    assert metrics[0]["iteration"] == 5
+    assert kwargs["step"] == 5

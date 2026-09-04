@@ -148,17 +148,27 @@ class SingleModelAdapter(GleanAdapterBase):
         )
 
     def _get_or_fetch_shell_error_analysis(
-        self, eval_id: str, *, include_error_examples: bool = True
+        self,
+        eval_id: str,
+        *,
+        include_error_examples: bool = True,
+        include_per_entry: bool = True,
     ) -> EvalRunShellToolErrorAnalysis:
         cached = self._eval_analysis_cache.get(eval_id)
         if cached is not None:
-            print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
-            return cached
+            missing_entry_breakdown = (
+                include_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0
+            )
+            if not missing_entry_breakdown:
+                print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
+                return cached
+            print(f"[Cache] Refetching shell error analysis with per-entry metrics for eval_id: {eval_id}")
         analysis = fetch_eval_run_shell_tool_error_analysis(
             self.bigquery_client,
             eval_id=eval_id,
             lookback_days=self.agentspan_lookback_days,
             include_error_examples=include_error_examples,
+            include_per_entry=include_per_entry,
         )
         if include_error_examples:
             analysis = enrich_shell_error_action_inputs(self.runner.evalcli, analysis)
@@ -336,7 +346,11 @@ class SingleModelAdapter(GleanAdapterBase):
                 )
             analysis = self._get_or_fetch_shell_error_analysis(
                 student_eval_id,
-                include_error_examples=not is_focused_eval,
+                # Full validation only needs the aggregate score. Per-entry
+                # ARRAY_AGG + evalcli trace hydration can stall for minutes on
+                # a Medium eval with no further logs.
+                include_error_examples=capture_traces and not is_focused_eval,
+                include_per_entry=is_focused_eval or capture_traces,
             )
             if analysis.aggregate.shell_executions == 0:
                 raise ShellToolTelemetryPendingError(

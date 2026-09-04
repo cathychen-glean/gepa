@@ -15,6 +15,9 @@ SHELL_SUCCESS_OBJECTIVE = "shell_success_rate"
 SHELL_SPAN_NAMES = ("Execute Action: Shell", "Execute Action: Shell Tool")
 SHELL_ACTION_IDS = ("Shell", "Shell Tool")
 FAILED_PROVIDER_STATUSES = frozenset({"failed", "error"})
+# `_TABLE_SUFFIX` is a UTC date. Always scan tomorrow's shard so a PDT "today"
+# or a just-after-midnight UTC eval is not scored as empty 0/0.
+UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS = 1
 
 
 @dataclass(frozen=True)
@@ -197,7 +200,8 @@ def build_shell_tool_error_per_entry_query(
     if entry_ids:
         entry_filter = "AND COALESCE(entry_id, entry_uuid) IN UNNEST(@entry_ids)"
     shell_spans = _shell_spans_select_sql().format(agentspan_table=agentspan_table)
-    error_detail_columns = """
+    error_detail_columns = (
+        """
     , ARRAY_AGG(
       IF(
         is_error,
@@ -237,7 +241,10 @@ def build_shell_tool_error_per_entry_query(
       ORDER BY start_ms DESC
       LIMIT 10
     ) AS session_tracking_tokens
-""" if include_error_examples else ""
+"""
+        if include_error_examples
+        else ""
+    )
     return f"""
 WITH shell_spans AS (
 {shell_spans}
@@ -673,11 +680,20 @@ def _parse_bigquery_date(value: Any) -> date | None:
         return None
 
 
+def utc_today() -> date:
+    """Calendar date of the agentspan `_TABLE_SUFFIX` shards (UTC, not host local)."""
+    return datetime.now(timezone.utc).date()
+
+
 def default_date_range(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None) -> tuple[date, date]:
-    # Agentspan shards by UTC ``_TABLE_SUFFIX``. Local ``date.today()`` is wrong after
-    # UTC midnight while the local timezone is still the previous calendar day.
-    resolved_end = end_date or datetime.now(timezone.utc).date()
-    return resolved_end - timedelta(days=lookback_days), resolved_end
+    search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
+    return search_start, search_end
+
+
+def _search_window(*, lookback_days: int, end_date: date | None) -> tuple[date, date]:
+    base_end = end_date or utc_today()
+    search_end = base_end + timedelta(days=UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS)
+    return base_end - timedelta(days=lookback_days), search_end
 
 
 def build_eval_run_search_params(
@@ -729,8 +745,7 @@ def resolve_eval_run_date_range(
     # causing the aggregate query to scan a different shard and return 0/0.
     min_date = datetime.fromtimestamp(int(min_ms) / 1000, tz=timezone.utc).date()
     max_date = datetime.fromtimestamp(int(max_ms) / 1000, tz=timezone.utc).date()
-    search_end = end_date or datetime.now(timezone.utc).date()
-    search_start = search_end - timedelta(days=lookback_days)
+    search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
     start_date = max(min_date, search_start)
     end_date_resolved = min(max_date, search_end)
     if start_date > end_date_resolved:
@@ -845,7 +860,9 @@ def fetch_eval_run_shell_tool_error_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     include_error_examples: bool = True,
+    include_per_entry: bool = True,
 ) -> EvalRunShellToolErrorAnalysis:
+    print(f"[Shell Tool] Querying BigQuery time bounds for eval {eval_id}")
     bounds_rows = client.query(
         build_eval_run_time_bounds_query(agentspan_table=agentspan_table),
         params=build_eval_run_search_params(
@@ -875,6 +892,10 @@ def fetch_eval_run_shell_tool_error_analysis(
     # deliberately require eval-entry attribution and therefore omit spans that
     # lack an entry id/uuid; using them as the aggregate made those omitted
     # spans look like a perfect 0/0 run.
+    print(
+        f"[Shell Tool] Querying BigQuery aggregate shell metrics for eval {eval_id} "
+        f"({start_date.isoformat()} to {resolved_end.isoformat()})"
+    )
     aggregate_rows = client.query(
         build_shell_tool_error_rate_query(agentspan_table=agentspan_table),
         params=build_shell_tool_error_query_params(
@@ -883,7 +904,20 @@ def fetch_eval_run_shell_tool_error_analysis(
             end_date=resolved_end,
         ),
     )
-    aggregate = parse_shell_tool_error_metrics(aggregate_rows[0]) if aggregate_rows else empty_shell_tool_error_metrics(eval_id)
+    aggregate = (
+        parse_shell_tool_error_metrics(aggregate_rows[0]) if aggregate_rows else empty_shell_tool_error_metrics(eval_id)
+    )
+    if not include_per_entry:
+        return EvalRunShellToolErrorAnalysis(
+            eval_id=eval_id,
+            start_date=start_date,
+            end_date=resolved_end,
+            aggregate=aggregate,
+            per_entry={},
+            high_signal_entry_ids=(),
+        )
+
+    print(f"[Shell Tool] Querying BigQuery per-entry shell metrics for eval {eval_id}")
     per_entry_rows = client.query(
         build_shell_tool_error_per_entry_query(
             agentspan_table=agentspan_table,

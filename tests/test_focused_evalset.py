@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from glean_gepa.evalcli_client import EvalCliError
 from glean_gepa.focused_evalset import (
     DEFAULT_RUN_LABEL,
     HIGH_SIGNAL_RUN_LABEL,
@@ -365,3 +366,79 @@ def test_resolve_eval_run_target(data, ensure_return, expected, ensure_called):
     with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=ensure_return) as ensure:
         assert resolve_eval_run_target(MagicMock(), data) == expected
     assert ensure.called is ensure_called
+
+
+def test_ensure_focused_eval_set_retries_when_existing_version_has_no_entries():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = {"name": "existing"}
+    evalcli.list_eval_set_entries.return_value = []
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+    source_entries = [{"id": "keep", "deploymentId": "prod", "query": "how do I list shell files"}]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+        source_entries=source_entries,
+    )
+
+    assert focused is not None
+    uploaded_version = evalcli.upload_eval_set.call_args.args[0]["version"]
+    assert "_retry_" in uploaded_version
+    assert evalcli.wait_for_eval_set_entries.call_args.kwargs["eval_set_version"] == uploaded_version
+
+
+def test_ensure_focused_eval_set_retries_unreadable_already_exists_version():
+    evalcli = MagicMock()
+    evalcli.get_eval_set_version.return_value = None
+    evalcli.upload_eval_set.side_effect = [
+        EvalCliError('Eval set with name "gepa-high-signal-example" and version "v1_hs_abc" already exists'),
+        None,
+    ]
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+    source_entries = [{"id": "keep", "deploymentId": "prod", "query": "how do I list shell files"}]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+        source_entries=source_entries,
+    )
+
+    assert focused is not None
+    assert evalcli.upload_eval_set.call_count == 2
+    original_version = evalcli.upload_eval_set.call_args_list[0].args[0]["version"]
+    retry_version = evalcli.upload_eval_set.call_args_list[1].args[0]["version"]
+    assert original_version == focused_eval_set_version("v1", ["keep"])
+    assert retry_version.startswith(f"{original_version}_retry_")
+    assert focused.version == retry_version
+    assert evalcli.wait_for_eval_set_entries.call_args.kwargs["eval_set_version"] == retry_version
+
+
+def test_ensure_focused_eval_set_reuses_readable_concurrent_create():
+    evalcli = MagicMock()
+    original_version = focused_eval_set_version("v1", ["keep"])
+    evalcli.get_eval_set_version.side_effect = [None, {"name": "existing", "version": original_version}]
+    evalcli.upload_eval_set.side_effect = EvalCliError(
+        f'Eval set with name "gepa-high-signal-example" and version "{original_version}" already exists'
+    )
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+    source_entries = [{"id": "keep", "deploymentId": "prod", "query": "how do I list shell files"}]
+
+    focused = ensure_focused_eval_set(
+        evalcli,
+        base_eval_set_name="Example",
+        base_eval_set_version="v1",
+        deployment_ids=["prod"],
+        entry_ids=["keep"],
+        source_entries=source_entries,
+    )
+
+    assert focused is not None
+    assert evalcli.upload_eval_set.call_count == 1
+    assert focused.version == original_version
+    assert evalcli.wait_for_eval_set_entries.call_args.kwargs["eval_set_version"] == original_version
