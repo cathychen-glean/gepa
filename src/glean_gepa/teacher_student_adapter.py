@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -24,14 +25,19 @@ from glean_gepa.al_adapter import (
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.core_tools import CORE_TOOL_KEYS, core_tool_reflection_prompt, tool_description_override_key
+from glean_gepa.core_tools import (
+    CORE_TOOL_KEYS,
+    core_tool_reflection_prompt,
+    is_core_tool_span,
+    tool_description_override_key,
+)
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_judge_metrics,
 )
-from glean_gepa.prompt import FULL_PROMPT_KEY, WRITING_CODE_KEY, compile_encoded_prompt
+from glean_gepa.prompt import FULL_PROMPT_KEY, RULES_EXT_KEY, WRITING_CODE_KEY, compile_encoded_prompt
 from glean_gepa.run_log import (
     format_eval_entry_report,
     format_high_signal_selection_report,
@@ -39,20 +45,28 @@ from glean_gepa.run_log import (
     selected_entry_ids_from_examples,
 )
 from glean_gepa.tool_match_util import (
+    PREFIX_K_GRADUATION_RATE,
+    PREFIX_K_SHORTAGE_ENTRIES,
+    PREFIX_K_TOP_CANDIDATES,
     EvalRunToolMatchAnalysis,
     empty_tool_match_analysis,
+    exact_prefix_match,
     fetch_eval_run_tool_match_analysis,
+    first_disagreeing_mismatch,
     first_tool_mismatch_pair,
+    intersect_compared_entry_ids,
     log_tool_match_analysis,
+    prefix_tools,
     require_compared_eval_entries,
+    restrict_tool_match_analysis,
     select_first_tool_mismatch_groups,
+    tool_prefix_alignment,
 )
 
 PRIMARY_OBJECTIVE = "tool_alignment"
-FIXED_GROUNDING = 1.0
+ADAPTER_STATE_PREFIX_K = "tool_prefix_k"
 COMPLETENESS_WEIGHT = 0.5
-TOOL_ALIGNMENT_WEIGHT = 0.3
-GROUNDING_WEIGHT = 0.2
+TOOL_ALIGNMENT_WEIGHT = 0.5
 POINTWISE_JUDGES: tuple[tuple[str, str], ...] = ((COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),)
 
 
@@ -79,6 +93,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
+        val_eval_versions: list[str] | None = None,
+        prefix_k: int = 1,
     ):
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
@@ -86,6 +102,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self._tool_match_cache: dict[tuple[str, str], EvalRunToolMatchAnalysis] = {}
         self._judge_runs: dict[tuple[str, str], str] = {}
         self._judge_cache: dict[tuple[str, str], JudgeAnalysis] = {}
+        self.val_eval_versions = {str(version) for version in (val_eval_versions or [])}
+        self.prefix_k = max(1, int(prefix_k))
+        self._val_prefix_sequences: dict[str, dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]]] = {}
+        self._last_train_low_alignment_count: int | None = None
         super().__init__(
             runner=runner,
             thresholds=thresholds,
@@ -122,6 +142,131 @@ class TeacherStudentAdapter(GleanAdapterBase):
         print(f"[Cache MISS] Fetched tool match analysis for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 
+    @staticmethod
+    def _candidate_key(candidate: dict[str, str]) -> str:
+        return hashlib.md5(json.dumps(candidate, sort_keys=True).encode()).hexdigest()
+
+    def get_adapter_state(self) -> dict[str, Any]:
+        return {
+            ADAPTER_STATE_PREFIX_K: self.prefix_k,
+            "val_prefix_sequences": {
+                candidate_key: {
+                    version: [{"teacher": list(teacher), "student": list(student)} for teacher, student in sequences]
+                    for version, sequences in by_version.items()
+                }
+                for candidate_key, by_version in self._val_prefix_sequences.items()
+            },
+            "train_low_alignment_count": self._last_train_low_alignment_count,
+        }
+
+    def set_adapter_state(self, state: dict[str, Any]) -> None:
+        if not state:
+            return
+        prefix_k = state.get(ADAPTER_STATE_PREFIX_K)
+        if prefix_k is not None:
+            self.prefix_k = max(self.prefix_k, max(1, int(prefix_k)))
+        self._last_train_low_alignment_count = (
+            int(state["train_low_alignment_count"]) if state.get("train_low_alignment_count") is not None else None
+        )
+        raw_sequences = state.get("val_prefix_sequences") or {}
+        if isinstance(raw_sequences, dict):
+            restored: dict[str, dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]]] = {}
+            for candidate_key, by_version in raw_sequences.items():
+                if not isinstance(by_version, dict):
+                    continue
+                restored[str(candidate_key)] = {}
+                for version, rows in by_version.items():
+                    sequences: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+                    for row in rows or []:
+                        if not isinstance(row, dict):
+                            continue
+                        sequences.append((tuple(row.get("teacher") or []), tuple(row.get("student") or [])))
+                    restored[str(candidate_key)][str(version)] = sequences
+            self._val_prefix_sequences = restored
+
+    def record_train_low_alignment_count(self, eval_batch: GleanEvaluationBatch) -> int:
+        count = sum(
+            1
+            for trajectory in eval_batch.trajectories or []
+            if float((trajectory.get("objective_scores") or {}).get("tool_alignment", trajectory.get("score", 1.0)))
+            < 1.0
+        )
+        self._last_train_low_alignment_count = count
+        return count
+
+    def pooled_val_prefix_match_rate(self, candidate: dict[str, str], *, prefix_k: int | None = None) -> float | None:
+        by_version = self._val_prefix_sequences.get(self._candidate_key(candidate))
+        if not by_version:
+            return None
+        k = self.prefix_k if prefix_k is None else prefix_k
+        versions = self.val_eval_versions or set(by_version)
+        sequences = [pair for version, rows in by_version.items() if version in versions for pair in rows]
+        if not sequences:
+            return None
+        matches = sum(1 for teacher, student in sequences if exact_prefix_match(teacher, student, k))
+        return matches / len(sequences)
+
+    def maybe_graduate_prefix_k(self, *, iteration: int, candidates: list[dict[str, str]]) -> bool:
+        """Advance sticky prefix depth after an iteration's val, never before iter 1."""
+        if iteration < 2:
+            return False
+        rates = [
+            rate
+            for candidate in candidates
+            for rate in [self.pooled_val_prefix_match_rate(candidate)]
+            if rate is not None
+        ]
+        rates.sort(reverse=True)
+        top = rates[:PREFIX_K_TOP_CANDIDATES]
+        val_trigger = bool(top) and all(rate > PREFIX_K_GRADUATION_RATE for rate in top)
+        shortage = (
+            self._last_train_low_alignment_count is not None
+            and self._last_train_low_alignment_count < PREFIX_K_SHORTAGE_ENTRIES
+        )
+        if not val_trigger and not shortage:
+            return False
+        self.prefix_k += 1
+        self._save_cache()
+        reason = []
+        if val_trigger:
+            formatted = ", ".join(f"{rate:.1%}" for rate in top)
+            reason.append(
+                f"top {len(top)} pooled prefix-{self.prefix_k - 1} match rates [{formatted}] "
+                f"> {PREFIX_K_GRADUATION_RATE:.0%}"
+            )
+        if shortage:
+            reason.append(
+                f"train low-alignment entries={self._last_train_low_alignment_count} < {PREFIX_K_SHORTAGE_ENTRIES}"
+            )
+        print(f"[Prefix k] Graduated to k={self.prefix_k} ({'; '.join(reason)})")
+        return True
+
+    def high_signal_fix_rate(self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch) -> float:
+        """Fraction of parent alignment<1.0 entries whose child alignment improved."""
+        parent_by_id: dict[str, float] = {}
+        for trajectory in parent_eval.trajectories or []:
+            entry_id = str((trajectory.get("output") or {}).get("entry_id") or "")
+            if not entry_id or entry_id in parent_by_id:
+                continue
+            parent_by_id[entry_id] = float(
+                (trajectory.get("objective_scores") or {}).get("tool_alignment", trajectory.get("score", 0.0))
+            )
+        failures = {entry_id: alignment for entry_id, alignment in parent_by_id.items() if alignment < 1.0}
+        if not failures:
+            return 0.0
+        child_by_id: dict[str, float] = {}
+        for trajectory in child_eval.trajectories or []:
+            entry_id = str((trajectory.get("output") or {}).get("entry_id") or "")
+            if not entry_id:
+                continue
+            child_by_id[entry_id] = float(
+                (trajectory.get("objective_scores") or {}).get("tool_alignment", trajectory.get("score", 0.0))
+            )
+        improved = sum(
+            1 for entry_id, parent_alignment in failures.items() if child_by_id.get(entry_id, 0.0) > parent_alignment
+        )
+        return improved / len(failures)
+
     def _evaluate_teacher_student(
         self,
         batch: list[ALDataInst],
@@ -134,7 +279,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         started, pending_waits = self._start_batch_evals(typed_batch, candidate)
         self._wait_pending_evals(pending_waits)
         self._run_judges(started)
-        return self._finish_batch_evals(started, capture_traces)
+        return self._finish_batch_evals(started, capture_traces, candidate=candidate)
 
     def _get_or_start_eval(
         self,
@@ -264,7 +409,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 "per_entry": analysis.per_entry,
                 "judge_run_id": analysis.judge_run_id,
             }
-        return {"judge_runs": judge_runs, "judge_cache": judge_cache}
+        return {"judge_runs": judge_runs, "judge_cache": judge_cache, **self.get_adapter_state()}
 
     def _load_extra_cache(self, data: dict[str, Any]) -> None:
         self._judge_runs = {}
@@ -305,6 +450,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     judge_run_id=str(raw["judge_run_id"]) if raw.get("judge_run_id") else None,
                     judge_type=str(judge_type),
                 )
+        self.set_adapter_state(data)
 
     def _ensure_judge(self, eval_id: str, *, judge_type: str, run_params: str) -> str:
         cache_key = (eval_id, judge_type)
@@ -394,10 +540,50 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self._wait_pending_evals(pending_waits)
         for started in all_started:
             self._run_judges(started)
-        return [self._finish_batch_evals(started, capture_traces) for started in all_started]
+        shared_ids = self._inner_join_compared_entry_ids(typed_batch, all_started)
+        return [
+            self._finish_batch_evals(
+                started,
+                capture_traces,
+                candidate=candidate,
+                compared_entry_ids_by_version=shared_ids,
+            )
+            for started, candidate in zip(all_started, candidates, strict=True)
+        ]
+
+    def _inner_join_compared_entry_ids(
+        self,
+        batch: list[TeacherStudentALDataInst],
+        all_started: list[list[_StartedPair]],
+    ) -> dict[str, set[str]] | None:
+        """Intersect compared entries across children on the same full eval set.
+
+        Focused screens already share ``eval_entry_ids`` as the denominator.
+        A single candidate has nothing to join.
+        """
+        if len(all_started) < 2:
+            return None
+        if any(bool(item.get("eval_entry_ids")) for item in batch):
+            return None
+        by_version: dict[str, list[EvalRunToolMatchAnalysis]] = {}
+        for started in all_started:
+            for pair in started:
+                version = str(pair.al_data_inst.get("eval_set_version", ""))
+                by_version.setdefault(version, []).append(
+                    self._get_or_fetch_tool_match_analysis(pair.teacher_eval_id, pair.student_eval_id)
+                )
+        shared: dict[str, set[str]] = {}
+        for version, analyses in by_version.items():
+            entry_ids = intersect_compared_entry_ids(analyses)
+            shared[version] = entry_ids
+            print(
+                f"[Tool Match] Inner join {version}: {len(entry_ids)} entries "
+                f"across {len(analyses)} candidates"
+            )
+        return shared
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
-        """Keep every parent entry whose first scored tools disagree."""
+        """Keep every parent entry whose current-k tool alignment is below 1.0."""
         grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
         seen: set[str] = set()
         for trajectory in eval_batch.trajectories or []:
@@ -406,20 +592,19 @@ class TeacherStudentAdapter(GleanAdapterBase):
             entry_id = output.get("entry_id")
             if not entry_id or entry_id in seen:
                 continue
-            if (
-                first_tool_mismatch_pair(
-                    output.get("teacher_tool_events"),
-                    output.get("student_tool_events"),
-                )
-                is None
-            ):
+            alignment = tool_prefix_alignment(
+                output.get("teacher_tool_events"),
+                output.get("student_tool_events"),
+                self.prefix_k,
+            )
+            if alignment >= 1.0:
                 continue
             seen.add(entry_id)
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
             grouped.setdefault(key, []).append(entry_id)
         if grouped:
             count = sum(len(ids) for ids in grouped.values())
-            print(f"[High-signal] Selected {count} first-tool mismatch entries for screening")
+            print(f"[High-signal] Selected {count} alignment<1.0 entries for screening (prefix_k={self.prefix_k})")
         return [
             {
                 "eval_set_name": eval_set_name,
@@ -439,7 +624,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         k: int | None,
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[ReflectiveExample]]:
-        """Build reflection examples from the most frequent first-tool mismatch groups.
+        """Build reflection examples from the largest first-disagreement clusters.
 
         ``k`` and ``error_hamming_distance_k`` are ignored: the proposer only sees
         this frequency-capped mismatch set (at most 20 entries, or the full
@@ -451,25 +636,44 @@ class TeacherStudentAdapter(GleanAdapterBase):
 
         trajectories = [cast(TeacherStudentALTrajectory, trajectory) for trajectory in eval_batch.trajectories]
         mismatch_keys = [
-            first_tool_mismatch_pair(
+            first_disagreeing_mismatch(
                 trajectory["output"].get("teacher_tool_events"),
                 trajectory["output"].get("student_tool_events"),
+                prefix_k=self.prefix_k,
             )
             for trajectory in trajectories
         ]
         selected_indices, selected_groups = select_first_tool_mismatch_groups(mismatch_keys)
         selected = [trajectories[index] for index in selected_indices]
-        selected_pairs = [mismatch_keys[index] for index in selected_indices]
         examples: dict[str, list[ReflectiveExample]] = {}
         for component_name in components_to_update:
             chosen = selected
             if component_name in CORE_TOOL_KEYS:
                 chosen = [
                     trajectory
-                    for trajectory, pair in zip(selected, selected_pairs, strict=True)
-                    if pair is not None
-                    and any(tool_description_override_key(name) == component_name for name in pair if name)
+                    for trajectory in selected
+                    if component_name
+                    in {
+                        tool_description_override_key(name)
+                        for name in (
+                            *prefix_tools(trajectory["output"].get("teacher_tool_events"), self.prefix_k),
+                            *prefix_tools(trajectory["output"].get("student_tool_events"), self.prefix_k),
+                        )
+                    }
                 ]
+            elif component_name == RULES_EXT_KEY:
+                chosen = []
+                for trajectory in selected:
+                    mismatch = first_disagreeing_mismatch(
+                        trajectory["output"].get("teacher_tool_events"),
+                        trajectory["output"].get("student_tool_events"),
+                        prefix_k=self.prefix_k,
+                    )
+                    if mismatch is None:
+                        continue
+                    if any(is_core_tool_span(name) for name in mismatch[1:] if name):
+                        continue
+                    chosen.append(trajectory)
             examples[component_name] = [
                 self._build_reflective_example(component_name, trajectory, candidate) for trajectory in chosen
             ]
@@ -522,14 +726,20 @@ class TeacherStudentAdapter(GleanAdapterBase):
         completeness = objective_scores.get("completeness", 0.0)
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
-        mismatch = first_tool_mismatch_pair(teacher_tools, student_tools)
+        mismatch = first_disagreeing_mismatch(teacher_tools, student_tools, prefix_k=self.prefix_k)
         feedback_parts = []
         if mismatch is not None:
-            teacher_first, student_first = mismatch
-            feedback_parts.append(
-                f"First-tool mismatch: teacher used {teacher_first or '(none)'} "
-                f"and student used {student_first or '(none)'}."
-            )
+            slot, teacher_name, student_name = mismatch
+            if slot == 0:
+                feedback_parts.append(
+                    f"First-tool mismatch: teacher used {teacher_name or '(none)'} "
+                    f"and student used {student_name or '(none)'}."
+                )
+            else:
+                feedback_parts.append(
+                    f"Prefix mismatch at tool {slot + 1}: teacher used {teacher_name or '(none)'} "
+                    f"and student used {student_name or '(none)'}."
+                )
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
         if completeness < 0.7:
@@ -568,6 +778,14 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 "or response guidelines — if it improves first-tool alignment with the teacher. "
                 "Preserve [[placeholder]] tokens. Propose a complete updated prompt with minimal deltas."
             )
+        if module_name == RULES_EXT_KEY:
+            return (
+                "You are writing at most two markdown bullets that will be appended after the existing "
+                "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
+                "existing Rules, do not add a heading, and do not exceed two bullets. Target first-tool "
+                "mismatches whose tools are not core tools (for example Write vs (none)). Keep each "
+                "bullet operational and concise."
+            )
         if module_name in CORE_TOOL_KEYS:
             return core_tool_reflection_prompt(module_name)
         return "Focus only on this module's responsibilities."
@@ -583,6 +801,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self,
         started: list[_StartedPair],
         capture_traces: bool,
+        *,
+        candidate: dict[str, str] | None = None,
+        compared_entry_ids_by_version: dict[str, set[str]] | None = None,
     ) -> GleanEvaluationBatch[TeacherStudentALTrajectory, TeacherStudentALRolloutOutput]:
         all_outputs: list[TeacherStudentALRolloutOutput] = []
         all_scores: list[float] = []
@@ -590,6 +811,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         all_objective_scores: list[dict[str, float]] = []
         focused_alignment_rates: list[float] = []
         all_eval_run_ids: list[EvalRunIds] = []
+        recorded_val_sequences = False
 
         for pair in started:
             al_data_inst = pair.al_data_inst
@@ -602,10 +824,19 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 }
             )
             tool_match_analysis = self._get_or_fetch_tool_match_analysis(pair.teacher_eval_id, pair.student_eval_id)
+            version = str(al_data_inst.get("eval_set_version", ""))
+            if compared_entry_ids_by_version is not None and version in compared_entry_ids_by_version:
+                tool_match_analysis = restrict_tool_match_analysis(
+                    tool_match_analysis, compared_entry_ids_by_version[version]
+                )
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             if is_focused_eval:
-                matching = sum(1 for metrics in tool_match_analysis.per_entry.values() if metrics.tools_match)
+                matching = sum(
+                    1
+                    for metrics in tool_match_analysis.per_entry.values()
+                    if exact_prefix_match(metrics.teacher_tools, metrics.student_tools, self.prefix_k)
+                )
                 focused_alignment_rates.append(matching / len(requested_entry_ids))
                 if not tool_match_analysis.per_entry:
                     continue
@@ -621,10 +852,23 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 f"teacher {pair.teacher_eval_id}={teacher_completeness.aggregate:.2f}"
             )
 
+            record_val = (
+                candidate is not None
+                and not is_focused_eval
+                and (not self.val_eval_versions or version in self.val_eval_versions)
+            )
+            if record_val:
+                assert candidate is not None
+                candidate_key = self._candidate_key(candidate)
+                self._val_prefix_sequences.setdefault(candidate_key, {})[version] = [
+                    (metrics.teacher_tools, metrics.student_tools) for metrics in tool_match_analysis.per_entry.values()
+                ]
+                recorded_val_sequences = True
+
             for entry_id, tool_match in tool_match_analysis.per_entry.items():
                 student_tools = list(tool_match.student_tools)
                 teacher_tools = list(tool_match.teacher_tools)
-                tool_alignment = float(tool_match.tools_match)
+                tool_alignment = tool_prefix_alignment(teacher_tools, student_tools, self.prefix_k)
                 completeness = student_completeness.per_entry.get(entry_id, student_completeness.aggregate)
                 output: TeacherStudentALRolloutOutput = {
                     "deployment_id": deployment_id,
@@ -646,16 +890,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     "entry_id": entry_id,
                 }
                 all_outputs.append(output)
-                score = (
-                    COMPLETENESS_WEIGHT * completeness
-                    + TOOL_ALIGNMENT_WEIGHT * tool_alignment
-                    + GROUNDING_WEIGHT * FIXED_GROUNDING
-                )
+                score = COMPLETENESS_WEIGHT * completeness + TOOL_ALIGNMENT_WEIGHT * tool_alignment
                 all_scores.append(score)
                 objective_score = {
                     "completeness": completeness,
                     "tool_alignment": tool_alignment,
-                    "grounding": FIXED_GROUNDING,
                 }
                 all_objective_scores.append(objective_score)
                 if capture_traces and all_trajectories is not None:
@@ -678,13 +917,15 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 summary[dim] = sum(values) / len(values) if values else 0.0
         if focused_alignment_rates:
             if summary is None:
-                summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
+                summary = {"completeness": 0.0}
             summary["tool_alignment"] = sum(focused_alignment_rates) / len(focused_alignment_rates)
         if summary is not None and started:
             teacher_scores = [
                 self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE).aggregate for pair in started
             ]
             summary["teacher_completeness"] = sum(teacher_scores) / len(teacher_scores)
+        if recorded_val_sequences:
+            self._save_cache()
 
         return GleanEvaluationBatch(
             outputs=all_outputs,

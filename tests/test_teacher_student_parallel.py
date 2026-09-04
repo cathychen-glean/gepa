@@ -9,6 +9,7 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
+from glean_gepa.prompt import RULES_EXT_KEY
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
 from glean_gepa.tool_match_util import (
     EvalRunToolMatchAnalysis,
@@ -141,6 +142,55 @@ def test_evaluate_many_starts_all_candidate_runs_before_waiting():
     student_creates = [event for event in events if event.startswith("create:") and "_claude_sonnet_" in event]
     assert len(teacher_creates) == 1
     assert len(student_creates) == 2
+
+
+def test_evaluate_many_inner_joins_full_eval_entry_ids():
+    events: list[str] = []
+    evalcli = _evalcli_with_ordered_events(events)
+    adapter = _teacher_student_adapter(evalcli)
+    shared = ToolMatchEntryMetrics("shared", ("search",), ("search",), True)
+    only_a = ToolMatchEntryMetrics("only-a", ("search",), ("search",), True)
+    only_b = ToolMatchEntryMetrics("only-b", ("read",), ("search",), False)
+    by_student: dict[str, EvalRunToolMatchAnalysis] = {}
+
+    def fetch(teacher_eval_id: str, student_eval_id: str) -> EvalRunToolMatchAnalysis:
+        cached = by_student.get(student_eval_id)
+        if cached is not None:
+            return cached
+        extra = only_a if len(by_student) == 0 else only_b
+        per_entry = {"shared": shared, extra.entry_id: extra}
+        matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
+        analysis = EvalRunToolMatchAnalysis(
+            teacher_eval_id=teacher_eval_id,
+            student_eval_id=student_eval_id,
+            start_date=date(2026, 8, 8),
+            end_date=date(2026, 8, 11),
+            aggregate=ToolMatchMetrics(
+                teacher_eval_id=teacher_eval_id,
+                student_eval_id=student_eval_id,
+                compared_entries=len(per_entry),
+                matching_entries=matching,
+                tool_match_rate=matching / len(per_entry),
+            ),
+            per_entry=per_entry,
+            high_signal_entry_ids=tuple(entry_id for entry_id, metrics in per_entry.items() if not metrics.tools_match),
+        )
+        by_student[student_eval_id] = analysis
+        return analysis
+
+    with patch.object(adapter, "_get_or_fetch_tool_match_analysis", side_effect=fetch):
+        results = adapter.evaluate_many(
+            [EVAL_SET],
+            [{"WRITING_CODE": "prompt a"}, {"WRITING_CODE": "prompt b"}],
+            capture_traces=True,
+        )
+
+    assert len(results) == 2
+    for result in results:
+        assert [output["entry_id"] for output in result.outputs] == ["shared"]
+        assert result.objective_scores == [{"completeness": 0.0, "tool_alignment": 1.0}]
+        assert result.summary is not None
+        assert result.summary["tool_alignment"] == pytest.approx(1.0)
 
 
 def test_batch_evaluate_shares_teacher_run_across_children():
@@ -280,18 +330,17 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
         capture_traces=True,
     )
 
-    assert result.scores == pytest.approx([0.7])
-    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0, "grounding": 1.0}]
+    assert result.scores == pytest.approx([0.5])
+    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0}]
     assert result.outputs[0]["student_tool_events"] == ["search"]
     assert result.outputs[0]["teacher_tool_events"] == ["read"]
     assert result.summary == {
         "completeness": 1.0,
         "tool_alignment": 0.0,
-        "grounding": 1.0,
         "teacher_completeness": 0.9,
     }
     assert result.trajectories is not None
-    assert result.trajectories[0]["score"] == pytest.approx(0.7)
+    assert result.trajectories[0]["score"] == pytest.approx(0.5)
 
 
 def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
@@ -384,7 +433,6 @@ def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
     assert result.summary == {
         "completeness": 0.0,
         "tool_alignment": 0.0,
-        "grounding": 1.0,
         "teacher_completeness": 0.0,
     }
 
@@ -620,3 +668,105 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
     assert examples["glean_search"][0]["Feedback"].startswith(
         "First-tool mismatch: teacher used Glean Search and student used Discover."
     )
+
+
+def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
+    adapter = _teacher_student_adapter(MagicMock())
+    trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
+        _mismatch_trajectory(f"write-{i}", ["Write"], []) for i in range(8)
+    ]
+    examples = adapter.make_reflective_dataset(
+        {"FULL_PROMPT": "prompt", RULES_EXT_KEY: ""},
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[]),
+        [RULES_EXT_KEY, "glean_search"],
+        k=8,
+    )
+    write_ids = [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]]
+    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
+    assert write_ids == [f"write-{i}" for i in range(8)]
+    assert search_ids == [f"search-{i}" for i in range(12)]
+    assert examples[RULES_EXT_KEY][0]["Feedback"].startswith(
+        "First-tool mismatch: teacher used Write and student used (none)."
+    )
+
+
+def _alignment_trajectory(entry_id: str, teacher_tools: list[str], student_tools: list[str], alignment: float):
+    return {
+        "data": EVAL_SET,
+        "output": {
+            "entry_id": entry_id,
+            "student_tool_events": student_tools,
+            "teacher_tool_events": teacher_tools,
+        },
+        "score": alignment,
+        "objective_scores": {"tool_alignment": alignment},
+    }
+
+
+def test_high_signal_batch_at_k2_keeps_later_prefix_misses():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.prefix_k = 2
+    focused = adapter.high_signal_batch(
+        GleanEvaluationBatch(
+            outputs=[],
+            scores=[],
+            trajectories=[
+                _alignment_trajectory("later", ["search", "write"], ["search", "read"], 0.75),
+                _alignment_trajectory("perfect", ["search", "write"], ["search", "write"], 1.0),
+                _alignment_trajectory("first", ["search"], ["read"], 0.0),
+            ],
+            objective_scores=[],
+        )
+    )
+    assert focused[0]["eval_entry_ids"] == ["later", "first"]
+
+
+def test_high_signal_fix_rate_counts_alignment_improvements():
+    adapter = _teacher_student_adapter(MagicMock())
+    parent = GleanEvaluationBatch(
+        outputs=[],
+        scores=[],
+        trajectories=[
+            _alignment_trajectory("a", ["search"], ["read"], 0.0),
+            _alignment_trajectory("b", ["search", "write"], ["search", "read"], 0.75),
+            _alignment_trajectory("ok", ["search"], ["search"], 1.0),
+        ],
+        objective_scores=[],
+    )
+    child = GleanEvaluationBatch(
+        outputs=[],
+        scores=[],
+        trajectories=[
+            _alignment_trajectory("a", ["search"], ["search"], 1.0),
+            _alignment_trajectory("b", ["search", "write"], ["search", "read"], 0.75),
+        ],
+        objective_scores=[],
+        summary={"tool_alignment": 0.875},
+    )
+    assert adapter.high_signal_fix_rate(parent, child) == 0.5
+
+
+def test_prefix_k_graduates_after_val_from_stored_sequences():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.val_eval_versions = {"20260901", "20260902"}
+    seed = {"WRITING_CODE": "seed"}
+    child = {"WRITING_CODE": "child"}
+    matching = [(("search",), ("search",))] * 8
+    almost = [(("search",), ("search",))] * 5 + [(("search",), ("write",))] * 3
+    adapter._val_prefix_sequences[adapter._candidate_key(seed)] = {"20260901": matching, "20260902": matching}
+    adapter._val_prefix_sequences[adapter._candidate_key(child)] = {"20260901": matching, "20260902": matching}
+    adapter._last_train_low_alignment_count = 40
+
+    assert adapter.pooled_val_prefix_match_rate(seed) == 1.0
+    assert not adapter.maybe_graduate_prefix_k(iteration=1, candidates=[seed, child])
+    assert adapter.prefix_k == 1
+    assert adapter.maybe_graduate_prefix_k(iteration=2, candidates=[seed, child])
+    assert adapter.prefix_k == 2
+
+    adapter._val_prefix_sequences[adapter._candidate_key(seed)] = {"20260901": almost, "20260902": almost}
+    adapter._val_prefix_sequences[adapter._candidate_key(child)] = {"20260901": almost, "20260902": almost}
+    adapter._last_train_low_alignment_count = 40
+    assert not adapter.maybe_graduate_prefix_k(iteration=3, candidates=[seed, child])
+    adapter._last_train_low_alignment_count = 19
+    assert adapter.maybe_graduate_prefix_k(iteration=3, candidates=[seed, child])
+    assert adapter.prefix_k == 3

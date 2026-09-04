@@ -120,33 +120,43 @@ def format_eval_entry_report(trajectories: Sequence[Mapping[str, Any]] | None) -
 
 def format_high_signal_selection_report(
     *,
-    selected_groups: Sequence[tuple[str, str, int]],
+    selected_groups: Sequence[tuple[int, str, str, int] | tuple[str, str, int]],
     selected_entry_ids: Sequence[str],
     selected_count: int,
     total_mismatch_count: int,
     module_entry_ids: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
-    """Explain which first-tool mismatch groups made the reflection set."""
+    """Explain which first-disagreement clusters made the reflection set."""
     lines = [
-        "Justification: most-frequent first-tool mismatch groups.",
+        "Justification: largest first-disagreement clusters among low-alignment rows.",
         f"The most frequent group is always included in full, even if it exceeds "
         f"{REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT} entries. Later whole groups are added only while they "
-        f"still fit in that cap. Shell / Personal Knowledge Vault Retrieve are stripped before the "
-        f"first-tool comparison.",
-        f"Selected {selected_count} of {total_mismatch_count} first-tool mismatch entries "
+        f"still fit in that cap. Consecutive duplicate tools are collapsed, and Shell / Personal "
+        f"Knowledge Vault Retrieve are stripped, before comparing prefixes.",
+        f"Selected {selected_count} of {total_mismatch_count} low-alignment entries "
         f"(cap {REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT}).",
         "",
         "Groups (most frequent first):",
     ]
     if not selected_groups:
-        lines.append("  (none — every compared entry already matched on first tool)")
-    for index, (teacher_tool, student_tool, count) in enumerate(selected_groups, start=1):
-        lines.append(f"  {index}. teacher={teacher_tool or '(none)'}  student={student_tool or '(none)'}  n={count}")
+        lines.append("  (none — every compared entry already matched the current tool prefix)")
+    for index, group in enumerate(selected_groups, start=1):
+        if len(group) == 4:
+            slot, teacher_tool, student_tool, count = group
+        else:
+            teacher_tool, student_tool, count = group
+            slot = 0
+        lines.append(
+            f"  {index}. slot={int(slot) + 1}  teacher={teacher_tool or '(none)'}  "
+            f"student={student_tool or '(none)'}  n={count}"
+        )
     lines.append("")
     lines.append("Selected entry_ids: " + (", ".join(selected_entry_ids) if selected_entry_ids else "(none)"))
     if module_entry_ids:
         lines.append("")
-        lines.append("Per-module reflection examples (core-tool modules keep only mismatches involving that tool):")
+        lines.append(
+            "Per-module reflection examples (core-tool modules keep only rows whose k-prefix includes that tool):"
+        )
         for module, entry_ids in module_entry_ids.items():
             lines.append(f"  {module}: {', '.join(entry_ids) if entry_ids else '(none)'}")
     return "\n".join(lines)

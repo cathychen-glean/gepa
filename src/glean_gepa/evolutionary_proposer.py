@@ -34,7 +34,7 @@ from glean_gepa.prompt import PROMPT_MODULE_DEFAULTS
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
 
-CHILDREN_CACHE_SCHEMA_VERSION = 6
+CHILDREN_CACHE_SCHEMA_VERSION = 7
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 1 / 3
 
 
@@ -45,6 +45,7 @@ class ChildCacheRecord:
     eval_run_ids: list[EvalRunIds] = field(default_factory=list)
     screening_score: float | None = None
     screening_passed: bool | None = None
+    prefix_k: int = 1
 
 
 # TODO(Cathy): pick modules based on holistic performance of the eval
@@ -54,15 +55,19 @@ def pick_modules_to_edit(
 ) -> list[str]:
     """Return modules the proposer should rewrite this generation.
 
-    Non-core modules listed in ``editable_modules`` are always rewritten.
-    Core-tool descriptions are eligible only when listed, and the proposer
-    only rewrites those that appear in the high-signal first-tool mismatch set.
+    Non-core modules listed in ``editable_modules`` (including ``RULES_EXT``) are
+    always rewritten. Core-tool descriptions are eligible only when listed, and
+    the proposer only rewrites those that appear in the high-signal k-prefix.
     """
     eligible = list(adapter.editable_modules)
     modules = [module for module in eligible if module not in CORE_TOOL_KEYS]
+    prefix_k = int(getattr(adapter, "prefix_k", 1) or 1)
     extra = [
         key
-        for key in high_signal_core_tool_keys(eval_batch.trajectories if eval_batch is not None else None)
+        for key in high_signal_core_tool_keys(
+            eval_batch.trajectories if eval_batch is not None else None,
+            prefix_k=prefix_k,
+        )
         if key in eligible
     ]
     modules.extend(key for key in extra if key not in modules)
@@ -317,6 +322,7 @@ class EvolutionaryProposer:
         # Both are scoped by training slice, root candidate, and child ID.
         self._child_cache_records_by_train_slice: dict[tuple[Any, ...], dict[str, dict[str, ChildCacheRecord]]] = {}
         self._root_screening_scores_by_train_slice: dict[tuple[Any, ...], dict[str, float]] = {}
+        self._slice_prefix_k: dict[tuple[Any, ...], int] = {}
         self.children_cache_file = Path(children_cache_file).expanduser() if children_cache_file else None
         self._load_children_cache()
 
@@ -344,13 +350,14 @@ class EvolutionaryProposer:
             if not isinstance(data, dict):
                 raise ValueError("child cache root must be a JSON object")
             schema_version = data.get("schema_version")
-            if schema_version not in (1, 2, 3, CHILDREN_CACHE_SCHEMA_VERSION):
+            if schema_version not in (1, 2, 3, 6, CHILDREN_CACHE_SCHEMA_VERSION):
                 print(f"[Child cache] Ignoring unsupported cache schema in {self.children_cache_file}")
                 return
 
             restored: dict[tuple[Any, ...], dict[str, list[Candidate]]] = {}
             restored_records: dict[tuple[Any, ...], dict[str, dict[str, ChildCacheRecord]]] = {}
             restored_root_scores: dict[tuple[Any, ...], dict[str, float]] = {}
+            restored_slice_k: dict[tuple[Any, ...], int] = {}
             for entry in data.get("training_slices", []):
                 train_ids = tuple(entry["train_ids"])
                 roots: dict[str, list[Candidate]] = {}
@@ -372,19 +379,23 @@ class EvolutionaryProposer:
                             eval_run_ids=list(child_record.get("eval_run_ids", [])),
                             screening_score=child_record.get("screening_score"),
                             screening_passed=child_record.get("screening_passed"),
+                            prefix_k=int(child_record.get("prefix_k") or entry.get("prefix_k") or 1),
                         )
                 restored[train_ids] = roots
                 restored_records[train_ids] = records_by_root
                 restored_root_scores[train_ids] = root_scores
+                restored_slice_k[train_ids] = int(entry.get("prefix_k") or 1)
             self._children_by_root_by_train_slice = restored
             self._child_cache_records_by_train_slice = restored_records
             self._root_screening_scores_by_train_slice = restored_root_scores
+            self._slice_prefix_k = restored_slice_k
             print(f"[Child cache] Loaded {sum(len(roots) for roots in restored.values())} root entries")
         except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
             print(f"[Child cache] Failed to load {self.children_cache_file}: {exc}")
             self._children_by_root_by_train_slice = {}
             self._child_cache_records_by_train_slice = {}
             self._root_screening_scores_by_train_slice = {}
+            self._slice_prefix_k = {}
 
     def _save_children_cache(self) -> None:
         """Atomically persist generated children, including cached empty results."""
@@ -395,6 +406,7 @@ class EvolutionaryProposer:
             "training_slices": [
                 {
                     "train_ids": list(train_ids),
+                    "prefix_k": self._slice_prefix_k.get(train_ids, int(getattr(self.al_adapter, "prefix_k", 1) or 1)),
                     "root_screening_scores": self._root_screening_scores_by_train_slice.get(train_ids, {}),
                     "roots": {
                         root_id: [
@@ -412,6 +424,10 @@ class EvolutionaryProposer:
                                 .get(root_id, {})
                                 .get(child.candidate_id, ChildCacheRecord())
                                 .screening_passed,
+                                "prefix_k": self._child_cache_records_by_train_slice.get(train_ids, {})
+                                .get(root_id, {})
+                                .get(child.candidate_id, ChildCacheRecord())
+                                .prefix_k,
                             }
                             for child in children
                         ]
@@ -484,7 +500,7 @@ class EvolutionaryProposer:
         cached: list[tuple[float, bool]] = []
         for child in children:
             record = self._child_cache_record(train_ids, child)
-            if record.screening_score is None:
+            if record.screening_score is None or record.prefix_k != self._adapter_prefix_k():
                 return None
             passed = not use_high_signal_gate or record.screening_score >= high_signal_screen_threshold
             cached.append((record.screening_score, passed))
@@ -500,20 +516,82 @@ class EvolutionaryProposer:
         record = self._child_cache_record(train_ids, child)
         record.screening_score = screening_score
         record.screening_passed = screening_passed
+        record.prefix_k = self._adapter_prefix_k()
+        self._slice_prefix_k[train_ids] = record.prefix_k
+
+    def _adapter_prefix_k(self) -> int:
+        return max(1, int(getattr(self.al_adapter, "prefix_k", 1) or 1))
 
     def _cached_root_screening_score(self, train_ids: tuple[Any, ...], root_id: str) -> float | None:
         """Return a cached root score only when this root has a child-cache entry."""
         if root_id not in self._children_by_root_by_train_slice.get(train_ids, {}):
             return None
+        if self._slice_prefix_k.get(train_ids, 1) != self._adapter_prefix_k():
+            return None
         return self._root_screening_scores_by_train_slice.get(train_ids, {}).get(root_id)
 
     def _record_root_screening_score(self, train_ids: tuple[Any, ...], root_id: str, score: float) -> None:
         self._root_screening_scores_by_train_slice.setdefault(train_ids, {})[root_id] = score
+        self._slice_prefix_k[train_ids] = self._adapter_prefix_k()
 
     def _placeholder_evaluation(self, screening_score: float) -> GleanEvaluationBatch:
         """Build the minimal evaluation shape needed while replaying a cached root."""
         objective = getattr(self.al_adapter, "primary_objective", "screening_score")
         return GleanEvaluationBatch(outputs=[], scores=[], trajectories=None, summary={objective: screening_score})
+
+    def _program_key(self, program: dict[str, str]) -> str:
+        """Canonical prompt-module fingerprint used to detect duplicate candidates."""
+        return json.dumps(self._to_candidate(program).prompt_modules, sort_keys=True)
+
+    def _child_is_pending(
+        self,
+        train_ids: tuple[Any, ...],
+        child: Candidate,
+        existing_keys: set[str],
+    ) -> bool:
+        """True when this child still needs screening or has not yet entered the pool."""
+        if self._program_key(child.prompt_modules) in existing_keys:
+            return False
+        record = self._child_cache_record(train_ids, child)
+        if record.screening_score is None or record.prefix_k != self._adapter_prefix_k():
+            return True
+        use_high_signal_gate = getattr(self.al_adapter, "supports_high_signal_eval", False)
+        passed = not use_high_signal_gate or record.screening_score >= self.high_signal_screen_threshold
+        return passed
+
+    def _slice_is_exhausted(self, train_ids: tuple[Any, ...], existing_keys: set[str]) -> bool:
+        """True when every cached child on this slice is failed or already in the pool."""
+        roots = self._children_by_root_by_train_slice.get(train_ids)
+        if roots is None:
+            return False
+        children = [child for group in roots.values() for child in group]
+        if not children:
+            return True
+        return not any(self._child_is_pending(train_ids, child, existing_keys) for child in children)
+
+    def _select_train_ids(self, existing_keys: set[str], *, iteration: int) -> list[Any] | None:
+        """Pick the next training slice, retrying in-flight work instead of replaying finished slices."""
+        if self.evalset_policy is None:
+            return list(self.trainset.all_ids())
+
+        for example_id in self.trainset.all_ids():
+            train_ids = (example_id,)
+            if train_ids in self._children_by_root_by_train_slice and not self._slice_is_exhausted(
+                train_ids, existing_keys
+            ):
+                print(f"[Eval set schedule] reflection and offspring screening: reusing in-flight id {example_id}")
+                return [example_id]
+
+        ordered = list(self.trainset.all_ids())
+        exhausted_prefix = 0
+        while exhausted_prefix < len(ordered) and self._slice_is_exhausted((ordered[exhausted_prefix],), existing_keys):
+            exhausted_prefix += 1
+        self.evalset_policy.sync_next_index(self.trainset, exhausted_prefix)
+        try:
+            return self.evalset_policy.take_unseen(self.trainset, purpose="reflection and offspring screening")
+        except RuntimeError as exc:
+            self.logger.log(f"Iteration {iteration}: Training eval schedule exhausted; stopping proposals ({exc})")
+            return None
 
     def _to_candidate(self, program: dict[str, str], parent_id: str | None = None) -> Candidate:
         """Convert a GEPA program into adapter-editable Glean prompt modules."""
@@ -536,6 +614,9 @@ class EvolutionaryProposer:
 
     def propose(self, state: GEPAState) -> list[CandidateProposal]:
         i = self.get_display_iteration(state)
+        graduate = getattr(self.al_adapter, "maybe_graduate_prefix_k", None)
+        if callable(graduate):
+            graduate(iteration=state.i, candidates=list(state.program_candidates))
 
         # 1. Get frontier program indices from Pareto front
         front_mapping = state.get_pareto_front_mapping()
@@ -550,21 +631,50 @@ class EvolutionaryProposer:
         else:
             self.logger.log(f"Iteration {i}: Found the following frontier programs {frontier_idxs_sorted}")
 
-        # 2. Reveal one fresh training slice for this generation. The same slice
-        # supplies failure evidence for reflection and the child-screening baseline,
-        # so each iteration learns from new train data rather than reusing val IDs.
-        if self.evalset_policy is not None:
-            try:
-                train_ids = self.evalset_policy.take_unseen(self.trainset, purpose="reflection and offspring screening")
-            except RuntimeError as exc:
-                self.logger.log(f"Iteration {i}: Training eval schedule exhausted; stopping proposals ({exc})")
+        existing_keys = {self._program_key(program) for program in state.program_candidates}
+        tried_slices: set[tuple[Any, ...]] = set()
+        while True:
+            # 2. Reveal one training slice for this generation. Resume retries an
+            # in-flight slice; finished slices whose passers are already in the
+            # pool are skipped so a restart cannot re-accept the same child.
+            train_ids = self._select_train_ids(existing_keys, iteration=i)
+            if train_ids is None:
                 return []
-            trace_batch = self.trainset.fetch(train_ids)
-        else:
-            train_ids = list(self.trainset.all_ids())
-            trace_batch = self._batch_data
-        train_slice_key = tuple(train_ids)
+            train_slice_key = tuple(train_ids)
+            if train_slice_key in tried_slices:
+                self.logger.log(
+                    f"Iteration {i}: Training slice {train_slice_key} already attempted; stopping proposals"
+                )
+                return []
+            tried_slices.add(train_slice_key)
+            if self.evalset_policy is not None:
+                trace_batch = self.trainset.fetch(train_ids)
+            else:
+                trace_batch = self._batch_data
+            proposals = self._propose_for_train_slice(
+                state=state,
+                iteration=i,
+                frontier_idxs_sorted=frontier_idxs_sorted,
+                train_ids=train_ids,
+                train_slice_key=train_slice_key,
+                trace_batch=trace_batch,
+                existing_keys=existing_keys,
+            )
+            if proposals is None:
+                continue
+            return proposals
 
+    def _propose_for_train_slice(
+        self,
+        state: GEPAState,
+        iteration: int,
+        frontier_idxs_sorted: list[int],
+        train_ids: list[Any],
+        train_slice_key: tuple[Any, ...],
+        trace_batch: list[Any],
+        existing_keys: set[str],
+    ) -> list[CandidateProposal] | None:
+        i = iteration
         # 3. Convert frontier programs to Candidate objects and reuse cached root scores when possible.
         frontier_candidates: list[Candidate] = []
         frontier_evals: dict[str, GleanEvaluationBatch] = {}
@@ -672,6 +782,9 @@ class EvolutionaryProposer:
                         self.al_adapter.get_screening_score(parent_eval),
                     )
                 high_signal_batch = self.al_adapter.high_signal_batch(parent_eval)
+                record_train = getattr(self.al_adapter, "record_train_low_alignment_count", None)
+                if callable(record_train):
+                    record_train(parent_eval)
                 if not high_signal_batch:
                     self.logger.log(f"Iteration {i}: Parent has no high-signal failures; rejecting children")
                     return []
@@ -738,7 +851,6 @@ class EvolutionaryProposer:
                 rows=screening_rows,
             ),
         )
-        best_child_score = max((score for _child, _eval, score in screened_children), default=float("-inf"))
 
         if not screened_children:
             if use_high_signal_gate:
@@ -751,6 +863,18 @@ class EvolutionaryProposer:
                 self.logger.log(f"Iteration {i}: No children completed screening")
             return []
 
+        pending_children = [
+            (child, screen_eval, score)
+            for child, screen_eval, score in screened_children
+            if self._program_key(child.prompt_modules) not in existing_keys
+        ]
+        if not pending_children:
+            self.logger.log(
+                f"Iteration {i}: All {len(screened_children)} passing children are already in the "
+                "candidate pool; trying the next training slice"
+            )
+            return None
+
         # 7. The engine runs selected children on the full eval set. A
         # high-signal score is a rate over the parent's errors, so it is not
         # comparable to the parent's overall screening score. Treat it as a
@@ -759,12 +883,13 @@ class EvolutionaryProposer:
         # parent-vs-child score comparison.
         subsample_ids = train_ids
         parent_score = self.al_adapter.get_screening_score(parent_eval)
+        best_child_score = max(score for _child, _eval, score in pending_children)
         child_score = best_child_score
         proposal_score_before = 0.0 if use_high_signal_gate else parent_score
 
         self.logger.log(
             f"Iteration {i}: Evolutionary proposer generated {len(children)} children, "
-            f"{len(valid_children)} passed budget, {len(screened_children)} passed screening. "
+            f"{len(valid_children)} passed budget, {len(pending_children)} passed screening. "
             f"Best screening score={best_child_score:.3f}"
         )
         self.experiment_tracker.log_metrics(
@@ -773,7 +898,7 @@ class EvolutionaryProposer:
                 "evolutionary_child_eval_score": child_score,
                 "evolutionary_children_generated": len(children),
                 "evolutionary_children_valid": len(valid_children),
-                "evolutionary_children_screened_in": len(screened_children),
+                "evolutionary_children_screened_in": len(pending_children),
                 "total_metric_calls": state.total_num_evals,
             },
             step=i,
@@ -793,5 +918,5 @@ class EvolutionaryProposer:
                     "screening_threshold": HIGH_SIGNAL_FIX_RATE_THRESHOLD if use_high_signal_gate else None,
                 },
             )
-            for child, _screen_eval, screen_score in screened_children
+            for child, _screen_eval, screen_score in pending_children
         ]

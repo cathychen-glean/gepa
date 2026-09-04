@@ -36,13 +36,13 @@ def test_format_run_log_reports():
     assert "completeness=0.80" in report
 
     high_signal = format_high_signal_selection_report(
-        selected_groups=[("Glean Search", "Discover", 12), ("Glean Document Reader", "todo_write", 8)],
+        selected_groups=[(0, "Glean Search", "Discover", 12), (0, "Glean Document Reader", "todo_write", 8)],
         selected_entry_ids=["e1", "e2"],
         selected_count=20,
         total_mismatch_count=31,
         module_entry_ids={"glean_search": ["e1"], "FULL_PROMPT": ["e1", "e2"]},
     )
-    assert "most-frequent first-tool mismatch groups" in high_signal
+    assert "largest first-disagreement clusters" in high_signal
     assert "teacher=Glean Search  student=Discover  n=12" in high_signal
     assert "Selected entry_ids: e1, e2" in high_signal
     assert "glean_search: e1" in high_signal

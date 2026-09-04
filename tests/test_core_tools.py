@@ -10,11 +10,13 @@ from glean_gepa.core_tools import (
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     compile_tool_description_overrides,
     high_signal_core_tool_keys,
+    high_signal_has_non_core_mismatch_group,
+    is_core_tool_span,
     tool_description_override_key,
 )
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evolutionary_proposer import pick_modules_to_edit
-from glean_gepa.prompt import FULL_PROMPT_KEY, compile_encoded_prompt
+from glean_gepa.prompt import FULL_PROMPT_KEY, RULES_EXT_KEY, compile_encoded_prompt
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
 
@@ -87,6 +89,44 @@ def test_high_signal_core_tool_keys():
     assert high_signal_core_tool_keys(shell_only) == ["glean_search"]
     assert high_signal_core_tool_keys([object()]) == []
 
+    second_slot = [
+        {
+            "output": {
+                "teacher_tool_events": ["Glean Search", "Write"],
+                "student_tool_events": ["Glean Search", "Discover"],
+            }
+        }
+    ]
+    assert high_signal_core_tool_keys(second_slot, prefix_k=1) == []
+    assert high_signal_core_tool_keys(second_slot, prefix_k=2) == ["glean_search", "discover"]
+
+
+def test_is_core_tool_span_and_non_core_mismatch_groups():
+    assert is_core_tool_span("Glean Search")
+    assert is_core_tool_span("todo_write")
+    assert not is_core_tool_span("Write")
+    assert not is_core_tool_span("")
+    write_none = [
+        {
+            "output": {
+                "teacher_tool_events": ["Write"],
+                "student_tool_events": [],
+            }
+        }
+    ]
+    search_discover = [
+        {
+            "output": {
+                "teacher_tool_events": ["Glean Search"],
+                "student_tool_events": ["Discover"],
+            }
+        }
+    ]
+    assert high_signal_has_non_core_mismatch_group(write_none)
+    assert high_signal_core_tool_keys(write_none) == []
+    assert not high_signal_has_non_core_mismatch_group(search_discover)
+    assert not high_signal_has_non_core_mismatch_group(None)
+
 
 def test_pick_modules_to_edit_rewrites_only_eligible_high_signal_core_tools():
     runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
@@ -120,6 +160,33 @@ def test_pick_modules_to_edit_rewrites_only_eligible_high_signal_core_tools():
     assert pick_modules_to_edit(core_tools, eval_batch) == ["glean_search", "discover"]
     assert pick_modules_to_edit(both, eval_batch) == [FULL_PROMPT_KEY, "glean_search", "discover"]
     assert pick_modules_to_edit(search_only, eval_batch) == ["glean_search"]
+
+
+def test_pick_modules_to_edit_always_includes_listed_rules_ext():
+    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
+    kwargs = {
+        "runner": runner,
+        "teacher_model": "gpt",
+        "student_model": "fast",
+        "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    }
+    search_discover = GleanEvaluationBatch(
+        outputs=[],
+        scores=[],
+        trajectories=[
+            {
+                "output": {"teacher_tool_events": ["Glean Search"], "student_tool_events": ["Discover"]},
+                "score": 0.0,
+            }
+        ],
+    )
+    rules_and_core = TeacherStudentAdapter(**kwargs, editable_modules=[*CORE_TOOLS, RULES_EXT_KEY])
+    rules_only = TeacherStudentAdapter(**kwargs, editable_modules=[RULES_EXT_KEY])
+
+    assert pick_modules_to_edit(rules_and_core) == [RULES_EXT_KEY]
+    assert pick_modules_to_edit(rules_and_core, search_discover) == [RULES_EXT_KEY, "glean_search", "discover"]
+    assert pick_modules_to_edit(rules_only) == [RULES_EXT_KEY]
+    assert pick_modules_to_edit(rules_only, search_discover) == [RULES_EXT_KEY]
 
 
 def test_total_prompt_tokens_excludes_core_tool_descriptions():

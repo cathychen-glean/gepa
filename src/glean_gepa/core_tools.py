@@ -14,7 +14,12 @@ from base64 import urlsafe_b64encode
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from glean_gepa.tool_match_util import first_tool_mismatch_pair, select_first_tool_mismatch_groups
+from glean_gepa.tool_match_util import (
+    first_disagreeing_mismatch,
+    prefix_tools,
+    select_first_tool_mismatch_groups,
+    tool_prefix_alignment,
+)
 
 CORE_TOOLS = (
     "glean_search",
@@ -116,6 +121,11 @@ def tool_description_override_key(span_name: str) -> str:
     return sanitized
 
 
+def is_core_tool_span(span_name: str) -> bool:
+    """True when an Execute Action span maps to an editable core-tool description."""
+    return bool(span_name) and tool_description_override_key(span_name) in CORE_TOOL_KEYS
+
+
 def with_core_tool_defaults(prompt_modules: Mapping[str, str]) -> dict[str, str]:
     """Copy ``prompt_modules`` and fill any missing core-tool descriptions from stock text."""
     merged = dict(prompt_modules)
@@ -124,25 +134,57 @@ def with_core_tool_defaults(prompt_modules: Mapping[str, str]) -> dict[str, str]
     return merged
 
 
-def high_signal_core_tool_keys(trajectories: Sequence[Any] | None) -> list[str]:
-    """Core-tool keys that appear in the reflection high-signal first-tool mismatch groups."""
-    mismatch_keys: list[tuple[str, str] | None] = []
+def _high_signal_mismatch_groups(
+    trajectories: Sequence[Any] | None,
+    *,
+    prefix_k: int = 1,
+) -> tuple[list[int], list[tuple[int, str, str, int]]]:
+    mismatch_keys: list[tuple[int, str, str] | None] = []
     for trajectory in trajectories or []:
         output = trajectory.get("output") if isinstance(trajectory, Mapping) else None
         if not isinstance(output, Mapping):
             mismatch_keys.append(None)
             continue
-        mismatch_keys.append(
-            first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-        )
-    _indices, groups = select_first_tool_mismatch_groups(mismatch_keys)
+        teacher_tools = output.get("teacher_tool_events")
+        student_tools = output.get("student_tool_events")
+        alignment = tool_prefix_alignment(teacher_tools, student_tools, prefix_k)
+        if alignment >= 1.0:
+            mismatch_keys.append(None)
+            continue
+        mismatch_keys.append(first_disagreeing_mismatch(teacher_tools, student_tools, prefix_k))
+    return select_first_tool_mismatch_groups(mismatch_keys)
+
+
+def high_signal_core_tool_keys(trajectories: Sequence[Any] | None, *, prefix_k: int = 1) -> list[str]:
+    """Core-tool keys that appear in the k-prefix of selected high-signal rows."""
+    selected_indices, _groups = _high_signal_mismatch_groups(trajectories, prefix_k=prefix_k)
     found: list[str] = []
-    for teacher_tool, student_tool, _count in groups:
-        for name in (teacher_tool, student_tool):
+    for index in selected_indices:
+        trajectory = (trajectories or [])[index]
+        output = trajectory.get("output") if isinstance(trajectory, Mapping) else None
+        if not isinstance(output, Mapping):
+            continue
+        names = (
+            *prefix_tools(output.get("teacher_tool_events"), prefix_k),
+            *prefix_tools(output.get("student_tool_events"), prefix_k),
+        )
+        for name in names:
             key = tool_description_override_key(name)
             if key in CORE_TOOL_KEYS and key not in found:
                 found.append(key)
     return found
+
+
+def high_signal_has_non_core_mismatch_group(trajectories: Sequence[Any] | None, *, prefix_k: int = 1) -> bool:
+    """True when a selected high-signal group has no core tool on either side of the miss.
+
+    ``Write`` vs ``(none)`` is the typical case: neither maps to ``CORE_TOOLS``.
+    """
+    _indices, groups = _high_signal_mismatch_groups(trajectories, prefix_k=prefix_k)
+    return any(
+        not is_core_tool_span(teacher_tool) and not is_core_tool_span(student_tool)
+        for _slot, teacher_tool, student_tool, _count in groups
+    )
 
 
 def compile_tool_description_overrides(candidate: Mapping[str, str]) -> str:
@@ -168,6 +210,6 @@ def core_tool_reflection_prompt(module_name: str) -> str:
     return (
         f"You are editing only the prompt-visible schema.description for the core tool `{module_name}`. "
         "The override replaces description text only — not the tool signature, parameters, or Returns. "
-        "Rewrite the description so the student uses this tool as the first action when the teacher does, "
-        "and does not use it first when the teacher chooses a different tool. Keep the text operational and concise."
+        "Rewrite the description so the student uses this tool in the same scored prefix as the teacher, "
+        "and does not use it in that prefix when the teacher chooses a different tool. Keep the text operational and concise."
     )

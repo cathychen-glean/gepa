@@ -14,9 +14,13 @@ from glean_gepa.shell_tool_error_util import (
     QueryParameter,
     default_date_range,
     resolve_eval_run_date_range,
+    wildcard_shard_filter,
 )
 
 REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT = 20
+PREFIX_K_GRADUATION_RATE = 0.75
+PREFIX_K_TOP_CANDIDATES = 2
+PREFIX_K_SHORTAGE_ENTRIES = 20
 SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool"})
 _EXECUTE_ACTION_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
@@ -65,8 +69,7 @@ SELECT
   MIN(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS min_start_ms,
   MAX(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS max_start_ms
 FROM `{agentspan_table}`
-WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-  BETWEEN @search_start_date AND @search_end_date
+WHERE {wildcard_shard_filter("search_start_date", "search_end_date")}
   AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
   AND {_EXECUTE_ACTION_FILTER}
 """.strip()
@@ -76,7 +79,13 @@ def build_tool_match_per_entry_query(
     *,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
-    """Build SQL that pairs teacher and student tool sequences per eval entry."""
+    """Build SQL that pairs teacher and student tool sequences per eval entry.
+
+    The teacher side is the denominator: every teacher entry is kept, and a
+    missing student run is an empty tool list (a mismatch). Student-only
+    extras are dropped so every child compared to the same teacher uses the
+    same entry set.
+    """
     skipped = ", ".join(f"'{name}'" for name in sorted(SKIPPED_TOOL_NAMES))
     return f"""
 WITH tool_spans AS (
@@ -89,8 +98,7 @@ WITH tool_spans AS (
     REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') AS tool_name,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{agentspan_table}`
-  WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-    BETWEEN @start_date AND @end_date
+  WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
     AND {_EXECUTE_ACTION_FILTER}
     AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN ({skipped})
@@ -111,11 +119,11 @@ teacher AS (
   SELECT entry_id, tools FROM per_role WHERE eval_id = @teacher_eval_id
 )
 SELECT
-  COALESCE(student.entry_id, teacher.entry_id) AS entry_id,
+  teacher.entry_id AS entry_id,
   IFNULL(student.tools, ARRAY<STRING>[]) AS student_tools,
-  IFNULL(teacher.tools, ARRAY<STRING>[]) AS teacher_tools
-FROM student
-FULL OUTER JOIN teacher
+  teacher.tools AS teacher_tools
+FROM teacher
+LEFT JOIN student
   ON student.entry_id = teacher.entry_id
 ORDER BY entry_id
 """.strip()
@@ -126,10 +134,100 @@ def scored_tool_sequence(tools: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(str(name) for name in (tools or []) if name and str(name) not in SKIPPED_TOOL_NAMES)
 
 
+def collapse_consecutive_tools(tools: Sequence[str]) -> tuple[str, ...]:
+    """Collapse adjacent duplicate tool names. ``[Write, Search, Write]`` stays three steps."""
+    collapsed: list[str] = []
+    for name in tools:
+        if not collapsed or collapsed[-1] != name:
+            collapsed.append(name)
+    return tuple(collapsed)
+
+
+def match_tool_sequence(tools: Sequence[str] | None) -> tuple[str, ...]:
+    """Strip skipped tools, then collapse consecutive duplicates."""
+    return collapse_consecutive_tools(scored_tool_sequence(tools))
+
+
+def prefix_slot_weights(prefix_k: int) -> tuple[float, ...]:
+    """Return unnormalized slot weights for a prefix of length ``prefix_k``."""
+    if prefix_k < 1:
+        raise ValueError("prefix_k must be >= 1")
+    if prefix_k == 1:
+        return (1.0,)
+    if prefix_k == 2:
+        return (0.75, 0.25)
+    later = 0.5 / (prefix_k - 1)
+    return (0.5,) + (later,) * (prefix_k - 1)
+
+
+def tool_prefix_alignment(
+    teacher_tools: Sequence[str] | None,
+    student_tools: Sequence[str] | None,
+    prefix_k: int = 1,
+) -> float:
+    """Weighted prefix alignment after consecutive-run collapse.
+
+    Slots past both sequence lengths are skipped and remaining weights are
+    renormalized. A miss at slot i zeros later slots. Matching every tool that
+    exists scores 1.0.
+    """
+    if prefix_k < 1:
+        raise ValueError("prefix_k must be >= 1")
+    teacher = match_tool_sequence(teacher_tools)
+    student = match_tool_sequence(student_tools)
+    weights = prefix_slot_weights(prefix_k)
+    used_weights: list[float] = []
+    used_matches: list[float] = []
+    for index in range(prefix_k):
+        teacher_has = index < len(teacher)
+        student_has = index < len(student)
+        if not teacher_has and not student_has:
+            continue
+        matched = teacher_has and student_has and teacher[index] == student[index]
+        used_weights.append(weights[index])
+        used_matches.append(1.0 if matched else 0.0)
+        if not matched:
+            break
+    if not used_weights:
+        return 1.0
+    return sum(match * weight for match, weight in zip(used_matches, used_weights, strict=True)) / sum(used_weights)
+
+
+def exact_prefix_match(
+    teacher_tools: Sequence[str] | None,
+    student_tools: Sequence[str] | None,
+    prefix_k: int = 1,
+) -> bool:
+    """True when every scored prefix slot that exists matches."""
+    return tool_prefix_alignment(teacher_tools, student_tools, prefix_k) >= 1.0
+
+
 def first_tool_name(tools: Sequence[str] | None) -> str:
     """Return the first scored tool name, or an empty string when none remain."""
-    scored = scored_tool_sequence(tools)
+    scored = match_tool_sequence(tools)
     return scored[0] if scored else ""
+
+
+def first_disagreeing_mismatch(
+    teacher_tools: Sequence[str] | None,
+    student_tools: Sequence[str] | None,
+    prefix_k: int = 1,
+) -> tuple[int, str, str] | None:
+    """Return ``(0-based slot, teacher_tool, student_tool)`` at the first prefix miss."""
+    if prefix_k < 1:
+        raise ValueError("prefix_k must be >= 1")
+    teacher = match_tool_sequence(teacher_tools)
+    student = match_tool_sequence(student_tools)
+    for index in range(prefix_k):
+        teacher_has = index < len(teacher)
+        student_has = index < len(student)
+        if not teacher_has and not student_has:
+            continue
+        teacher_name = teacher[index] if teacher_has else ""
+        student_name = student[index] if student_has else ""
+        if teacher_name != student_name:
+            return (index, teacher_name, student_name)
+    return None
 
 
 def first_tool_mismatch_pair(
@@ -137,43 +235,60 @@ def first_tool_mismatch_pair(
     student_tools: Sequence[str] | None,
 ) -> tuple[str, str] | None:
     """Return ``(teacher_first, student_first)`` when they differ, else ``None``."""
-    teacher = first_tool_name(teacher_tools)
-    student = first_tool_name(student_tools)
-    if teacher == student:
+    mismatch = first_disagreeing_mismatch(teacher_tools, student_tools, prefix_k=1)
+    if mismatch is None:
         return None
-    return (teacher, student)
+    return (mismatch[1], mismatch[2])
+
+
+def prefix_tools(
+    tools: Sequence[str] | None,
+    prefix_k: int,
+) -> tuple[str, ...]:
+    """Return the collapsed tool prefix of length ``prefix_k``."""
+    if prefix_k < 1:
+        return ()
+    return match_tool_sequence(tools)[:prefix_k]
 
 
 def select_first_tool_mismatch_groups(
-    mismatch_keys: Sequence[tuple[str, str] | None],
+    mismatch_keys: Sequence[tuple[int, str, str] | tuple[str, str] | None],
     *,
     max_entries: int = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
-) -> tuple[list[int], list[tuple[str, str, int]]]:
-    """Select first-tool mismatch indices by descending ``(teacher, student)`` frequency.
+) -> tuple[list[int], list[tuple[int, str, str, int]]]:
+    """Select low-alignment rows by descending first-disagreement frequency.
 
-    The most frequent group is always included in full, even when it exceeds
-    ``max_entries``. Later whole groups are added while they still fit in the
-    cap; groups that would overflow are skipped so later smaller groups can
-    still be included.
+    Keys are ``(slot, teacher_tool, student_tool)``. A 2-tuple
+    ``(teacher_tool, student_tool)`` is treated as slot 0. The most frequent
+    group is always included in full, even when it exceeds ``max_entries``.
+    Later whole groups are added while they still fit in the cap; groups that
+    would overflow are skipped so later smaller groups can still be included.
 
     Returns ``(selected_indices, selected_groups)`` where each group is
-    ``(teacher_tool, student_tool, taken_count)``.
+    ``(slot, teacher_tool, student_tool, taken_count)``.
     """
     if max_entries < 0:
         raise ValueError("max_entries must be non-negative")
-    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    groups: dict[tuple[int, str, str], list[int]] = defaultdict(list)
     for index, key in enumerate(mismatch_keys):
         if key is None:
             continue
-        groups[key].append(index)
-    ranked = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0], item[0][1]))
+        if len(key) == 2:
+            normalized = (0, key[0], key[1])
+        else:
+            normalized = (int(key[0]), str(key[1]), str(key[2]))
+        groups[normalized].append(index)
+    ranked = sorted(
+        groups.items(),
+        key=lambda item: (-len(item[1]), item[0][0], item[0][1], item[0][2]),
+    )
     selected: list[int] = []
-    selected_groups: list[tuple[str, str, int]] = []
-    for (teacher_tool, student_tool), indices in ranked:
+    selected_groups: list[tuple[int, str, str, int]] = []
+    for (slot, teacher_tool, student_tool), indices in ranked:
         if selected and len(selected) + len(indices) > max_entries:
             continue
         selected.extend(indices)
-        selected_groups.append((teacher_tool, student_tool, len(indices)))
+        selected_groups.append((slot, teacher_tool, student_tool, len(indices)))
         if len(selected) >= max_entries:
             break
     return selected, selected_groups
@@ -186,8 +301,37 @@ def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics
         entry_id=str(row.get("entry_id") or ""),
         student_tools=student_tools,
         teacher_tools=teacher_tools,
-        tools_match=(student_tools[:1] == teacher_tools[:1]),
+        tools_match=exact_prefix_match(teacher_tools, student_tools, prefix_k=1),
     )
+
+
+def restrict_tool_match_analysis(
+    analysis: EvalRunToolMatchAnalysis,
+    entry_ids: set[str],
+) -> EvalRunToolMatchAnalysis:
+    """Keep only ``entry_ids`` and recompute aggregate / high-signal fields."""
+    per_entry = {entry_id: metrics for entry_id, metrics in analysis.per_entry.items() if entry_id in entry_ids}
+    return EvalRunToolMatchAnalysis(
+        teacher_eval_id=analysis.teacher_eval_id,
+        student_eval_id=analysis.student_eval_id,
+        start_date=analysis.start_date,
+        end_date=analysis.end_date,
+        aggregate=aggregate_tool_match_metrics(analysis.teacher_eval_id, analysis.student_eval_id, per_entry),
+        per_entry=per_entry,
+        high_signal_entry_ids=tuple(
+            sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.tools_match)
+        ),
+    )
+
+
+def intersect_compared_entry_ids(analyses: Sequence[EvalRunToolMatchAnalysis]) -> set[str]:
+    """Return entry IDs present in every analysis, or empty when none are given."""
+    if not analyses:
+        return set()
+    shared = set(analyses[0].per_entry)
+    for analysis in analyses[1:]:
+        shared &= set(analysis.per_entry)
+    return shared
 
 
 def aggregate_tool_match_metrics(
@@ -235,28 +379,32 @@ def fetch_eval_run_tool_match_analysis(
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> EvalRunToolMatchAnalysis:
     search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
-    bounds_rows = client.query(
-        build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
-        params=[
-            QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
-            QueryParameter("search_start_date", "DATE", search_start.isoformat()),
-            QueryParameter("search_end_date", "DATE", search_end.isoformat()),
-        ],
-    )
-    date_range = resolve_eval_run_date_range(
-        bounds_rows[0] if bounds_rows else None,
-        lookback_days=lookback_days,
-        end_date=end_date,
-    )
-    if date_range is None:
-        return empty_tool_match_analysis(
-            teacher_eval_id,
-            student_eval_id,
+    # The default 1-day lookback is already two UTC shards. A bounds pre-scan
+    # reads the same jsonPayload days again and does not shrink the window.
+    if lookback_days <= 1:
+        start_date, resolved_end = search_start, search_end
+    else:
+        bounds_rows = client.query(
+            build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
+            params=[
+                QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
+                QueryParameter("search_start_date", "DATE", search_start.isoformat()),
+                QueryParameter("search_end_date", "DATE", search_end.isoformat()),
+            ],
+        )
+        date_range = resolve_eval_run_date_range(
+            bounds_rows[0] if bounds_rows else None,
             lookback_days=lookback_days,
             end_date=end_date,
         )
-
-    start_date, resolved_end = date_range
+        if date_range is None:
+            return empty_tool_match_analysis(
+                teacher_eval_id,
+                student_eval_id,
+                lookback_days=lookback_days,
+                end_date=end_date,
+            )
+        start_date, resolved_end = date_range
     per_entry_rows = client.query(
         build_tool_match_per_entry_query(agentspan_table=agentspan_table),
         params=[
