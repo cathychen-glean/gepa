@@ -1,3 +1,4 @@
+from hashlib import md5
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from glean_gepa.evalcli_client import EvalCliError
 from glean_gepa.focused_evalset import (
     DEFAULT_RUN_LABEL,
+    HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA,
     HIGH_SIGNAL_RUN_LABEL,
     QUERY_CANONICAL_BUCKET_TYPE,
     SESSION_BUCKET_TYPE,
@@ -35,6 +37,8 @@ def test_focused_eval_set_version_changes_with_bucket_type():
     session = focused_eval_set_version("v1", ids, bucket_type=SESSION_BUCKET_TYPE)
     query = focused_eval_set_version("v1", ids, bucket_type=QUERY_CANONICAL_BUCKET_TYPE)
     assert session != query
+    digest = md5(f"{HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA}:{','.join(sorted(ids))}".encode()).hexdigest()[:12]
+    assert session == f"v1_hs_{digest}"
 
 
 def test_build_upload_request_keeps_source_metadata():
@@ -77,22 +81,7 @@ def test_ensure_focused_eval_set_uploads_only_requested_entries():
     assert focused.entry_count == 1
 
 
-def test_build_upload_entry_rejects_session_rows_without_stt():
-    assert (
-        build_upload_entry(
-            {
-                "id": "keep",
-                "deploymentId": "prod",
-                "input": {"query": "hello"},
-                "sourceTrackingInfo": {"sessionTrackingToken": None, "traceId": None},
-            },
-            bucket_type=SESSION_BUCKET_TYPE,
-        )
-        is None
-    )
-
-
-def test_build_upload_entry_session_keeps_only_stt_identity():
+def test_build_upload_entry_session_keeps_source_identity_fields():
     entry = build_upload_entry(
         {
             "deploymentId": "prod",
@@ -109,9 +98,24 @@ def test_build_upload_entry_session_keeps_only_stt_identity():
     assert entry == {
         "deploymentId": "prod",
         "user": "spark",
+        "traceId": "eval-trace",
         "stt": "session-1",
+        "qtt": "qtt-1",
+        "runId": "orig-run",
         "query": "hello",
     }
+
+
+def test_build_upload_entry_session_allows_query_without_stt():
+    assert build_upload_entry(
+        {
+            "id": "keep",
+            "deploymentId": "prod",
+            "input": {"query": "hello"},
+            "sourceTrackingInfo": {"sessionTrackingToken": None, "traceId": None},
+        },
+        bucket_type=SESSION_BUCKET_TYPE,
+    ) == {"deploymentId": "prod", "query": "hello"}
 
 
 def test_build_upload_entry_query_canonical_is_fresh_query():
@@ -134,11 +138,11 @@ def test_build_upload_entry_query_canonical_rejects_rows_without_query():
     assert build_upload_entry({"deploymentId": "prod", "stt": "session-1"}) is None
 
 
-def test_ensure_focused_eval_set_does_not_upload_session_rows_without_stt():
+def test_ensure_focused_eval_set_does_not_upload_session_rows_without_identity():
     evalcli = MagicMock()
     evalcli.get_eval_set_version.return_value = None
     evalcli.list_eval_set_entries.return_value = [
-        {"id": "keep", "deploymentId": "prod", "input": {"query": "hello"}},
+        {"id": "keep", "deploymentId": "prod"},
     ]
 
     focused = ensure_focused_eval_set(
@@ -243,6 +247,7 @@ def test_ensure_focused_eval_set_fills_stt_from_bigquery_for_session_bucket():
             "deploymentId": "prod",
             "user": "spark",
             "stt": "session-1",
+            "runId": "run-1",
             "query": "hello",
         }
     ]
@@ -279,6 +284,8 @@ def test_ensure_focused_eval_set_uploads_resolved_trace_identifiers():
         {
             "deploymentId": "prod",
             "stt": "session-1",
+            "runId": "run-1",
+            "traceId": "trace-1",
         }
     ]
 

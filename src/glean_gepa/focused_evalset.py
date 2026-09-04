@@ -145,8 +145,16 @@ def focused_eval_set_version(
     *,
     bucket_type: str = DEFAULT_BUCKET_TYPE,
 ) -> str:
-    """Deterministic version so the same entry set is reused instead of re-uploaded."""
-    fingerprint = f"{bucket_type}:{HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA}:{','.join(sorted(entry_ids))}"
+    """Deterministic version so the same entry set is reused instead of re-uploaded.
+
+    SESSION keeps the original fingerprint so single-model reuses focused sets
+    uploaded before bucket type was part of the key. QUERY_CANONICAL is prefixed
+    so it cannot collide with those SESSION versions.
+    """
+    if bucket_type == SESSION_BUCKET_TYPE:
+        fingerprint = f"{HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA}:{','.join(sorted(entry_ids))}"
+    else:
+        fingerprint = f"{bucket_type}:{HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA}:{','.join(sorted(entry_ids))}"
     digest = hashlib.md5(fingerprint.encode()).hexdigest()[:12]
     return f"{base_eval_set_version}_hs_{digest}"
 
@@ -244,16 +252,6 @@ def build_upload_entry(
         "query": query,
     }
     entry.update({key: value for key, value in optional_fields.items() if value})
-    if bucket_type == SESSION_BUCKET_TYPE:
-        # QE session ingest treats runId/qtt as a session-event filter, not metadata.
-        # Chat V2 source rows store workflow_run_id, which is not a QTT, so a filter
-        # drops every row and the upload job publishes size 0. traceId is eval-run
-        # identity and is also not a source session.
-        entry.pop("traceId", None)
-        entry.pop("runId", None)
-        entry.pop("qtt", None)
-        if not entry.get("stt"):
-            return None
     return entry if any(entry.get(key) for key in ("traceId", "stt", "qtt", "query")) else None
 
 
@@ -465,6 +463,7 @@ __all__ = [
     "DEFAULT_RUN_LABEL",
     "EvalRunTarget",
     "FocusedEvalSet",
+    "HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA",
     "HIGH_SIGNAL_RUN_LABEL",
     "QUERY_CANONICAL_BUCKET_TYPE",
     "SESSION_BUCKET_TYPE",
