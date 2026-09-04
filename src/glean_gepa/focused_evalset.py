@@ -48,9 +48,11 @@ def prepare_high_signal_eval_batch(
     batch: Sequence[ALDataInst],
     *,
     bigquery_client: Any | None = None,
+    bucket_type: str = QUERY_CANONICAL_BUCKET_TYPE,
 ) -> list[ALDataInst] | None:
     """Upload/reuse focused eval sets once, before concurrent child screening.
 
+    Teacher-student uses ``QUERY_CANONICAL`` (fresh query, no session restore).
     Returns None if any focused set cannot be created so a candidate cannot
     silently fall back to the full eval set.
     """
@@ -66,6 +68,7 @@ def prepare_high_signal_eval_batch(
             base_eval_set_version=data["eval_set_version"],
             deployment_ids=list(data.get("deployment_ids") or []),
             entry_ids=entry_ids,
+            bucket_type=bucket_type,
             bigquery_client=bigquery_client,
         )
         if focused is None:
@@ -87,6 +90,7 @@ def resolve_eval_run_target(
     data: Mapping[str, Any],
     *,
     bigquery_client: Any | None = None,
+    bucket_type: str = QUERY_CANONICAL_BUCKET_TYPE,
 ) -> EvalRunTarget | None:
     """Return where to run this data inst. None if focused setup failed."""
     entry_ids = data.get("eval_entry_ids") or []
@@ -116,6 +120,7 @@ def resolve_eval_run_target(
         base_eval_set_version=eval_set_version,
         deployment_ids=list(data.get("deployment_ids") or []),
         entry_ids=entry_ids,
+        bucket_type=bucket_type,
         bigquery_client=bigquery_client,
     )
     if focused is None:

@@ -332,6 +332,7 @@ def test_prepare_high_signal_eval_batch_attaches_focused_set_or_fails():
         prepared = prepare_high_signal_eval_batch(MagicMock(), batch)
 
     ensure.assert_called_once()
+    assert ensure.call_args.kwargs["bucket_type"] == QUERY_CANONICAL_BUCKET_TYPE
     assert prepared is not None
     assert prepared[0]["eval_set_name"] == focused.name
     assert prepared[0]["eval_set_version"] == focused.version
@@ -366,6 +367,14 @@ def test_resolve_eval_run_target(data, ensure_return, expected, ensure_called):
     with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=ensure_return) as ensure:
         assert resolve_eval_run_target(MagicMock(), data) == expected
     assert ensure.called is ensure_called
+    if ensure_called:
+        assert ensure.call_args.kwargs["bucket_type"] == QUERY_CANONICAL_BUCKET_TYPE
+
+
+def test_resolve_eval_run_target_forwards_session_bucket():
+    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=FOCUSED) as ensure:
+        resolve_eval_run_target(MagicMock(), {**SOURCE, "eval_entry_ids": ["keep"]}, bucket_type=SESSION_BUCKET_TYPE)
+    assert ensure.call_args.kwargs["bucket_type"] == SESSION_BUCKET_TYPE
 
 
 def test_ensure_focused_eval_set_retries_when_existing_version_has_no_entries():

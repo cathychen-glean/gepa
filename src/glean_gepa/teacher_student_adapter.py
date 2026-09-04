@@ -25,7 +25,7 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
-from glean_gepa.focused_evalset import resolve_eval_run_target
+from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_judge_metrics,
@@ -177,6 +177,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 self.runner.evalcli,
                 al_data_inst,
                 bigquery_client=self.bigquery_client,
+                bucket_type=QUERY_CANONICAL_BUCKET_TYPE,
             )
             if target is None:
                 print(

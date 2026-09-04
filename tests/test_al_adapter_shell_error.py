@@ -17,7 +17,7 @@ from glean_gepa.al_adapter import (
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
-from glean_gepa.focused_evalset import FocusedEvalSet
+from glean_gepa.focused_evalset import FocusedEvalSet, SESSION_BUCKET_TYPE
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
@@ -291,6 +291,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     assert resolve_entries.call_args.kwargs["eval_run_id"] == "parent-run"
     assert ensure.call_args.kwargs["entry_ids"] == ["source-entry"]
     assert ensure.call_args.kwargs["source_entries"] == source_entries
+    assert ensure.call_args.kwargs["bucket_type"] == SESSION_BUCKET_TYPE
     assert prepared[0]["focused_eval_set_name"] == "gepa-high-signal-source"
     assert prepared[0]["eval_entry_ids"] == ["source-entry"]
 

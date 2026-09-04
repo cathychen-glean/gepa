@@ -21,7 +21,7 @@ from glean_gepa.al_adapter import (
     log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.focused_evalset import ensure_focused_eval_set, resolve_eval_run_target
+from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.reflection_prompts import single_model_reflection_prompt
@@ -65,7 +65,11 @@ class SingleModelAdapter(GleanAdapterBase):
         return enriched
 
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Upload/reuse focused eval sets once, before concurrent child screening."""
+        """Upload/reuse focused eval sets once, before concurrent child screening.
+
+        Uses ``SESSION`` so child screens restore the parent ``stt`` and can
+        reproduce the same shell errors. Teacher-student uses ``QUERY_CANONICAL``.
+        """
         prepared: list[ALDataInst] = []
         for data in batch:
             entry_ids = data.get("eval_entry_ids")
@@ -102,6 +106,7 @@ class SingleModelAdapter(GleanAdapterBase):
                 deployment_ids=data["deployment_ids"],
                 entry_ids=resolved_entry_ids,
                 source_entries=source_entries,
+                bucket_type=SESSION_BUCKET_TYPE,
             )
             if focused is None:
                 return None
@@ -297,6 +302,7 @@ class SingleModelAdapter(GleanAdapterBase):
                 self.runner.evalcli,
                 al_data_inst,
                 bigquery_client=self.bigquery_client,
+                bucket_type=SESSION_BUCKET_TYPE,
             )
             if target is None:
                 # Do not fall back to the full eval set: a failed focused
