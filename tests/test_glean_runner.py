@@ -1,16 +1,19 @@
 import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 
-from glean_gepa.core_tools import CORE_TOOLS, CORE_TOOLS_GROUP, with_core_tool_defaults
-from glean_gepa.prompt import (
+from glean_gepa.prompt import compile_system_prompt, materialize_system_prompt, with_core_tool_defaults
+from glean_gepa.prompt_constants import (
+    CORE_TOOLS,
+    CORE_TOOLS_GROUP,
+    DEFAULT_FULL_PROMPT,
+    DEFAULT_WRITING_CODE,
     FULL_PROMPT_KEY,
+    PROMPT_MODULE_DEFAULTS,
+    RULES_EXT_KEY,
     WRITING_CODE_KEY,
-    compile_system_prompt,
-    default_writing_code,
-    materialize_system_prompt,
-    prompt_format,
 )
 from glean_gepa.runner import (
     ADAPTER_CACHE_FILENAME,
@@ -32,13 +35,13 @@ def test_compile_and_materialize_splice_writing_code_when_present():
 
     stock = compile_system_prompt({WRITING_CODE_KEY: "CUSTOM_PATTERNS"})
     assert "CUSTOM_PATTERNS" in stock
-    assert default_writing_code not in stock
+    assert DEFAULT_WRITING_CODE not in stock
     assert "{WRITING_CODE}" not in stock
     assert "## Writing Code" in stock
 
 
 def test_compile_system_prompt_leaves_writing_code_slot_when_key_absent():
-    assert compile_system_prompt({}) == prompt_format
+    assert compile_system_prompt({}) == DEFAULT_FULL_PROMPT
     assert (
         compile_system_prompt({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"}) == "PREFIX\n{WRITING_CODE}\nSUFFIX"
     )
@@ -47,25 +50,49 @@ def test_compile_system_prompt_leaves_writing_code_slot_when_key_absent():
 def test_materialize_system_prompt_fills_defaults_when_modules_missing():
     prompt = materialize_system_prompt({})
 
-    assert prompt == prompt_format.replace("{WRITING_CODE}", default_writing_code)
+    assert prompt == DEFAULT_FULL_PROMPT.replace("{WRITING_CODE}", DEFAULT_WRITING_CODE)
     assert "{WRITING_CODE}" not in prompt
+    assert "{RULES_EXT}" in prompt
     assert "**Rules:**" in prompt
 
 
+def test_compile_system_prompt_splices_rules_ext_after_rules():
+    writing = "intro\n**Rules:**\n- stock rule\n{RULES_EXT}\n### Sandbox\n"
+    compiled = compile_system_prompt(
+        {
+            WRITING_CODE_KEY: writing,
+            FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX",
+            RULES_EXT_KEY: "- Prefer Write after retrieving sources.\n- Do not skip Write when the teacher writes.",
+        }
+    )
+    assert "{RULES_EXT}" not in compiled
+    assert compiled == (
+        "PREFIX\nintro\n**Rules:**\n- stock rule\n"
+        "- Prefer Write after retrieving sources.\n- Do not skip Write when the teacher writes."
+        "\n### Sandbox\n\nSUFFIX"
+    )
+    empty = compile_system_prompt(
+        {WRITING_CODE_KEY: writing, FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX", RULES_EXT_KEY: ""}
+    )
+    assert empty == "PREFIX\nintro\n**Rules:**\n- stock rule\n\n### Sandbox\n\nSUFFIX"
+
+
 @pytest.mark.parametrize(
-    "raw, required_keys",
+    "raw",
     [
-        ({"WRITING_CODE": "code instructions"}, {WRITING_CODE_KEY}),
-        ({"FULL_PROMPT": "full template"}, {FULL_PROMPT_KEY}),
-        ({"WRITING_CODE": "patterns", "FULL_PROMPT": "template"}, {FULL_PROMPT_KEY}),
-        ({"glean_search": "Search less."}, set()),
+        {},
+        {"WRITING_CODE": "code instructions"},
+        {"FULL_PROMPT": "full template"},
+        {"WRITING_CODE": "patterns", "FULL_PROMPT": "template"},
+        {"glean_search": "Search less."},
+        {RULES_EXT_KEY: "- Prefer Write after retrieving sources."},
     ],
 )
-def test_load_seed_candidate_accepts_known_keys(tmp_path, raw, required_keys):
+def test_load_seed_candidate_accepts_known_keys(tmp_path, raw):
     path = tmp_path / "seed.json"
     path.write_text(json.dumps(raw))
 
-    assert _load_seed_candidate(path, required_keys=required_keys) == raw
+    assert _load_seed_candidate(path) == raw
 
 
 def test_seed_for_editable_modules():
@@ -86,11 +113,26 @@ def test_seed_for_editable_modules():
     assert WRITING_CODE_KEY not in frozen
     assert frozen["glean_search"] == with_core_tool_defaults({})["glean_search"]
 
+    rules_seed = _seed_for_editable_modules({**SEED_BOTH, RULES_EXT_KEY: ""}, [RULES_EXT_KEY])
+    assert rules_seed[RULES_EXT_KEY] == ""
+    assert rules_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
+
+    defaulted = _seed_for_editable_modules({}, [WRITING_CODE_KEY, RULES_EXT_KEY])
+    assert defaulted[WRITING_CODE_KEY] == DEFAULT_WRITING_CODE
+    assert defaulted[RULES_EXT_KEY] == ""
+    assert FULL_PROMPT_KEY not in defaulted
+
+    overridden = _seed_for_editable_modules({RULES_EXT_KEY: "- Prefer Write."}, [RULES_EXT_KEY])
+    assert overridden[RULES_EXT_KEY] == "- Prefer Write."
+    assert overridden[FULL_PROMPT_KEY] == materialize_system_prompt({})
+
 
 def test_parse_editable_modules():
     assert _parse_editable_modules("FULL_PROMPT") == [FULL_PROMPT_KEY]
     assert _parse_editable_modules("WRITING_CODE,FULL_PROMPT") == [WRITING_CODE_KEY, FULL_PROMPT_KEY]
     assert _parse_editable_modules("glean_search") == ["glean_search"]
+    assert _parse_editable_modules(RULES_EXT_KEY) == [RULES_EXT_KEY]
+    assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},{RULES_EXT_KEY}") == [*CORE_TOOLS, RULES_EXT_KEY]
     assert _parse_editable_modules(CORE_TOOLS_GROUP) == list(CORE_TOOLS)
     assert _parse_editable_modules(f"FULL_PROMPT,{CORE_TOOLS_GROUP}") == [FULL_PROMPT_KEY, *CORE_TOOLS]
     assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},glean_search") == list(CORE_TOOLS)
@@ -99,19 +141,30 @@ def test_parse_editable_modules():
 
 
 @pytest.mark.parametrize(
-    "raw, required_keys, match",
+    "raw, match",
     [
-        ({"GLOBAL_ROLE": "role", "WRITING_CODE": "code instructions"}, {WRITING_CODE_KEY}, "unknown keys"),
-        ({"WRITING_CODE": "code instructions"}, {FULL_PROMPT_KEY}, "missing required keys"),
-        ({"WRITING_CODE": ["code instructions"]}, {WRITING_CODE_KEY}, "WRITING_CODE must be a string"),
+        ({"GLOBAL_ROLE": "role", "WRITING_CODE": "code instructions"}, "unknown keys"),
+        ({"WRITING_CODE": ["code instructions"]}, "WRITING_CODE must be a string"),
+        (["WRITING_CODE"], "seed_candidate must be a JSON object"),
     ],
 )
-def test_load_seed_candidate_rejects_invalid(tmp_path, raw, required_keys, match):
+def test_load_seed_candidate_rejects_invalid(tmp_path, raw, match):
     path = tmp_path / "seed.json"
     path.write_text(json.dumps(raw))
 
     with pytest.raises(SystemExit, match=match):
-        _load_seed_candidate(path, required_keys=required_keys)
+        _load_seed_candidate(path)
+
+
+def test_committed_seed_candidate_is_overrides_only():
+    path = Path(__file__).resolve().parents[1] / "data" / "seed_candidate.json"
+    raw = _load_seed_candidate(path)
+
+    assert WRITING_CODE_KEY not in raw
+    assert FULL_PROMPT_KEY not in raw
+    seed = _seed_for_editable_modules(raw, [WRITING_CODE_KEY, RULES_EXT_KEY])
+    assert seed[WRITING_CODE_KEY] == PROMPT_MODULE_DEFAULTS[WRITING_CODE_KEY]
+    assert seed[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
 
 
 def test_parse_args_defaults_editable_modules_to_writing_code():

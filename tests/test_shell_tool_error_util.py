@@ -74,7 +74,10 @@ def test_build_shell_tool_error_rate_query_includes_eval_and_shell_filters():
     assert "jsonPayload.span_info.execution_status.user_message" in sql
     assert "NULLIF(jsonPayload.action.action_run_id, '')" in sql
     assert "NULLIF(jsonPayload.context.agent_trace.span_id, '')" in sql
-    assert "TO_JSON_STRING(jsonPayload)" in sql
+    assert "TO_JSON_STRING(STRUCT(" in sql
+    assert "TO_JSON_STRING(jsonPayload)" not in sql
+    assert "PARSE_DATE" not in sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "action_run_id," in sql
     assert "recent_error_examples" in sql
 
@@ -460,6 +463,8 @@ def test_build_eval_entry_uuid_tracking_query_filters_entry_uuid():
     assert "entry_uuid IN UNNEST(@entry_ids)" in sql
     assert "session_tracking_token" in sql
     assert "scrubbed_agentspan" in sql
+    assert "PARSE_DATE" not in sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
 
 
 def test_fetch_evalset_entry_tracking_uses_agentspan_stt():

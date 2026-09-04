@@ -35,8 +35,7 @@ class BigQueryClient:
             from google.cloud import bigquery
         except ImportError as exc:
             raise BigQueryError(
-                "google-cloud-bigquery is required for BigQueryClient. "
-                "Install with: uv sync --extra glean"
+                "google-cloud-bigquery is required for BigQueryClient. Install with: uv sync --extra glean"
             ) from exc
 
         self._client = bigquery.Client(project=self.project_id)
@@ -58,9 +57,7 @@ class BigQueryClient:
                     if isinstance(param.value, list):
                         bq_params.append(bigquery.ArrayQueryParameter(param.name, param.type_, param.value))
                     else:
-                        bq_params.append(
-                            bigquery.ScalarQueryParameter(param.name, param.type_, param.value)
-                        )
+                        bq_params.append(bigquery.ScalarQueryParameter(param.name, param.type_, param.value))
                 else:
                     bq_params.append(param)
             job_config = bigquery.QueryJobConfig(query_parameters=bq_params)

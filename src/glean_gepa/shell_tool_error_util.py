@@ -109,6 +109,33 @@ def is_shell_tool_error(
     )
 
 
+def wildcard_shard_filter(start_date_param: str, end_date_param: str, *, table_alias: str = "") -> str:
+    """Restrict a ``table_*`` wildcard to UTC date shards.
+
+    Compare ``_TABLE_SUFFIX`` as a string. Wrapping it in ``PARSE_DATE`` can stop
+    BigQuery from eliminating shards, which scans the full Agentspan history.
+    ``FORMAT_DATE`` on query parameters is constant-folded.
+    """
+    suffix = f"{table_alias}._TABLE_SUFFIX" if table_alias else "_TABLE_SUFFIX"
+    return f"{suffix} BETWEEN FORMAT_DATE('%Y%m%d', @{start_date_param}) AND FORMAT_DATE('%Y%m%d', @{end_date_param})"
+
+
+def _shell_execution_id_sql() -> str:
+    """Stable execution id without serializing the full ``jsonPayload`` blob."""
+    return """COALESCE(
+      NULLIF(jsonPayload.action.action_run_id, ''),
+      NULLIF(jsonPayload.context.agent_trace.span_id, ''),
+      -- Some eval spans omit both IDs. Count the observed span instead of
+      -- letting COUNT(DISTINCT NULL) turn a real execution into 0/0.
+      TO_JSON_STRING(STRUCT(
+        jsonPayload.context.eval.entry_uuid,
+        jsonPayload.context.eval.entry_id,
+        jsonPayload.span_info.span_name,
+        jsonPayload.span_info.start_end_timestamps.start_time_millis
+      ))
+    )"""
+
+
 def _shell_span_filter_sql(table_alias: str = "") -> str:
     prefix = f"{table_alias}." if table_alias else ""
     span_names = ", ".join(f"'{name}'" for name in SHELL_SPAN_NAMES)
@@ -124,13 +151,7 @@ def _shell_spans_select_sql() -> str:
     return f"""
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
-    COALESCE(
-      NULLIF(jsonPayload.action.action_run_id, ''),
-      NULLIF(jsonPayload.context.agent_trace.span_id, ''),
-      -- Some eval spans omit both IDs. Count the observed span instead of
-      -- letting COUNT(DISTINCT NULL) turn a real execution into 0/0.
-      TO_JSON_STRING(jsonPayload)
-    ) AS shell_execution_id,
+    {_shell_execution_id_sql()} AS shell_execution_id,
     jsonPayload.context.eval.entry_uuid AS entry_uuid,
     CAST(jsonPayload.context.eval.entry_id AS STRING) AS entry_id,
     resource.labels.project_id AS project_id,
@@ -162,8 +183,7 @@ def _shell_spans_select_sql() -> str:
     ) AS output_status_code,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{{agentspan_table}}`
-  WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-    BETWEEN @start_date AND @end_date
+  WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id = @eval_id
     AND {shell_filter}
     AND jsonPayload.action.execution_mode = 'EXECUTE'
@@ -181,8 +201,7 @@ SELECT
   MIN(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS min_start_ms,
   MAX(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS max_start_ms
 FROM `{agentspan_table}`
-WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-  BETWEEN @search_start_date AND @search_end_date
+WHERE {wildcard_shard_filter("search_start_date", "search_end_date")}
   AND jsonPayload.context.eval.eval_id = @eval_id
   AND {shell_filter}
   AND jsonPayload.action.execution_mode = 'EXECUTE'
@@ -424,7 +443,7 @@ SELECT
   jsonPayload.context.workflow.run_id AS runId,
   jsonPayload.context.agent_trace.trace_id AS traceId
 FROM `{agentspan_table}`
-WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX) BETWEEN @start_date AND @end_date
+WHERE {wildcard_shard_filter("start_date", "end_date")}
   AND (
     jsonPayload.context.eval.entry_uuid IN UNNEST(@entry_ids)
     OR CAST(jsonPayload.context.eval.entry_id AS STRING) IN UNNEST(@entry_ids)
@@ -660,11 +679,7 @@ def _historical_trace_ids(
             QueryParameter("end_suffix", "STRING", end_suffix),
         ],
     )
-    return {
-        str(row["id"]): str(row["traceId"])
-        for row in trace_rows
-        if row.get("id") and row.get("traceId")
-    }
+    return {str(row["id"]): str(row["traceId"]) for row in trace_rows if row.get("id") and row.get("traceId")}
 
 
 def _parse_bigquery_date(value: Any) -> date | None:

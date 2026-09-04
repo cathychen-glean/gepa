@@ -11,6 +11,7 @@ from glean_gepa.tool_match_util import (
     ToolMatchEntryMetrics,
     aggregate_tool_match_metrics,
     build_tool_match_per_entry_query,
+    build_tool_match_time_bounds_query,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
     first_tool_mismatch_pair,
@@ -48,7 +49,12 @@ def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
 
 
 def test_tool_match_queries_and_fetch():
+    bounds_sql = build_tool_match_time_bounds_query()
     sql = build_tool_match_per_entry_query()
+    assert "PARSE_DATE" not in bounds_sql
+    assert "PARSE_DATE" not in sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
+    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
     assert "Execute Action:" in sql
     assert "student_trace_id" not in sql

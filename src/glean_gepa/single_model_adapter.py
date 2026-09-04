@@ -21,9 +21,10 @@ from glean_gepa.al_adapter import (
     log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.core_tools import CORE_TOOL_KEYS, core_tool_reflection_prompt
 from glean_gepa.focused_evalset import ensure_focused_eval_set, resolve_eval_run_target
-from glean_gepa.prompt import WRITING_CODE_KEY, compile_encoded_prompt
+from glean_gepa.prompt import compile_encoded_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import single_model_reflection_prompt
 from glean_gepa.reflection_sampling import strip_stdout_sections
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
@@ -138,7 +139,7 @@ class SingleModelAdapter(GleanAdapterBase):
             evaluate_fn=self._evaluate_single_model,
             failure_pattern_fn=self._create_failure_pattern,
             reflective_example_fn=self._build_reflective_example,
-            reflection_prompt_fn=self._reflection_prompt,
+            reflection_prompt_fn=single_model_reflection_prompt,
             reflective_metrics_fn=self._format_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES",
             primary_objective=SHELL_SUCCESS_OBJECTIVE,
@@ -259,18 +260,6 @@ class SingleModelAdapter(GleanAdapterBase):
             "Feedback": feedback,
             "Metrics": {"score": trajectory["score"], "shell_success_rate": shell_success_rate},
         }
-
-    @staticmethod
-    def _reflection_prompt(module_name: str) -> str:
-        if module_name == "WRITING_CODE":
-            return (
-                "Focus ONLY on coding instructions that affect shell tool reliability: SDK call patterns, "
-                "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
-                "Use shell error examples as evidence. Propose minimal deltas."
-            )
-        if module_name in CORE_TOOL_KEYS:
-            return core_tool_reflection_prompt(module_name)
-        return "Focus only on this module's responsibilities."
 
     @staticmethod
     def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str | None:

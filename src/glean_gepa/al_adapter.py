@@ -22,7 +22,6 @@ from glean_gepa.adapter_types import (
     ALTrajectory,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.core_tools import CORE_TOOL_KEYS
 from glean_gepa.debug import debug_print
 from glean_gepa.evalcli_client import (
     CORRECTNESS_INPUT_MAPPINGS,
@@ -34,6 +33,16 @@ from glean_gepa.evalcli_client import (
     is_missing_eval_job,
 )
 from glean_gepa.focused_evalset import prepare_high_signal_eval_batch
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.reflection_prompts import (
+    CONSOLIDATE_LENGTH_EMPTY,
+    CONSOLIDATE_LENGTH_NONEMPTY,
+    EMPTY_DIAGNOSIS_FALLBACK,
+    LENGTH_RULE_EMPTY,
+    LENGTH_RULE_NONEMPTY,
+    consolidate_prompt,
+    diagnosis_prompt,
+)
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
 from glean_gepa.shell_tool_error_util import (
@@ -1589,6 +1598,10 @@ class GleanAdapterBase:
         ``diagnosis`` is the first-pass reflection text (failure modes and WHY).
         """
         current = candidate.prompt_modules.get(components_to_update[0], "")
+        if current.strip():
+            length_rule, consolidate_length = LENGTH_RULE_NONEMPTY, CONSOLIDATE_LENGTH_NONEMPTY
+        else:
+            length_rule, consolidate_length = LENGTH_RULE_EMPTY, CONSOLIDATE_LENGTH_EMPTY
 
         ex_blocks = []
         for r in reflective_examples:
@@ -1619,44 +1632,31 @@ class GleanAdapterBase:
         if len(components_to_update) != 1:
             return [], False, ""
         module_name = components_to_update[0]
-        prompt = (
-            f"You are optimizing ONLY the module {module_name}.\n"
-            f"MODULE RESPONSIBILITY:\n{self._reflection_prompt_fn(module_name)}\n\n"
-            f"CURRENT MODULE TEXT:\n<<<\n{current}\n>>>\n\n"
-            f"{self._failure_label}:\n{''.join(ex_blocks)}\n\n"
-            f"Task:\n"
-            f"1) Identify recurring failure modes that are plausibly caused by {module_name}.\n"
-            f"2) Propose 1-2 SMALL patches (delta edits), each with:\n"
-            f"   - BEFORE: quoted snippet from current module\n"
-            f"   - AFTER: revised snippet\n"
-            f"   - WHY: one sentence\n"
-            f"3) Every supplied example is relevant evidence for {module_name}; use it to propose a variant.\n"
-            f"4) Make only generalizable changes; do not overfit to individual examples.\n"
-            f"5) Keep the revised module succinct: each candidate must be strictly less than 1.1 times "
-            f"the current module's character length.\n"
+        prompt = diagnosis_prompt(
+            module_name=module_name,
+            responsibility=self._reflection_prompt_fn(module_name),
+            current=current,
+            failure_label=self._failure_label,
+            example_blocks="".join(ex_blocks),
+            length_rule=length_rule,
         )
 
         raw = reflection_llm(prompt).strip()
         if raw.upper() == "NOT_RELEVANT" or not raw:
-            raw = (
-                "No module-specific diagnosis was returned. Propose a conservative rewrite that addresses "
-                "the supplied failure evidence while preserving the current instructions."
-            )
+            raw = EMPTY_DIAGNOSIS_FALLBACK
 
         # Simple parser strategy:
         # In production, parse structured JSON/YAML, or ask LLM to output patches in JSON.
         # Here we just return one consolidated rewrite request for a second pass:
-        consolidate_prompt = (
-            f"Consolidate the following patch suggestions into up to {max_variants} candidate rewrites "
-            f"of the module {module_name}. Preserve good behavior, incorporate consistent changes only, "
-            f"and make only generalizable changes. Each variant must be succinct and strictly less than 1.1 "
-            f"times the current module's character length. "
-            f"Output each variant separated by '\n===VARIANT===\n'.\n\n"
-            f"CURRENT:\n<<<\n{current}\n>>>\n\n"
-            f"EVIDENCE (every example is relevant):\n{''.join(ex_blocks)}\n\n"
-            f"SUGGESTIONS:\n{raw}\n"
+        consolidate_text = consolidate_prompt(
+            module_name=module_name,
+            max_variants=max_variants,
+            consolidate_length=consolidate_length,
+            current=current,
+            example_blocks="".join(ex_blocks),
+            suggestions=raw,
         )
-        consolidated = reflection_llm(consolidate_prompt).strip()
+        consolidated = reflection_llm(consolidate_text).strip()
         variants = [
             variant
             for variant in (v.strip() for v in consolidated.split("===VARIANT==="))

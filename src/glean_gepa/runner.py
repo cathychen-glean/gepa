@@ -22,25 +22,22 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.api import optimize
 from glean_gepa.bigquery_client import BigQueryClient
-from glean_gepa.core_tools import (
-    CORE_TOOL_KEYS,
-    CORE_TOOLS,
-    CORE_TOOLS_GROUP,
-    with_core_tool_defaults,
-)
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
-from glean_gepa.prompt import (
+from glean_gepa.prompt import candidate_module_names, materialize_system_prompt, with_core_tool_defaults
+from glean_gepa.prompt_constants import (
+    CORE_TOOL_KEYS,
+    CORE_TOOLS,
+    CORE_TOOLS_GROUP,
     FULL_PROMPT_KEY,
     KNOWN_PROMPT_KEYS,
     MODULE_TOKEN_BUDGETS,
+    PROMPT_MODULE_DEFAULTS,
     WRITING_CODE_KEY,
-    candidate_module_names,
-    materialize_system_prompt,
 )
 from glean_gepa.run_log import capture_run_log, log_section
 from glean_gepa.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
@@ -68,22 +65,18 @@ def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
     return cache_file
 
 
-def _load_seed_candidate(path: Path, required_keys: set[str]) -> dict[str, str]:
+def _load_seed_candidate(path: Path) -> dict[str, str]:
+    """Load prompt-module overrides. Omitted keys use ``PROMPT_MODULE_DEFAULTS``."""
     if not path.is_file():
         raise SystemExit(f"seed_candidate file not found: {path}")
     raw = json.loads(path.read_text())
-    if not isinstance(raw, dict) or not raw:
-        raise SystemExit("seed_candidate must be a non-empty JSON object")
+    if not isinstance(raw, dict):
+        raise SystemExit("seed_candidate must be a JSON object")
 
     unknown = set(raw) - KNOWN_PROMPT_KEYS
     if unknown:
         unknown_list = ", ".join(sorted(repr(key) for key in unknown))
         raise SystemExit(f"seed_candidate has unknown keys: {unknown_list}")
-
-    missing = required_keys - set(raw)
-    if missing:
-        missing_list = ", ".join(sorted(repr(key) for key in missing))
-        raise SystemExit(f"seed_candidate missing required keys: {missing_list}")
 
     seed: dict[str, str] = {}
     for key, value in raw.items():
@@ -123,13 +116,16 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     When neither ``FULL_PROMPT`` nor ``WRITING_CODE`` is editable, the materialized
     seed prompt is still attached so evals keep a frozen system prompt. Core-tool
     descriptions are always attached so evals can override ``schema.description``.
+    ``RULES_EXT`` is copied from the seed when listed; compile time splices it into
+    the ``{RULES_EXT}`` slot after Writing Code **Rules:**. Keys omitted from
+    ``raw`` use ``PROMPT_MODULE_DEFAULTS``.
     """
     seed: dict[str, str] = {}
     for key in editable_modules:
         if key == FULL_PROMPT_KEY:
             seed[key] = materialize_system_prompt(raw)
         elif key not in CORE_TOOL_KEYS:
-            seed[key] = raw[key]
+            seed[key] = raw.get(key, PROMPT_MODULE_DEFAULTS[key])
     editing_system_prompt = any(key in {FULL_PROMPT_KEY, WRITING_CODE_KEY} for key in editable_modules)
     if not editing_system_prompt:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
@@ -277,7 +273,12 @@ def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optimize Glean prompts with GEPA's low-level engine.")
-    parser.add_argument("--seed_candidate", type=Path)
+    parser.add_argument(
+        "--seed_candidate",
+        type=Path,
+        help="JSON object of prompt-module overrides. Omitted keys use the Python defaults "
+        "in glean_gepa.prompt_constants (WRITING_CODE, FULL_PROMPT, RULES_EXT, core-tool descriptions).",
+    )
     parser.add_argument("--max_metric_calls", type=int, default=10)
     parser.add_argument("--run_dir", type=Path, default=None)
     parser.add_argument(
@@ -377,8 +378,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--editable_modules",
         default=WRITING_CODE_KEY,
         help="Comma-separated prompt keys to edit (WRITING_CODE, FULL_PROMPT, CORE_TOOLS, "
-        "or individual core-tool keys). CORE_TOOLS expands to all core-tool descriptions; "
-        "the proposer only rewrites those involved in high-signal first-tool mismatches.",
+        "RULES_EXT, or individual core-tool keys). CORE_TOOLS expands to all core-tool "
+        "descriptions; the proposer only rewrites those involved in high-signal first-tool "
+        "mismatches. RULES_EXT is at most two bullets after Writing Code **Rules:**.",
     )
     parser.add_argument(
         "--fake_flow",
@@ -422,8 +424,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         raise SystemExit("--seed_candidate is required unless --fake_flow is set")
     editable_modules = _parse_editable_modules(args.editable_modules)
     judging_mode = cast(JudgingMode, args.judging_mode)
-    required_keys = {key for key in editable_modules if key != FULL_PROMPT_KEY and key not in CORE_TOOL_KEYS}
-    raw_seed = _load_seed_candidate(args.seed_candidate, required_keys=required_keys)
+    raw_seed = _load_seed_candidate(args.seed_candidate)
     seed_candidate = _seed_for_editable_modules(raw_seed, editable_modules)
     log_section(
         "RUN CONFIG",

@@ -14,7 +14,8 @@ from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.al_adapter import MODULES, Candidate, GleanAdapterBase, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.prompt import WRITING_CODE_KEY
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import FAKE_FLOW_RESPONSIBILITY
 
 FAKE_FLOW_MARKER = "[fake-flow iteration="
 
@@ -63,7 +64,7 @@ class FakeFlowAdapter(GleanAdapterBase):
             evaluate_fn=lambda *_args: self.evaluate(*_args),
             failure_pattern_fn=lambda _module, trajectory: (trajectory["output"]["entry_id"],),
             reflective_example_fn=lambda _module, trajectory, _candidate: self._reflective_example(trajectory),
-            reflection_prompt_fn=lambda _module: "Improve the fake coding instructions using the failed examples.",
+            reflection_prompt_fn=lambda _module: FAKE_FLOW_RESPONSIBILITY,
             reflective_metrics_fn=lambda metrics: f"fake score={metrics['score']:.2f}",
             failure_label="Fake eval evidence",
             primary_objective="fake_score",

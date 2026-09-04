@@ -113,6 +113,24 @@ class UnseenEvalSetPolicy:
             raise ValueError("UnseenEvalSetPolicy must be shared with loaders containing the same eval sets")
         return self._ordered_ids
 
+    def skip_consumed_prefix(self, loader: DataLoader, next_index: int) -> None:
+        """Mark training ids before ``next_index`` consumed so ``take_unseen`` skips them.
+
+        Used when cached children from earlier slices are already in the candidate pool.
+        """
+        ids = self._ids(loader)
+        if next_index < 0:
+            raise ValueError("next_index must be >= 0")
+        next_index = min(next_index, len(ids))
+        labels = [_slice_label(loader, data_id) for data_id in ids]
+        for label in labels[:next_index]:
+            if label not in self._consumed:
+                self._consumed.append(label)
+        if self._pending_label is not None and self._pending_label in labels[:next_index]:
+            self._pending_label = None
+            self._pending_attempt = None
+        self._save()
+
     def _consume_pending(self) -> None:
         """Retire the slice of the generation that has now been left behind."""
         if self._pending_label is not None and self._pending_label not in self._consumed:

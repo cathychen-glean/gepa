@@ -24,14 +24,15 @@ from glean_gepa.al_adapter import (
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.core_tools import CORE_TOOL_KEYS, core_tool_reflection_prompt, tool_description_override_key
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_judge_metrics,
 )
-from glean_gepa.prompt import FULL_PROMPT_KEY, WRITING_CODE_KEY, compile_encoded_prompt
+from glean_gepa.prompt import compile_encoded_prompt, is_core_tool_span, tool_description_override_key
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS, RULES_EXT_KEY, WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import teacher_student_reflection_prompt
 from glean_gepa.run_log import (
     format_eval_entry_report,
     format_high_signal_selection_report,
@@ -93,7 +94,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             evaluate_fn=self._evaluate_teacher_student,
             failure_pattern_fn=self._create_failure_pattern,
             reflective_example_fn=self._build_reflective_example,
-            reflection_prompt_fn=self._reflection_prompt,
+            reflection_prompt_fn=teacher_student_reflection_prompt,
             reflective_metrics_fn=self._format_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES (teacher vs student tool match)",
             primary_objective=PRIMARY_OBJECTIVE,
@@ -470,6 +471,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     if pair is not None
                     and any(tool_description_override_key(name) == component_name for name in pair if name)
                 ]
+            elif component_name == RULES_EXT_KEY:
+                chosen = [
+                    trajectory
+                    for trajectory, pair in zip(selected, selected_pairs, strict=True)
+                    if pair is not None and not any(is_core_tool_span(name) for name in pair if name)
+                ]
             examples[component_name] = [
                 self._build_reflective_example(component_name, trajectory, candidate) for trajectory in chosen
             ]
@@ -558,19 +565,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 "completeness": completeness,
             },
         }
-
-    @staticmethod
-    def _reflection_prompt(module_name: str) -> str:
-        if module_name == FULL_PROMPT_KEY:
-            return (
-                "You are editing the ENTIRE student system prompt as a single string. Any section "
-                "may change — routing, execution discipline, coding instructions, tool surface, "
-                "or response guidelines — if it improves first-tool alignment with the teacher. "
-                "Preserve [[placeholder]] tokens. Propose a complete updated prompt with minimal deltas."
-            )
-        if module_name in CORE_TOOL_KEYS:
-            return core_tool_reflection_prompt(module_name)
-        return "Focus only on this module's responsibilities."
 
     @staticmethod
     def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str:

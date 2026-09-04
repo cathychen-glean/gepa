@@ -14,6 +14,7 @@ from glean_gepa.shell_tool_error_util import (
     QueryParameter,
     default_date_range,
     resolve_eval_run_date_range,
+    wildcard_shard_filter,
 )
 
 REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT = 20
@@ -65,8 +66,7 @@ SELECT
   MIN(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS min_start_ms,
   MAX(SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64)) AS max_start_ms
 FROM `{agentspan_table}`
-WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-  BETWEEN @search_start_date AND @search_end_date
+WHERE {wildcard_shard_filter("search_start_date", "search_end_date")}
   AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
   AND {_EXECUTE_ACTION_FILTER}
 """.strip()
@@ -89,8 +89,7 @@ WITH tool_spans AS (
     REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') AS tool_name,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{agentspan_table}`
-  WHERE PARSE_DATE('%Y%m%d', _TABLE_SUFFIX)
-    BETWEEN @start_date AND @end_date
+  WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
     AND {_EXECUTE_ACTION_FILTER}
     AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN ({skipped})

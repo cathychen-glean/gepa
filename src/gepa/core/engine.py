@@ -656,12 +656,19 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Deduplicate: identical child candidates selected in the same
         # iteration would each get a full valset eval and a pool entry.
+        # Also skip programs that are already in the pool so a resumed
+        # proposer cannot re-accept a cached child as a new candidate.
+        pool_keys = {tuple(sorted(program.items())) for program in state.program_candidates}
         deduped: list[CandidateProposal] = []
         seen_candidates: set[tuple] = set()
         seen_ids: set[int] = set()
         duplicates: list[CandidateProposal] = []
+        already_in_pool: list[CandidateProposal] = []
         for p in selected:
             content_key = tuple(sorted(p.candidate.items()))
+            if content_key in pool_keys:
+                already_in_pool.append(p)
+                continue
             if id(p) in seen_ids or content_key in seen_candidates:
                 duplicates.append(p)
                 continue
@@ -676,6 +683,14 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         selected_ids = {id(p) for p in selected}
         for proposal in proposals:
             if id(proposal) in selected_ids:
+                continue
+            if any(proposal is d for d in already_in_pool):
+                self._report_rejected_proposal(
+                    proposal,
+                    iteration,
+                    state,
+                    reason_override="Duplicate of a candidate already in the pool",
+                )
                 continue
             if any(proposal is d for d in duplicates):
                 self._report_rejected_proposal(

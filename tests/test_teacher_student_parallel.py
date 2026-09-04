@@ -9,6 +9,7 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
+from glean_gepa.prompt_constants import RULES_EXT_KEY
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
 from glean_gepa.tool_match_util import (
     EvalRunToolMatchAnalysis,
@@ -619,4 +620,24 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
     assert reader_ids == [f"read-{i}" for i in range(8)]
     assert examples["glean_search"][0]["Feedback"].startswith(
         "First-tool mismatch: teacher used Glean Search and student used Discover."
+    )
+
+
+def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
+    adapter = _teacher_student_adapter(MagicMock())
+    trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
+        _mismatch_trajectory(f"write-{i}", ["Write"], []) for i in range(8)
+    ]
+    examples = adapter.make_reflective_dataset(
+        {"FULL_PROMPT": "prompt", RULES_EXT_KEY: ""},
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[]),
+        [RULES_EXT_KEY, "glean_search"],
+        k=8,
+    )
+    write_ids = [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]]
+    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
+    assert write_ids == [f"write-{i}" for i in range(8)]
+    assert search_ids == [f"search-{i}" for i in range(12)]
+    assert examples[RULES_EXT_KEY][0]["Feedback"].startswith(
+        "First-tool mismatch: teacher used Write and student used (none)."
     )

@@ -8,7 +8,7 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evolutionary_proposer import pick_modules_to_edit
-from glean_gepa.prompt import FULL_PROMPT_KEY, WRITING_CODE_KEY
+from glean_gepa.prompt_constants import FULL_PROMPT_KEY, WRITING_CODE_KEY
 from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
