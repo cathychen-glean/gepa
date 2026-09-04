@@ -10,8 +10,10 @@ from gepa.core.state import FrontierType
 from gepa.logging.experiment_tracker import ExperimentTracker
 from gepa.logging.logger import LoggerProtocol
 from gepa.strategies.eval_policy import EvaluationPolicy
-from gepa.utils import MaxMetricCallsStopper
+from gepa.utils import CompositeStopper, MaxMetricCallsStopper
+from gepa.utils.stop_condition import StopperProtocol
 from glean_gepa.adapter_types import SingleModelALDataInst, TeacherStudentALDataInst
+from glean_gepa.evalset_policy import TrainingScheduleExhaustedStopper
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
@@ -33,6 +35,12 @@ def optimize(
 ) -> GEPAResult:
     """Run the Glean proposer while keeping custom wiring outside ``gepa.api``."""
     del trainset  # The proposer owns its training loader; the engine only needs validation data.
+    stop_callback: StopperProtocol = MaxMetricCallsStopper(max_metric_calls)
+    if proposer.evalset_policy is not None:
+        stop_callback = CompositeStopper(
+            stop_callback,
+            TrainingScheduleExhaustedStopper(proposer.evalset_policy, proposer.trainset),
+        )
     engine = GEPAEngine(
         adapter=cast(Any, adapter),
         run_dir=run_dir,
@@ -45,7 +53,7 @@ def optimize(
         frontier_type=frontier_type,
         logger=logger,
         experiment_tracker=experiment_tracker,
-        stop_callback=MaxMetricCallsStopper(max_metric_calls),
+        stop_callback=stop_callback,
         val_evaluation_policy=val_evaluation_policy,
     )
 

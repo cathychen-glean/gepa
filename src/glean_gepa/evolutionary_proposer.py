@@ -458,6 +458,28 @@ class EvolutionaryProposer:
             cached.append((record.screening_score, passed))
         return cached
 
+    def _slice_replay_is_fully_cached(
+        self,
+        train_ids: tuple[Any, ...],
+        frontier_candidates: list[Candidate],
+        children_by_root: dict[str, list[Candidate]],
+        *,
+        use_high_signal_gate: bool,
+    ) -> bool:
+        """Report whether this slice needs neither reflection nor screening.
+
+        Every frontier root must already own cached children, since a root
+        without them is reflected on and reflection reads the root's traces.
+        The check covers every cached child rather than the subset a generation
+        ends up screening, which can only err toward fetching traces.
+        """
+        if any(candidate.candidate_id not in children_by_root for candidate in frontier_candidates):
+            return False
+        children = [child for candidate in frontier_candidates for child in children_by_root[candidate.candidate_id]]
+        if not children:
+            return False
+        return self._cached_screening_scores(train_ids, children, use_high_signal_gate=use_high_signal_gate) is not None
+
     def _record_screening_result(
         self,
         train_ids: tuple[Any, ...],
@@ -519,7 +541,11 @@ class EvolutionaryProposer:
         # so each iteration learns from new train data rather than reusing val IDs.
         if self.evalset_policy is not None:
             try:
-                train_ids = self.evalset_policy.take_unseen(self.trainset, purpose="reflection and offspring screening")
+                train_ids = self.evalset_policy.take_unseen(
+                    self.trainset,
+                    purpose="reflection and offspring screening",
+                    attempt=state.i,
+                )
             except RuntimeError as exc:
                 self.logger.log(f"Iteration {i}: Training eval schedule exhausted; stopping proposals ({exc})")
                 return []
@@ -529,22 +555,47 @@ class EvolutionaryProposer:
             trace_batch = self._batch_data
         train_slice_key = tuple(train_ids)
 
-        # 3. Convert frontier programs to Candidate objects and reuse cached root scores when possible.
+        # 3. Convert frontier programs to Candidate objects. Cached mutations
+        # are scoped to the current training slice, so a fresh slice prompts a
+        # new reflection while duplicate attempts within that slice are avoided.
         frontier_candidates: list[Candidate] = []
-        frontier_evals: dict[str, GleanEvaluationBatch] = {}
         prog_idx_to_cand_id: dict[int, str] = {}
-        cached_frontier_evals: set[str] = set()
-
         for idx in frontier_idxs_sorted:
-            program = state.program_candidates[idx]
-            cand = self._to_candidate(program)
+            cand = self._to_candidate(state.program_candidates[idx])
             prog_idx_to_cand_id[idx] = cand.candidate_id
             frontier_candidates.append(cand)
 
+        children_by_root = (
+            self._children_by_root_by_train_slice.setdefault(train_slice_key, {})
+            if self.evalset_policy is not None
+            else self._children_by_root
+        )
+        use_high_signal_gate = getattr(self.al_adapter, "supports_high_signal_eval", False)
+
+        # A root's error examples exist to drive reflection and the high-signal
+        # screen. When both are already cached for this slice, the generation is
+        # only being replayed to reach full validation, so paying for per-entry
+        # BigQuery and evalcli trace hydration would buy nothing.
+        capture_root_traces = not self._slice_replay_is_fully_cached(
+            train_slice_key,
+            frontier_candidates,
+            children_by_root,
+            use_high_signal_gate=use_high_signal_gate,
+        )
+        if not capture_root_traces:
+            self.logger.log(
+                f"Iteration {i}: Replaying this slice from cached children and screens; "
+                "skipping root error-example fetches"
+            )
+
+        # 4. Score the frontier roots, reusing cached root scores when possible.
+        frontier_evals: dict[str, GleanEvaluationBatch] = {}
+        cached_frontier_evals: set[str] = set()
+        for cand in frontier_candidates:
             cached_root_score = self._cached_root_screening_score(train_slice_key, cand.candidate_id)
             if cached_root_score is None:
                 frontier_evals[cand.candidate_id] = self.al_adapter.evaluate(
-                    trace_batch, cand.prompt_modules, capture_traces=True
+                    trace_batch, cand.prompt_modules, capture_traces=capture_root_traces
                 )
                 self._record_root_screening_score(
                     train_slice_key,
@@ -555,14 +606,7 @@ class EvolutionaryProposer:
                 frontier_evals[cand.candidate_id] = self._placeholder_evaluation(cached_root_score)
                 cached_frontier_evals.add(cand.candidate_id)
 
-        # 4. Generate children using evolutionary strategies. Cached mutations
-        # are scoped to the current training slice, so a fresh slice prompts a
-        # new reflection while duplicate attempts within that slice are avoided.
-        children_by_root = (
-            self._children_by_root_by_train_slice.setdefault(train_slice_key, {})
-            if self.evalset_policy is not None
-            else self._children_by_root
-        )
+        # 5. Generate children using evolutionary strategies.
         children = make_children_for_generation(
             adapter=self.al_adapter,
             frontier_candidates=frontier_candidates,
@@ -580,19 +624,18 @@ class EvolutionaryProposer:
             self.logger.log(f"Iteration {i}: Evolutionary proposer generated no children")
             return []
 
-        # 5. Filter children by prompt budget
+        # 6. Filter children by prompt budget
         valid_children = [c for c in children if within_prompt_budget(c)]
         if not valid_children:
             self.logger.log(f"Iteration {i}: No children passed budget check")
             return []
 
-        # 6. Screen children on the parent's high-signal failures first.
+        # 7. Screen children on the parent's high-signal failures first.
         # Only a child that fixes at least one-third of those failures is
         # allowed to reach GEPA's full validation evaluation.
         best_parent_idx = max(frontier_idxs_sorted, key=lambda idx: state.program_full_scores_val_set[idx])
         best_parent_cand_id = prog_idx_to_cand_id[best_parent_idx]
         parent_eval = frontier_evals[best_parent_cand_id]
-        use_high_signal_gate = getattr(self.al_adapter, "supports_high_signal_eval", False)
         cached_screening = self._cached_screening_scores(
             train_slice_key,
             valid_children,
@@ -611,7 +654,10 @@ class EvolutionaryProposer:
             )
         else:
             if use_high_signal_gate:
-                if best_parent_cand_id in cached_frontier_evals:
+                # A cached root score carries no traces, and neither does a root
+                # evaluated while the screens looked cached. Either way the gate
+                # needs the parent's failures, so fetch them now.
+                if best_parent_cand_id in cached_frontier_evals or not parent_eval.trajectories:
                     best_parent_candidate = next(
                         candidate for candidate in frontier_candidates if candidate.candidate_id == best_parent_cand_id
                     )

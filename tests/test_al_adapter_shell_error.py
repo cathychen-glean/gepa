@@ -607,6 +607,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     )
     with (
         patch.object(second_evalcli, "create_eval_run") as create_eval_run,
+        patch.object(second_evalcli, "wait_for_eval_run") as wait_for_eval_run,
         patch(
             "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
         ) as fetch,
@@ -614,6 +615,8 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         with_traces = second.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=True)
 
     create_eval_run.assert_not_called()
+    # The ID was cached at creation, so a resumed run must confirm the run finished.
+    wait_for_eval_run.assert_called_once_with("run_123")
     fetch.assert_called_once()
     assert fetch.call_args.kwargs["include_error_examples"] is True
     assert fetch.call_args.kwargs["include_per_entry"] is True

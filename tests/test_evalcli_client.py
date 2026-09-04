@@ -77,6 +77,26 @@ def test_al_runner_caches_created_eval_before_waiting(tmp_path):
     assert list(events[0][2].values()) == ["run_123"]
 
 
+def test_al_runner_waits_for_an_eval_run_cached_by_an_interrupted_process(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(client, "create_eval_run", return_value="run_123"),
+        patch.object(client, "wait_for_eval_run"),
+    ):
+        ALRunner(evalcli=client, cache_file=str(cache_file)).run("fast", "prompt", "eval-set", "v1", ["scio-prod"])
+
+    resumed = ALRunner(evalcli=client, cache_file=str(cache_file))
+    with (
+        patch.object(client, "create_eval_run") as create_eval_run,
+        patch.object(client, "wait_for_eval_run") as wait_for_eval_run,
+    ):
+        assert resumed.run("fast", "prompt", "eval-set", "v1", ["scio-prod"]) == "run_123"
+
+    create_eval_run.assert_not_called()
+    wait_for_eval_run.assert_called_once_with("run_123")
+
+
 def test_create_judge_run_parses_response_list():
     client = EvalCliClient(binary="/fake/evalcli")
     with patch.object(client, "_invoke_json", return_value=[{"id": "judge_456", "status": "SUBMITTED"}]):

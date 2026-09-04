@@ -395,13 +395,17 @@ class ALRunner:
         cache_key = (model, system_prompt_hash, eval_set_name, eval_set_version, run_label)
 
         with self._cache_lock:
-            if cache_key in self._eval_run_ids:
-                cached_eval_id = self._eval_run_ids[cache_key]
-                print(
-                    f"[Eval run cache HIT] Using cached student eval_id: {cached_eval_id} "
-                    f"for {eval_set_name}:{eval_set_version} ({run_label})"
-                )
-                return cached_eval_id
+            cached_eval_id = self._eval_run_ids.get(cache_key)
+        if cached_eval_id is not None:
+            print(
+                f"[Eval run cache HIT] Using cached student eval_id: {cached_eval_id} "
+                f"for {eval_set_name}:{eval_set_version} ({run_label})"
+            )
+            # The ID is cached at creation, so a cached run may still be in
+            # flight: an interrupted process leaves its eval run polling from
+            # here on resume instead of reading a half-finished run's results.
+            self._wait_for_eval_run(cached_eval_id)
+            return cached_eval_id
 
         eval_id = f"{run_label}_{model}_{system_prompt_hash}_{int(time.time())}"
 
@@ -432,13 +436,15 @@ class ALRunner:
         if on_created is not None:
             on_created(created_id)
 
-        if self.eval_run_timeout_sec is None:
-            self.evalcli.wait_for_eval_run(created_id)
-        else:
-            self.evalcli.wait_for_eval_run(created_id, timeout_sec=self.eval_run_timeout_sec)
-        print(f"Eval run {created_id} completed successfully")
+        self._wait_for_eval_run(created_id)
 
         return created_id
+
+    def _wait_for_eval_run(self, eval_run_id: str) -> None:
+        if self.eval_run_timeout_sec is None:
+            self.evalcli.wait_for_eval_run(eval_run_id)
+        else:
+            self.evalcli.wait_for_eval_run(eval_run_id, timeout_sec=self.eval_run_timeout_sec)
 
     def get_eval_run_id(
         self,
