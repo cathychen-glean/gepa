@@ -558,7 +558,7 @@ class ALRunner:
         if candidate is None:
             return None
         if candidate in verified:
-            wait_required = candidate == in_flight_id and candidate != completed_id
+            wait_required = candidate == in_flight_id
             if wait_required:
                 print(f"[Eval run cache HIT] Resuming in-flight eval_id: {candidate}")
             else:
@@ -664,9 +664,11 @@ class ALRunner:
             cache_key = self._in_flight.get(eval_run_id)
             completed = eval_run_id in self._eval_run_ids.values()
             verified = eval_run_id in self._verified_eval_ids
-        if completed and verified:
-            with self._cache_lock:
-                self._in_flight.pop(eval_run_id, None)
+        # An id can sit in both maps: an earlier session promoted it to completed,
+        # then a later probe found Cortex still running it. The in-flight entry is
+        # the newer fact and must win, or the run gets scored while it is still
+        # producing spans and the caller reads partial telemetry as if it were final.
+        if cache_key is None and completed and verified:
             return
 
         if self.eval_run_timeout_sec is None:

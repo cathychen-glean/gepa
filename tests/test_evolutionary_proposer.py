@@ -2,6 +2,8 @@ import json
 from typing import ClassVar
 from unittest.mock import MagicMock
 
+import pytest
+
 from gepa.core.engine import GEPAEngine
 from gepa.core.state import ValsetEvaluation
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
@@ -9,7 +11,11 @@ from gepa.strategies.acceptance import StrictImprovementAcceptance
 from glean_gepa.al_adapter import Candidate, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
-from glean_gepa.evolutionary_proposer import EvolutionaryProposer, make_children_for_generation
+from glean_gepa.evolutionary_proposer import (
+    CHILDREN_CACHE_SCHEMA_VERSION,
+    EvolutionaryProposer,
+    make_children_for_generation,
+)
 
 
 class _ReflectionAdapter:
@@ -242,6 +248,58 @@ def test_children_cache_survives_proposer_restart(tmp_path) -> None:
     ]
 
 
+@pytest.mark.parametrize("schema_version", range(2, CHILDREN_CACHE_SCHEMA_VERSION + 1))
+def test_loads_every_released_children_cache_schema(tmp_path, schema_version) -> None:
+    cache_file = tmp_path / "children.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "training_slices": [
+                    {
+                        "train_ids": [0],
+                        "root_screening_scores": {"root": 0.75},
+                        "roots": {
+                            "root": [
+                                {
+                                    "prompt_modules": {"WRITING_CODE": "cached rewrite"},
+                                    "eval_run_ids": [
+                                        {
+                                            "eval_set_name": "focused",
+                                            "eval_set_version": "v1",
+                                            "student_eval_run_id": "eval-child-1",
+                                        }
+                                    ],
+                                    "screening_score": 0.5,
+                                    "screening_passed": True,
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    proposer = _proposer(_ReflectionAdapter(), str(cache_file))
+    child = proposer._children_by_root_by_train_slice[(0,)]["root"][0]
+
+    assert child.prompt_modules["WRITING_CODE"] == "cached rewrite"
+    assert proposer._cached_root_screening_score((0,), "root") == 0.75
+    assert proposer._cached_eval_run_ids((0,), child)[0]["student_eval_run_id"] == "eval-child-1"
+    assert proposer._cached_screening_scores((0,), [child], use_high_signal_gate=True) == [(0.5, True)]
+
+
+def test_ignores_children_cache_written_by_a_newer_schema(tmp_path) -> None:
+    """A cache from a future version is unreadable, so it must not be trusted."""
+    cache_file = tmp_path / "children.json"
+    cache_file.write_text(json.dumps({"schema_version": CHILDREN_CACHE_SCHEMA_VERSION + 1, "training_slices": []}))
+
+    proposer = _proposer(_ReflectionAdapter(), str(cache_file))
+
+    assert proposer._children_by_root_by_train_slice == {}
+
+
 def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None:
     cache_file = str(tmp_path / "children.json")
     root = _candidate("root")
@@ -348,10 +406,7 @@ def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_pat
             self.root_evaluation_calls += len(candidates)
             if capture_traces:
                 return [_Evaluation() for _ in candidates]
-            return [
-                GleanEvaluationBatch(outputs=[{}], scores=[1.0], summary={"objective": 1.0})
-                for _ in candidates
-            ]
+            return [GleanEvaluationBatch(outputs=[{}], scores=[1.0], summary={"objective": 1.0}) for _ in candidates]
 
     first_adapter = _TraceRecordingAdapter()
     first_proposer = _proposer(first_adapter, cache_file)

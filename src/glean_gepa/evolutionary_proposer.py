@@ -345,7 +345,12 @@ class EvolutionaryProposer:
             if not isinstance(data, dict):
                 raise ValueError("child cache root must be a JSON object")
             schema_version = data.get("schema_version")
-            if schema_version not in (1, 2, 3, 7, CHILDREN_CACHE_SCHEMA_VERSION):
+            # Accept every released schema up to the current one. An explicit
+            # allow-list silently discarded caches whenever a version was bumped
+            # without being added to it, which forces children to be re-proposed.
+            # Only v1 needs a shape transform; later versions share a record shape,
+            # and anything unreadable is caught below and degrades to an empty cache.
+            if not isinstance(schema_version, int) or not 1 <= schema_version <= CHILDREN_CACHE_SCHEMA_VERSION:
                 print(f"[Child cache] Ignoring unsupported cache schema in {self.children_cache_file}")
                 return
 
