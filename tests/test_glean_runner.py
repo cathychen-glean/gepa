@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from glean_gepa.prompt import compile_system_prompt, materialize_system_prompt, with_core_tool_defaults
+from glean_gepa.prompt import candidate_module_names, compile_system_prompt, materialize_system_prompt
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
@@ -96,22 +96,24 @@ def test_load_seed_candidate_accepts_known_keys(tmp_path, raw):
 
 
 def test_seed_for_editable_modules():
-    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == with_core_tool_defaults(
-        {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
-    )
-    assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == with_core_tool_defaults(
-        {WRITING_CODE_KEY: "patterns"}
-    )
+    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == {
+        FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"
+    }
+    assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: "patterns"}
 
     raw = {**SEED_BOTH, "glean_search": "Search less."}
     seed = _seed_for_editable_modules(raw, [FULL_PROMPT_KEY])
-    assert seed["glean_search"] == "Search less."
-    assert seed["discover"] == with_core_tool_defaults({})["discover"]
+    assert seed == {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
 
     frozen = _seed_for_editable_modules(SEED_BOTH, [])
     assert frozen[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
     assert WRITING_CODE_KEY not in frozen
-    assert frozen["glean_search"] == with_core_tool_defaults({})["glean_search"]
+    assert "glean_search" not in frozen
+
+    core_tool_seed = _seed_for_editable_modules(raw, ["glean_search", "discover"])
+    assert core_tool_seed["glean_search"] == "Search less."
+    assert core_tool_seed["discover"] == PROMPT_MODULE_DEFAULTS["discover"]
+    assert core_tool_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
 
     rules_seed = _seed_for_editable_modules({**SEED_BOTH, RULES_EXT_KEY: ""}, [RULES_EXT_KEY])
     assert rules_seed[RULES_EXT_KEY] == ""
@@ -125,6 +127,13 @@ def test_seed_for_editable_modules():
     overridden = _seed_for_editable_modules({RULES_EXT_KEY: "- Prefer Write."}, [RULES_EXT_KEY])
     assert overridden[RULES_EXT_KEY] == "- Prefer Write."
     assert overridden[FULL_PROMPT_KEY] == materialize_system_prompt({})
+
+
+def test_writing_code_only_does_not_expand_core_tools():
+    editable_modules = [WRITING_CODE_KEY]
+
+    assert candidate_module_names(editable_modules) == editable_modules
+    assert _seed_for_editable_modules(SEED_BOTH, editable_modules) == {WRITING_CODE_KEY: "patterns"}
 
 
 def test_parse_editable_modules():

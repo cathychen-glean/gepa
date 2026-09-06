@@ -70,8 +70,8 @@ def compile_encoded_prompt(candidate: dict[str, str]) -> str:
 
 
 def candidate_module_names(editable_modules: Sequence[str]) -> list[str]:
-    """Editable modules plus core-tool description keys, de-duplicated in that order."""
-    return list(dict.fromkeys([*editable_modules, *CORE_TOOLS]))
+    """Return the editable candidate modules, de-duplicated in order."""
+    return list(dict.fromkeys(editable_modules))
 
 
 def tool_description_override_key(span_name: str) -> str:

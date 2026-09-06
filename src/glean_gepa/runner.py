@@ -28,9 +28,8 @@ from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
-from glean_gepa.prompt import candidate_module_names, materialize_system_prompt, with_core_tool_defaults
+from glean_gepa.prompt import candidate_module_names, materialize_system_prompt
 from glean_gepa.prompt_constants import (
-    CORE_TOOL_KEYS,
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
     FULL_PROMPT_KEY,
@@ -115,7 +114,8 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     ``FULL_PROMPT`` is a fully stitched system prompt when that key is editable.
     When neither ``FULL_PROMPT`` nor ``WRITING_CODE`` is editable, the materialized
     seed prompt is still attached so evals keep a frozen system prompt. Core-tool
-    descriptions are always attached so evals can override ``schema.description``.
+    descriptions are attached only when they are editable, so a ``WRITING_CODE``-only
+    run keeps the legacy candidate and compiled-prompt hashes.
     ``RULES_EXT`` is copied from the seed when listed; compile time splices it into
     the ``{RULES_EXT}`` slot after Writing Code **Rules:**. Keys omitted from
     ``raw`` use ``PROMPT_MODULE_DEFAULTS``.
@@ -124,15 +124,12 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     for key in editable_modules:
         if key == FULL_PROMPT_KEY:
             seed[key] = materialize_system_prompt(raw)
-        elif key not in CORE_TOOL_KEYS:
+        else:
             seed[key] = raw.get(key, PROMPT_MODULE_DEFAULTS[key])
     editing_system_prompt = any(key in {FULL_PROMPT_KEY, WRITING_CODE_KEY} for key in editable_modules)
     if not editing_system_prompt:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
-    for key in CORE_TOOLS:
-        if key in raw:
-            seed.setdefault(key, raw[key])
-    return with_core_tool_defaults(seed)
+    return seed
 
 
 def _make_reflection_lm(
