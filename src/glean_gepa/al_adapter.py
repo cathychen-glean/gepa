@@ -378,7 +378,6 @@ ReflectiveMetricsFn = Callable[[ReflectiveExampleMetrics], str | None]
 class JudgeResult:
     correctness: float  # 0..1
     tool_alignment: float
-    grounding: float
     rationale: str
     traces: dict[str, list[TraceInfo]] | None = None  # Maps entry_id -> list of trace_info dicts
 
@@ -920,13 +919,10 @@ class Judge:
         correctness = sum(correctness_score_list) / len(correctness_score_list) if correctness_score_list else 0.0
         tool_alignment = get_tool_alignment(trace_map, student_eval_id, teacher_eval_id)
 
-        # Use correctness as proxy for other metrics
-        grounding = correctness
         rationale = f"Correctness: {correctness:.2f} (avg of {len(correctness_score_list)} entries)"
 
         return JudgeResult(
             correctness=correctness,
-            grounding=grounding,
             tool_alignment=tool_alignment,
             rationale=rationale,
             traces=dict(trace_map),

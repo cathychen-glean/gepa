@@ -93,10 +93,9 @@ def format_eval_entry_report(trajectories: Sequence[Mapping[str, Any]] | None) -
         metric_parts = [f"score={_fmt_metric(score)}"]
         if tool_alignment is not None:
             metric_parts.append(f"tool_alignment={_fmt_metric(tool_alignment)}")
-        for key in ("completeness", "grounding"):
-            value = metrics.get(key)
-            if value is not None:
-                metric_parts.append(f"{key}={_fmt_metric(value)}")
+        completeness = metrics.get("completeness")
+        if completeness is not None:
+            metric_parts.append(f"completeness={_fmt_metric(completeness)}")
         teacher_seq = " > ".join(scored_tool_sequence(teacher_tools)) or "(none)"
         student_seq = " > ".join(scored_tool_sequence(student_tools)) or "(none)"
         blocks.append(
