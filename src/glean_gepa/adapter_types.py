@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing import Literal, NamedTuple, NotRequired, TypeAlias, TypedDict
 
 JudgingMode: TypeAlias = Literal["teacher_student", "single_model"]
+
+
+class PointwiseJudge(NamedTuple):
+    """A Cortex pointwise judge and the composite dimension its score feeds.
+
+    ``name`` is the config signal name, which is what ``objective.composite``
+    weights; ``judge_type`` is the Cortex-side identity used to start and read
+    the judge run.
+    """
+
+    name: str
+    judge_type: str
+    run_params: str
 
 
 class EvalSetALDataInst(TypedDict):
@@ -107,6 +120,7 @@ __all__ = [
     "ALTrajectory",
     "EvalSetALDataInst",
     "JudgingMode",
+    "PointwiseJudge",
     "SingleModelALDataInst",
     "SingleModelALRolloutOutput",
     "SingleModelALTrajectory",

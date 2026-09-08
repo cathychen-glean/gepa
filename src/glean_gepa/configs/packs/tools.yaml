@@ -1,0 +1,22 @@
+# Pack: teacher/student first-tool alignment from paired traces.
+# Scorable only by teacher_student mode, which requires `packs: [tools]`.
+
+signals:
+  # Bounds the Agentspan shard window, which is measured back from UTC today --
+  # not from the eval run's own date. Tool-match analysis is re-queried on every
+  # process start (it is not persisted), so this must cover the age of the oldest
+  # eval run still being reused from the eval-run cache, or the query returns zero
+  # compared entries and scoring fails.
+  - name: tool_alignment
+    source: tool_match
+    lookback_days: 7
+
+objective:
+  primary: tool_alignment
+  composite:
+    tool_alignment: 1.0
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.333
+  high_signal: first_tool_mismatch

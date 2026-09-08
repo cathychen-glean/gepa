@@ -87,6 +87,7 @@ glean = [
     "openai>=2.54.0,<3",
     "tiktoken>=0.11.0",
     "truststore>=0.10.4,<1",
+    "pyyaml",
 ]
 
 langchain = [
@@ -104,6 +105,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 gepa = ["py.typed"]
+glean_gepa = ["configs/*.yaml", "configs/packs/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

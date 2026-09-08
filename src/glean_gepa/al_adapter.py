@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any, Callable, NotRequired, TypedDict, cast
+from typing import Any, Callable, Mapping, NotRequired, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
@@ -1185,6 +1185,10 @@ class Thresholds:
 class GleanAdapterBase:
     supports_high_signal_eval = False
 
+    #: Dimensions the subclass resolves from evaluation telemetry, as opposed to the
+    #: constants and judge scores the base already knows about.
+    telemetry_dimensions: tuple[str, ...] = ()
+
     def __init__(
         self,
         runner: ALRunner,
@@ -1200,12 +1204,17 @@ class GleanAdapterBase:
         primary_objective: str,
         default_frontier_type: str,
         editable_modules: list[str],
+        composite_weights: dict[str, float],
+        constant_scores: dict[str, float],
         cache_file: str | None = None,
     ):
         self.runner = runner
         self.thresholds = thresholds
         self.student_model = student_model
         self.primary_objective = primary_objective
+        self.composite_weights = dict(composite_weights)
+        self.constant_scores = dict(constant_scores)
+        self._require_scorable_composite_weights()
         self.default_frontier_type = default_frontier_type
         self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
@@ -1236,6 +1245,28 @@ class GleanAdapterBase:
         # Load cache if file exists
         if self.cache_file:
             self._load_cache()
+
+    def scorable_dimensions(self) -> set[str]:
+        """Composite dimensions this adapter can resolve a per-entry value for."""
+        return {*self.telemetry_dimensions, *self.constant_scores}
+
+    def composite_score(self, dimension_values: Mapping[str, float]) -> float:
+        """Weight the resolved dimensions by ``objective.composite``.
+
+        Indexes rather than defaulting to 0.0: a weight that resolves to nothing is a
+        wiring bug, and silently dropping it would report a composite the run never
+        actually applied.
+        """
+        return sum(weight * dimension_values[name] for name, weight in self.composite_weights.items())
+
+    def _require_scorable_composite_weights(self) -> None:
+        scorable = self.scorable_dimensions()
+        unscorable = sorted(set(self.composite_weights) - scorable)
+        if unscorable:
+            raise ValueError(
+                f"composite_weights name dimensions {type(self).__name__} cannot score: "
+                f"{', '.join(unscorable)}; scorable dimensions are {', '.join(sorted(scorable))}"
+            )
 
     def _load_cache(self) -> None:
         """Load analysis and judge-trigger state from the adapter cache."""

@@ -1,6 +1,7 @@
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,6 +23,7 @@ from glean_gepa.runner import (
     _load_seed_candidate,
     _parse_args,
     _parse_editable_modules,
+    _resolve_eval_version_split,
     _seed_for_editable_modules,
     _select_recent_train_and_val_versions,
 )
@@ -219,6 +221,44 @@ def test_default_cache_file_moves_legacy_root_cache_on_resume(tmp_path):
 def test_parse_args_rejects_invalid_reflection_sample_count(value):
     with pytest.raises(SystemExit):
         _parse_args(["--seed_candidate", "seed.json", "--reflection_samples", value])
+
+
+def _version(days_ago: int) -> str:
+    return (date.today() - timedelta(days=days_ago)).strftime("%Y%m%d")
+
+
+def _auto_selected_split(days_back: int | None) -> tuple[list[str], list[str]]:
+    """Resolve the automatic split against six consecutive daily versions."""
+    argv = ["--seed_candidate", "seed.json"]
+    if days_back is not None:
+        argv += ["--eval_version_days_back", str(days_back)]
+    evalcli = MagicMock()
+    evalcli.list_eval_set_versions.return_value = [{"version": _version(n)} for n in range(6)]
+    return _resolve_eval_version_split(_parse_args(argv), evalcli)
+
+
+def test_eval_version_days_back_holds_the_auto_selection_window_still():
+    """Without this the window tracks the calendar, so a new daily version lands in
+    the valset and misses the eval-run cache."""
+    train_today, val_today = _auto_selected_split(0)
+    train_shifted, val_shifted = _auto_selected_split(2)
+
+    assert val_today == [_version(1), _version(0)]
+    assert val_shifted == [_version(3), _version(2)]
+    assert train_today[-1] == _version(2)
+    assert train_shifted[-1] == _version(4)
+    # The shifted window excludes everything newer than the as-of date.
+    assert _version(0) not in train_shifted and _version(0) not in val_shifted
+
+
+def test_eval_version_days_back_defaults_to_today():
+    assert _auto_selected_split(None) == _auto_selected_split(0)
+    assert _parse_args(["--seed_candidate", "seed.json"]).eval_version_days_back == 0
+
+
+def test_eval_version_days_back_rejects_negative_values():
+    with pytest.raises(SystemExit):
+        _parse_args(["--seed_candidate", "seed.json", "--eval_version_days_back", "-1"])
 
 
 def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
