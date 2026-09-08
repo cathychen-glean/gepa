@@ -54,12 +54,12 @@ def test_both_adapters_default_to_scoring_their_own_telemetry_dimension(build, t
 @pytest.mark.parametrize(("build", "telemetry_dimension"), BOTH_ADAPTERS)
 def test_both_adapters_weight_constants_through_the_composite(build, telemetry_dimension):
     adapter = build(
-        composite_weights={telemetry_dimension: 0.6, "grounding": 0.4},
-        constant_scores={"grounding": 0.5},
+        composite_weights={telemetry_dimension: 0.6, "fixed_signal": 0.4},
+        constant_scores={"fixed_signal": 0.5},
     )
 
-    assert {telemetry_dimension, "grounding"} <= adapter.scorable_dimensions()
-    assert adapter.composite_score({telemetry_dimension: 1.0, "grounding": 0.5}) == pytest.approx(0.8)
+    assert {telemetry_dimension, "fixed_signal"} <= adapter.scorable_dimensions()
+    assert adapter.composite_score({telemetry_dimension: 1.0, "fixed_signal": 0.5}) == pytest.approx(0.8)
 
 
 @pytest.mark.parametrize(("build", "telemetry_dimension"), BOTH_ADAPTERS)

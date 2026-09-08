@@ -64,19 +64,13 @@ signals:
       llm_model: default
       use_cache: true
 
-  - name: grounding
-    source: constant
-    value: 1.0
-
 objective:
   frontier_type: hybrid
   # tool_alignment carries the whole objective, so the score reads directly as the
-  # first-tool match rate. grounding is deliberately unweighted: it is a constant,
-  # so any weight on it adds the same offset to every candidate and can never
-  # change the ranking.
+  # first-tool match rate.
   #
-  # The blend used while the completeness judge was enabled, for reference:
-  #   composite: {completeness: 0.5, tool_alignment: 0.3, grounding: 0.2}
+  # The blend to use if the completeness judge is re-enabled:
+  #   composite: {completeness: 0.5, tool_alignment: 0.5}
   composite:
     tool_alignment: 1.0
   # Enable the pairwise judge and uncomment to gate on correctness:

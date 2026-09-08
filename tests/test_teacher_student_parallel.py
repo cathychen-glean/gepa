@@ -281,18 +281,17 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
         capture_traces=True,
     )
 
-    assert result.scores == pytest.approx([0.7])
-    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0, "grounding": 1.0}]
+    assert result.scores == pytest.approx([0.5])
+    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0}]
     assert result.outputs[0]["student_tool_events"] == ["search"]
     assert result.outputs[0]["teacher_tool_events"] == ["read"]
     assert result.summary == {
         "completeness": 1.0,
         "tool_alignment": 0.0,
-        "grounding": 1.0,
         "teacher_completeness": 0.9,
     }
     assert result.trajectories is not None
-    assert result.trajectories[0]["score"] == pytest.approx(0.7)
+    assert result.trajectories[0]["score"] == pytest.approx(0.5)
 
 
 def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
@@ -385,7 +384,6 @@ def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
     assert result.summary == {
         "completeness": 0.0,
         "tool_alignment": 0.0,
-        "grounding": 1.0,
         "teacher_completeness": 0.0,
     }
 

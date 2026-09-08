@@ -29,7 +29,7 @@ def test_load_packaged_teacher_student_merges_tools_pack():
     # completeness is still declared so it can be switched back on, but it is
     # disabled, so no judge runs are started and it carries no weight.
     signal_names = [signal["name"] for signal in config.signals]
-    assert signal_names == ["tool_alignment", "completeness", "correctness", "grounding"]
+    assert signal_names == ["tool_alignment", "completeness", "correctness"]
     assert pointwise_judges(config) == ()
     assert composite_weights(config) == {"tool_alignment": 1.0}
     # The mode file overrides only the pack's threshold; kind and high_signal
