@@ -66,6 +66,20 @@ Both adapters satisfy the same GEPA-facing contract: candidates are `dict[str, s
 
 Keep evaluation behavior stable while changing the surrounding code. Do not simultaneously change scoring, candidate selection, or remote-evaluation semantics.
 
+## Customer eval after optimization
+
+When a real (non-`--fake_flow`) run finishes, `runner.py` runs the seed baseline
+and best candidate on the same **Glean Chat V2 Medium** customer entries. The
+eval-set **version is not configured**: EvalCLI is queried at runtime, and the
+newest `YYYYMMDD` version available to every configured customer is used.
+
+The best run is judged for pairwise correctness against the baseline. The
+held-out check passes only when correctness is above 80% and the EvalCLI paired
+comparison finds no statistically significant change (Benjamini-Hochberg
+adjusted `p >= 0.05`) in average cost, average loops, or any tool invocation
+rate. A failed gate exits the run unsuccessfully. These evals do not feed the
+search.
+
 ## Reflection sampling CLI
 
 Use all available reflective examples when each iteration's example set is
