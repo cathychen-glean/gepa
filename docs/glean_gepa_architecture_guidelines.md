@@ -94,6 +94,46 @@ uv run python -m glean_gepa.runner \
 6. Cache keys must include every result-changing input: eval-set identity/version, model, prompt hash, and run label. Keep fresh eval-set cache behavior explicit.
 7. Every extraction step gets characterization tests before cleanup. Remote EvalCLI/BigQuery runs are smoke tests, not unit tests.
 
+## Children cache (`glean_children_cache.json`)
+
+`EvolutionaryProposer` persists generated children so a resumed run does not
+re-reflect the same root on the same training slice. The file lives at
+`<run_dir>/cache/glean_children_cache.json` unless `--children_cache_file` is set.
+
+There is no schema version field. The file is the current record shape only;
+unreadable files degrade to an empty cache and those children are proposed
+again. Do not reintroduce version numbers or compatibility shims.
+
+```json
+{
+  "training_slices": [
+    {
+      "train_ids": [0],
+      "root_screening_scores": {"<root_id>": 0.75},
+      "roots": {
+        "<root_id>": [
+          {
+            "prompt_modules": {"WRITING_CODE": "..."},
+            "eval_run_ids": [
+              {
+                "eval_set_name": "focused",
+                "eval_set_version": "v1",
+                "student_eval_run_id": "eval-child-1"
+              }
+            ],
+            "screening_score": 0.5,
+            "screening_passed": true
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+`screening_passed` is stored, but a high-signal resume recomputes pass/fail
+from `screening_score` and the current threshold.
+
 ## Suggested ownership split
 
 The junior collaborator can own the **SingleModelAdapter vertical slice**—about one-third of the overall work—because it has a clear product boundary and can be tested with fakes. You retain the more coupled optimization and judge-comparison behavior.

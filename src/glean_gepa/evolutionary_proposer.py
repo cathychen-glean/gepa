@@ -34,7 +34,6 @@ from glean_gepa.prompt_constants import CORE_TOOL_KEYS, PROMPT_MODULE_DEFAULTS
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
 
-CHILDREN_CACHE_SCHEMA_VERSION = 6
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 1 / 3
 
 
@@ -344,15 +343,6 @@ class EvolutionaryProposer:
             data = json.loads(self.children_cache_file.read_text())
             if not isinstance(data, dict):
                 raise ValueError("child cache root must be a JSON object")
-            schema_version = data.get("schema_version")
-            # Accept every released schema up to the current one. An explicit
-            # allow-list silently discarded caches whenever a version was bumped
-            # without being added to it, which forces children to be re-proposed.
-            # Only v1 needs a shape transform; later versions share a record shape,
-            # and anything unreadable is caught below and degrades to an empty cache.
-            if not isinstance(schema_version, int) or not 1 <= schema_version <= CHILDREN_CACHE_SCHEMA_VERSION:
-                print(f"[Child cache] Ignoring unsupported cache schema in {self.children_cache_file}")
-                return
 
             restored: dict[tuple[Any, ...], dict[str, list[Candidate]]] = {}
             restored_records: dict[tuple[Any, ...], dict[str, dict[str, ChildCacheRecord]]] = {}
@@ -368,10 +358,7 @@ class EvolutionaryProposer:
                     root_key = str(root_id)
                     roots[root_key] = []
                     records_by_root[root_key] = {}
-                    for raw_child in child_records:
-                        child_record = (
-                            {"prompt_modules": raw_child, "eval_run_ids": []} if schema_version == 1 else raw_child
-                        )
+                    for child_record in child_records:
                         child = self._to_candidate(child_record["prompt_modules"], parent_id=root_key)
                         roots[root_key].append(child)
                         records_by_root[root_key][child.candidate_id] = ChildCacheRecord(
@@ -397,7 +384,6 @@ class EvolutionaryProposer:
         if self.children_cache_file is None:
             return
         data = {
-            "schema_version": CHILDREN_CACHE_SCHEMA_VERSION,
             "training_slices": [
                 {
                     "train_ids": list(train_ids),

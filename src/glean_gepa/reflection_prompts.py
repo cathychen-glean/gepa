@@ -10,11 +10,17 @@ from glean_gepa.prompt_constants import CORE_TOOL_KEYS, FULL_PROMPT_KEY, RULES_E
 
 DEFAULT_MODULE_RESPONSIBILITY = "Focus only on this module's responsibilities."
 
+CONDITIONAL_PRESERVE_RULE = (
+    "Never remove conditionals such as <<<[[hitl_approval_instructions]]>>>; keep every "
+    "<<<[[name]] ... >>> wrapper. You may modify the enclosed text as needed but be aware of the conditional."
+)
+
 FULL_PROMPT_TEACHER_STUDENT_RESPONSIBILITY = (
     "You are editing the ENTIRE student system prompt as a single string. Any section "
     "may change — routing, execution discipline, coding instructions, tool surface, "
     "or response guidelines — if it improves first-tool alignment with the teacher. "
-    "Preserve [[placeholder]] tokens. Propose a complete updated prompt with minimal deltas."
+    f"Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} "
+    "Propose a complete updated prompt with minimal deltas."
 )
 
 RULES_EXT_RESPONSIBILITY = (
@@ -28,7 +34,7 @@ RULES_EXT_RESPONSIBILITY = (
 WRITING_CODE_SINGLE_MODEL_RESPONSIBILITY = (
     "Focus ONLY on coding instructions that affect shell tool reliability: SDK call patterns, "
     "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
-    "Use shell error examples as evidence. Propose minimal deltas."
+    f"Use shell error examples as evidence. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
 )
 
 FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the failed examples."
@@ -102,7 +108,8 @@ def diagnosis_prompt(
         f"   - WHY: one sentence\n"
         f"3) Every supplied example is relevant evidence for {module_name}; use it to propose a variant.\n"
         f"4) Make only generalizable changes; do not overfit to individual examples.\n"
-        f"5) {length_rule}\n"
+        f"5) {CONDITIONAL_PRESERVE_RULE}\n"
+        f"6) {length_rule}\n"
     )
 
 
@@ -119,7 +126,7 @@ def consolidate_prompt(
     return (
         f"Consolidate the following patch suggestions into up to {max_variants} candidate rewrites "
         f"of the module {module_name}. Preserve good behavior, incorporate consistent changes only, "
-        f"and make only generalizable changes. {consolidate_length}"
+        f"and make only generalizable changes. {CONDITIONAL_PRESERVE_RULE} {consolidate_length}"
         f"Output each variant separated by '\n===VARIANT===\n'.\n\n"
         f"CURRENT:\n<<<\n{current}\n>>>\n\n"
         f"EVIDENCE (every example is relevant):\n{example_blocks}\n\n"
