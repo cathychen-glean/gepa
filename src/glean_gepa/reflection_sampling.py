@@ -72,6 +72,40 @@ def is_within_hamming_distance(left: str, right: str, k: int) -> bool:
     return hamming_distance(left, right) <= k
 
 
+FAILURE_PATTERN_DUPLICATE_SLACK = 3
+
+TrajectoryT = TypeVar("TrajectoryT")
+
+
+def select_diverse_by_failure_pattern(
+    trajectories: Sequence[TrajectoryT],
+    *,
+    pattern_fn: Callable[[TrajectoryT], tuple[Any, ...]],
+    relevance_fn: Callable[[TrajectoryT], float],
+    score_fn: Callable[[TrajectoryT], float],
+    k: int | None,
+    duplicate_slack: int = FAILURE_PATTERN_DUPLICATE_SLACK,
+) -> list[TrajectoryT]:
+    """Rank by relevance then score, keeping diverse failure patterns up to ``k``.
+
+    Duplicate patterns are allowed until ``k - duplicate_slack`` examples are
+    already selected; after that, a seen pattern is skipped.
+    """
+    scored = [(relevance_fn(trajectory), index, trajectory) for index, trajectory in enumerate(trajectories)]
+    scored.sort(key=lambda item: (-item[0], score_fn(item[2])))
+    selected: list[TrajectoryT] = []
+    seen_patterns: set[tuple[Any, ...]] = set()
+    for _relevance, _index, trajectory in scored:
+        pattern = pattern_fn(trajectory)
+        if k is not None and pattern in seen_patterns and len(selected) > k - duplicate_slack:
+            continue
+        selected.append(trajectory)
+        seen_patterns.add(pattern)
+        if k is not None and len(selected) >= k:
+            break
+    return selected
+
+
 def deduplicate_reflective_examples(
     examples: Sequence[ExampleT],
     k: int,

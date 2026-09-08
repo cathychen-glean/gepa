@@ -700,7 +700,9 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def default_date_range(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None) -> tuple[date, date]:
+def default_date_range(
+    *, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None
+) -> tuple[date, date]:
     search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
     return search_start, search_end
 

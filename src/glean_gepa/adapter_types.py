@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from dataclasses import dataclass
+from typing import Literal, NamedTuple, NotRequired, TypeAlias, TypedDict
 
 JudgingMode: TypeAlias = Literal["teacher_student", "single_model"]
+
+
+class PointwiseJudge(NamedTuple):
+    """A Cortex pointwise judge and the composite dimension its score feeds.
+
+    ``name`` is the config signal name, which is what ``objective.composite``
+    weights; ``judge_type`` is the Cortex-side identity used to start and read
+    the judge run.
+    """
+
+    name: str
+    judge_type: str
+    run_params: str
 
 
 class EvalSetALDataInst(TypedDict):
@@ -17,6 +31,9 @@ class EvalSetALDataInst(TypedDict):
     eval_entry_ids: NotRequired[list[str]]
     focused_eval_set_name: NotRequired[str]
     focused_eval_set_version: NotRequired[str]
+    source_eval_set_name: NotRequired[str]
+    source_eval_set_version: NotRequired[str]
+    source_entry_ids_by_focused_id: NotRequired[dict[str, str]]
 
 
 class SingleModelALDataInst(EvalSetALDataInst):
@@ -37,6 +54,7 @@ class TeacherStudentALDataInst(EvalSetALDataInst):
 
     cached_student_eval_run_id: NotRequired[str]
     cached_teacher_eval_run_id: NotRequired[str]
+    source_teacher_eval_run_id: NotRequired[str]
 
 
 class BaseALRolloutOutput(TypedDict):
@@ -93,6 +111,22 @@ class TeacherStudentALTrajectory(TypedDict):
     objective_scores: dict[str, float]
 
 
+@dataclass(frozen=True)
+class EntryTelemetry:
+    """One eval entry's objective values and the rollout row that explains them.
+
+    ``objective_scores`` holds only the dimensions the producing objective
+    measures. The adapter merges in the constants and judge scores that every
+    objective shares, so a new objective needs a producer returning these and
+    nothing else.
+    """
+
+    entry_id: str
+    student_entry_id: str
+    objective_scores: dict[str, float]
+    output: TeacherStudentALRolloutOutput
+
+
 # Shared infrastructure dispatches to one concrete adapter at runtime. Keep
 # these unions internal/compatibility-facing; adapter users should use the
 # concrete types above.
@@ -105,6 +139,7 @@ __all__ = [
     "ALDataInst",
     "ALRolloutOutput",
     "ALTrajectory",
+    "EntryTelemetry",
     "EvalSetALDataInst",
     "JudgingMode",
     "SingleModelALDataInst",

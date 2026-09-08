@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from glean_gepa.evalcli_client import EvalCliError
 from glean_gepa.run_log import (
     capture_run_log,
     format_child_proposal_report,
@@ -86,3 +89,32 @@ def test_capture_run_log_and_default_path(tmp_path, capsys):
     assert _resolve_log_file(args) == args.run_dir / RUN_LOG_FILENAME
     explicit = _parse_args(["--seed_candidate", "seed.json", "--log_file", "/tmp/custom.log"])
     assert _resolve_log_file(explicit).as_posix() == "/tmp/custom.log"
+
+
+def test_capture_run_log_records_the_fatal_traceback(tmp_path, capsys):
+    """Without this the log ends mid-run: the interpreter prints the traceback
+    only after the context manager has restored the real streams."""
+    log_path = tmp_path / "gepa_run.log"
+
+    with pytest.raises(EvalCliError, match="metrics were not ready"):
+        with capture_run_log(log_path):
+            print("[COMPLETENESS] Waiting for metrics on eval abc...")
+            raise EvalCliError("COMPLETENESS metrics were not ready after 3600s")
+
+    logged = log_path.read_text()
+    assert "[COMPLETENESS] Waiting for metrics on eval abc..." in logged
+    assert "Traceback (most recent call last)" in logged
+    assert "EvalCliError: COMPLETENESS metrics were not ready after 3600s" in logged
+    # Written straight to the file, so the terminal is left to the interpreter's
+    # own traceback rather than getting a duplicate from us.
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_capture_run_log_records_a_systemexit_message(tmp_path):
+    log_path = tmp_path / "gepa_run.log"
+
+    with pytest.raises(SystemExit):
+        with capture_run_log(log_path):
+            raise SystemExit("Train and validation eval versions must not overlap: 20260904")
+
+    assert "Train and validation eval versions must not overlap: 20260904" in log_path.read_text()

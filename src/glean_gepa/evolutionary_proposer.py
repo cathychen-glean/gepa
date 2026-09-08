@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import tempfile
 from dataclasses import dataclass, field
 from difflib import unified_diff
@@ -25,6 +24,7 @@ from glean_gepa.al_adapter import (
     Candidate,
     GleanAdapterBase,
     ModuleSpec,
+    approx_token_len,
     within_prompt_budget,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
@@ -36,6 +36,9 @@ from glean_gepa.utils import apply_single_module_edit
 
 CHILDREN_CACHE_SCHEMA_VERSION = 6
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 1 / 3
+# Empty proposals consume no budget, so a stuck schedule would otherwise loop
+# forever. Generous enough to tolerate a run of legitimately barren slices.
+MAX_EMPTY_PROPOSAL_STREAK = 25
 
 
 @dataclass
@@ -105,19 +108,34 @@ def make_children_for_generation(
     seen_child_programs: set[str] = set()
 
     def append_child(child: Candidate) -> bool:
-        """Append a distinct child while there is room in this generation."""
+        """Append a distinct, budget-fitting child while there is room."""
         child_key = json.dumps(child.prompt_modules, sort_keys=True)
         if child_key in seen_child_programs or len(children) >= offspring_count:
             return False
         seen_child_programs.add(child_key)
+        if not within_prompt_budget(child):
+            # Screening drops over-budget children, so admitting one here spends an
+            # offspring slot on a candidate that can never be scored -- and leaves a
+            # permanently unscored child behind, which keeps the slice alive forever.
+            over_budget = [
+                module_id
+                for module_id, spec in child.module_specs.items()
+                if module_id in child.prompt_modules
+                and approx_token_len(child.prompt_modules[module_id]) > spec.token_budget
+            ]
+            print(
+                "[Child generation] Skipping over-budget child: "
+                f"{', '.join(over_budget) if over_budget else 'exceeds the global token cap'}"
+            )
+            return False
         children.append(child)
         return True
 
-    # Pick a main parent using the concrete adapter's primary objective.
-    best_quality_parent = max(
-        frontier_candidates,
-        key=lambda c: adapter.get_screening_score(frontier_evals[c.candidate_id]),
-    )
+    def screening_score(candidate: Candidate) -> float:
+        return adapter.get_screening_score(frontier_evals[candidate.candidate_id])
+
+    # Rank parents by the concrete adapter's primary objective.
+    best_quality_parent = max(frontier_candidates, key=screening_score)
     print(f"Best quality parent: {best_quality_parent}")
 
     # A cached root is never reflected again. Reuse cached children first, in
@@ -144,11 +162,12 @@ def make_children_for_generation(
         ]
         if not uncached_roots:
             break
-        parent = (
-            best_quality_parent
-            if best_quality_parent in uncached_roots and random.random() < 0.7
-            else random.choice(uncached_roots)
-        )
+        # Always reflect on the strongest root not yet reflected for this slice.
+        # Sampling a weaker root instead spends a reflection call rediscovering
+        # mutations of a prompt already known to score worse, and a root is
+        # reflected at most once per slice, so working in quality order still
+        # drains the whole frontier.
+        parent = max(uncached_roots, key=screening_score)
         parent_eval = frontier_evals[parent.candidate_id]
         if not parent_eval.trajectories:
             # Need traces to reflect; skip mutation if missing.
@@ -318,6 +337,7 @@ class EvolutionaryProposer:
         # Both are scoped by training slice, root candidate, and child ID.
         self._child_cache_records_by_train_slice: dict[tuple[Any, ...], dict[str, dict[str, ChildCacheRecord]]] = {}
         self._root_screening_scores_by_train_slice: dict[tuple[Any, ...], dict[str, float]] = {}
+        self._empty_proposal_streak = 0
         self.children_cache_file = Path(children_cache_file).expanduser() if children_cache_file else None
         self._load_children_cache()
 
@@ -551,6 +571,10 @@ class EvolutionaryProposer:
         """True when this child still needs screening or has not yet entered the pool."""
         if self._program_key(child.prompt_modules) in existing_keys:
             return False
+        if not within_prompt_budget(child):
+            # Screening filters these out before they can be scored, so treating a
+            # missing score as "still to do" would keep the slice pending forever.
+            return False
         record = self._child_cache_record(train_ids, child)
         if record.screening_score is None:
             return True
@@ -622,6 +646,26 @@ class EvolutionaryProposer:
         )
 
     def propose(self, state: GEPAState) -> list[CandidateProposal]:
+        """Propose candidates, refusing to spin when no iteration can make progress.
+
+        An empty proposal consumes no budget, so ``max_metric_calls`` cannot end a
+        run that keeps producing them; without this guard the engine re-enters the
+        same iteration until the disk fills.
+        """
+        proposals = self._propose(state)
+        if proposals:
+            self._empty_proposal_streak = 0
+            return proposals
+        self._empty_proposal_streak += 1
+        if self._empty_proposal_streak >= MAX_EMPTY_PROPOSAL_STREAK:
+            raise RuntimeError(
+                f"Evolutionary proposer returned no candidates {self._empty_proposal_streak} times in a row; "
+                "the training schedule cannot advance. Check the screening report for children that "
+                "never become eligible."
+            )
+        return proposals
+
+    def _propose(self, state: GEPAState) -> list[CandidateProposal]:
         i = self.get_display_iteration(state)
 
         # 1. Get frontier program indices from Pareto front
@@ -753,8 +797,7 @@ class EvolutionaryProposer:
             reflection_hamming_distance_k=self.reflection_hamming_distance_k,
             children_by_root=children_by_root,
         )
-        if self.evalset_policy is not None:
-            self._save_children_cache()
+        self._save_children_cache()
 
         if not children:
             self.logger.log(f"Iteration {i}: Evolutionary proposer generated no children")
@@ -809,6 +852,7 @@ class EvolutionaryProposer:
                         best_parent_cand_id,
                         self.al_adapter.get_screening_score(parent_eval),
                     )
+                    self._save_children_cache()
                 high_signal_batch = self.al_adapter.high_signal_batch(parent_eval)
                 if not high_signal_batch:
                     self.logger.log(f"Iteration {i}: Parent has no high-signal failures; rejecting children")
@@ -842,6 +886,9 @@ class EvolutionaryProposer:
             screen_scores = []
             screened_children = []
             for child, screen_eval in zip(valid_children, screen_evals, strict=True):
+                # Record the eval-run linkage before scoring so a failure while
+                # scoring cannot orphan a screen that already ran.
+                self._record_eval_run_ids(train_slice_key, child, getattr(screen_eval, "eval_run_ids", None) or [])
                 score = (
                     self.al_adapter.high_signal_fix_rate(parent_eval, screen_eval)
                     if use_high_signal_gate
@@ -849,12 +896,12 @@ class EvolutionaryProposer:
                 )
                 passed = not use_high_signal_gate or score >= self.high_signal_screen_threshold
                 screen_scores.append(score)
-                self._record_eval_run_ids(train_slice_key, child, getattr(screen_eval, "eval_run_ids", None) or [])
                 self._record_screening_result(train_slice_key, child, score, passed)
+                # Checkpoint each child: screening one child can raise or hang, and
+                # saving only after the loop would discard every score before it.
+                self._save_children_cache()
                 if passed:
                     screened_children.append((child, screen_eval, score))
-            if self.evalset_policy is not None:
-                self._save_children_cache()
         passed_ids = {child.candidate_id for child, _eval, _score in screened_children}
         screening_rows: list[tuple[str, float, bool, str]] = []
         if cached_screening is not None:

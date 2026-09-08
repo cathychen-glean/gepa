@@ -1,5 +1,5 @@
 import json
-from typing import ClassVar
+from typing import ClassVar, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,9 +13,11 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import (
     CHILDREN_CACHE_SCHEMA_VERSION,
+    MAX_EMPTY_PROPOSAL_STREAK,
     EvolutionaryProposer,
     make_children_for_generation,
 )
+from glean_gepa.utils import apply_single_module_edit
 
 
 class _ReflectionAdapter:
@@ -38,6 +40,28 @@ class _ReflectionAdapter:
 class _Evaluation:
     def __init__(self) -> None:
         self.trajectories = [object()]
+
+
+class _ScoredEvaluation(_Evaluation):
+    def __init__(self, score: float) -> None:
+        super().__init__()
+        self.score = score
+
+
+class _ScoreOrderedAdapter(_ReflectionAdapter):
+    """Scores each root differently and records the order they are reflected on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reflected_parents: list[str] = []
+
+    def get_screening_score(self, eval_batch: object) -> float:
+        return float(getattr(eval_batch, "score", 0.0))
+
+    def propose_new_texts(self, **kwargs: object) -> tuple[list[str], object, str]:
+        candidate = cast(Candidate, kwargs["candidate"])
+        self.reflected_parents.append(candidate.candidate_id)
+        return super().propose_new_texts(**kwargs)
 
 
 class _ProposerAdapter(_ReflectionAdapter):
@@ -154,6 +178,31 @@ def test_reuses_children_cached_for_root_without_rereflecting() -> None:
     assert adapter.reflection_calls == 1
     assert [child.prompt_modules for child in second] == [child.prompt_modules for child in first]
     assert children_by_root[root.candidate_id] == first
+
+
+def test_reflects_on_roots_in_descending_screening_score_order() -> None:
+    adapter = _ScoreOrderedAdapter()
+    roots = [_candidate("weak"), _candidate("strong"), _candidate("middle")]
+    frontier_evals = {
+        "weak": _ScoredEvaluation(0.72),
+        "strong": _ScoredEvaluation(0.75),
+        "middle": _ScoredEvaluation(0.73),
+    }
+    children_by_root: dict[str, list[Candidate]] = {}
+
+    make_children_for_generation(
+        adapter,
+        roots,
+        frontier_evals,
+        reflection_llm=object(),
+        offspring_count=5,
+        children_by_root=children_by_root,
+    )
+
+    # Every root is reflected at most once, strongest first. Sampling a weaker
+    # root ahead of a stronger one would spend a reflection call on a prompt
+    # already known to score worse.
+    assert adapter.reflected_parents == ["strong", "middle", "weak"]
 
 
 def test_prints_child_prompt_delta_against_parent(capsys) -> None:
@@ -374,6 +423,140 @@ def test_same_root_and_training_slice_reuses_children_and_screen(tmp_path) -> No
     assert second_adapter.reflection_calls == 0
     assert second_adapter.root_evaluation_calls == 0
     assert second_adapter.screen_evaluation_calls == 0
+
+
+def _tiny_budget_candidate(candidate_id: str) -> Candidate:
+    """A root whose module budget is far smaller than the variants reflection writes.
+
+    run_ts11 hit this with RULES_EXT: a 64-token budget on an empty seed module.
+    """
+    return Candidate(
+        model="test",
+        prompt_modules={"WRITING_CODE": ""},
+        module_specs={"WRITING_CODE": ModuleSpec("WRITING_CODE", "free_text", 1)},
+        global_token_cap=100,
+        baseline_prompt_hash="baseline",
+        candidate_id=candidate_id,
+    )
+
+
+def test_over_budget_variants_are_excluded_from_the_generation() -> None:
+    """Screening drops over-budget children, so admitting one only produces a
+    candidate that can never be scored."""
+    root = _tiny_budget_candidate("root")
+    adapter = _ReflectionAdapter(variants=["ok", "x" * 400])
+
+    children = make_children_for_generation(
+        adapter,
+        [root],
+        {root.candidate_id: _Evaluation()},
+        reflection_llm=object(),
+        offspring_count=2,
+    )
+
+    assert [child.prompt_modules["WRITING_CODE"] for child in children] == ["ok"]
+
+
+def test_cached_over_budget_children_are_not_replayed(tmp_path) -> None:
+    """run_ts11 already has three of these cached; replaying them would re-fill
+    the generation with candidates screening throws away."""
+    root = _tiny_budget_candidate("root")
+    over_budget = apply_single_module_edit(root, "WRITING_CODE", "z" * 400)
+    fits = apply_single_module_edit(root, "WRITING_CODE", "ok")
+
+    children = make_children_for_generation(
+        _ReflectionAdapter(),
+        [root],
+        {root.candidate_id: _Evaluation()},
+        reflection_llm=object(),
+        offspring_count=5,
+        children_by_root={root.candidate_id: [over_budget, fits]},
+    )
+
+    assert [child.prompt_modules["WRITING_CODE"] for child in children] == ["ok"]
+
+
+def test_an_unscoreable_child_does_not_keep_its_slice_pending(tmp_path) -> None:
+    """The run_ts11 livelock: over-budget children never get a score, so counting
+    them as pending kept the proposer re-entering the same iteration forever."""
+    root = _tiny_budget_candidate("root")
+    proposer = _proposer(_ReflectionAdapter(), str(tmp_path / "children.json"))
+    over_budget = apply_single_module_edit(root, "WRITING_CODE", "z" * 400)
+    proposer._children_by_root_by_train_slice[(0,)] = {"root": [over_budget]}
+
+    assert proposer._child_is_pending((0,), over_budget, set()) is False
+    assert proposer._slice_is_exhausted((0,), set()) is True
+
+
+def test_propose_raises_rather_than_spinning_on_empty_proposals(tmp_path) -> None:
+    """Empty proposals consume no budget, so max_metric_calls cannot stop them."""
+    proposer = _proposer(_ReflectionAdapter(), str(tmp_path / "children.json"))
+    proposer._propose = lambda _state: []  # type: ignore[method-assign]
+
+    for _ in range(MAX_EMPTY_PROPOSAL_STREAK - 1):
+        assert proposer.propose(object()) == []  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="cannot advance"):
+        proposer.propose(object())  # type: ignore[arg-type]
+
+
+def test_a_successful_proposal_resets_the_empty_streak(tmp_path) -> None:
+    proposer = _proposer(_ReflectionAdapter(), str(tmp_path / "children.json"))
+    proposer._propose = lambda _state: []  # type: ignore[method-assign]
+    for _ in range(MAX_EMPTY_PROPOSAL_STREAK - 1):
+        proposer.propose(object())  # type: ignore[arg-type]
+
+    proposer._propose = lambda _state: ["a proposal"]  # type: ignore[method-assign]
+    assert proposer.propose(object()) == ["a proposal"]  # type: ignore[arg-type]
+    assert proposer._empty_proposal_streak == 0
+
+
+def test_screening_checkpoints_each_child_before_a_later_one_fails(tmp_path) -> None:
+    """Scoring a screen reads BigQuery and can raise or hang partway through the
+    batch. Children already scored must survive, or the restart re-screens work
+    it has already paid for."""
+    root = _candidate("root")
+    cache_file = str(tmp_path / "children.json")
+
+    class _State:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 1
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    class _FailsScoringSecondChild(_HighSignalProposerAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fix_rate_calls = 0
+
+        def high_signal_fix_rate(self, _parent_eval, _child_eval):
+            self.fix_rate_calls += 1
+            if self.fix_rate_calls == 2:
+                raise RuntimeError("BigQuery query failed")
+            return 0.8
+
+    adapter = _FailsScoringSecondChild()
+    proposer = _proposer(adapter, cache_file)
+    proposer.trainset = _OneSliceLoader()
+
+    with pytest.raises(RuntimeError, match="BigQuery query failed"):
+        proposer.propose(_State())
+
+    assert adapter.fix_rate_calls == 2
+    with open(cache_file) as handle:
+        roots = json.load(handle)["training_slices"][0]["roots"]
+    (records,) = roots.values()
+    assert len(records) == 2
+    assert records[0]["screening_score"] == 0.8
+    assert records[0]["screening_passed"] is True
+    # The child whose scoring raised stays unscored so it is retried.
+    assert records[1]["screening_score"] is None
+    assert records[1]["screening_passed"] is None
 
 
 def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_path) -> None:

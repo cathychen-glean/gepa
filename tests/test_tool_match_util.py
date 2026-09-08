@@ -8,15 +8,14 @@ import pytest
 from glean_gepa.tool_match_util import (
     SKIPPED_TOOL_NAMES,
     NoComparedEvalEntriesError,
-    ToolMatchEntryMetrics,
-    aggregate_tool_match_metrics,
-    build_tool_match_per_entry_query,
-    build_tool_match_time_bounds_query,
-    empty_tool_match_analysis,
-    fetch_eval_run_tool_match_analysis,
+    TeacherStudentMatchEntryMetrics,
+    aggregate_teacher_student_match_metrics,
+    build_teacher_student_match_per_entry_query,
+    build_teacher_student_match_time_bounds_query,
+    empty_teacher_student_match_analysis,
+    fetch_eval_run_teacher_student_match_analysis,
     first_tool_mismatch_pair,
-    first_tool_name,
-    parse_tool_match_entry_metrics,
+    parse_teacher_student_match_entry_metrics,
     require_compared_eval_entries,
     scored_tool_sequence,
     select_first_tool_mismatch_groups,
@@ -26,31 +25,29 @@ from glean_gepa.tool_match_util import (
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
     assert scored_tool_sequence(["Shell", "search", "Shell Tool", "read"]) == ("search", "read")
     assert scored_tool_sequence(["Shell", "Shell"]) == ()
-    assert first_tool_name(()) == ""
-    assert first_tool_name(("search", "read")) == "search"
-    assert first_tool_name(("Shell", "search")) == "search"
     assert first_tool_mismatch_pair(("search", "read"), ("search", "write")) is None
     assert first_tool_mismatch_pair(("search",), ()) == ("search", "")
     assert first_tool_mismatch_pair(("Shell", "read"), ("search",)) == ("read", "search")
     assert first_tool_mismatch_pair(("Shell",), ("Shell Tool",)) is None
 
-    match = parse_tool_match_entry_metrics(
+    match = parse_teacher_student_match_entry_metrics(
         {"entry_id": "entry-1", "student_tools": ["Shell", "search", "read"], "teacher_tools": ["search", "write"]}
     )
     assert match.entry_id == "entry-1"
+    assert match.student_entry_id == "entry-1"
     assert match.student_tools == ("search", "read")
     assert match.teacher_tools == ("search", "write")
     assert match.tools_match
 
-    mismatch = parse_tool_match_entry_metrics(
+    mismatch = parse_teacher_student_match_entry_metrics(
         {"entry_id": "entry-2", "student_tools": ["search"], "teacher_tools": ["read"]}
     )
     assert not mismatch.tools_match
 
 
 def test_tool_match_queries_and_fetch():
-    bounds_sql = build_tool_match_time_bounds_query()
-    sql = build_tool_match_per_entry_query()
+    bounds_sql = build_teacher_student_match_time_bounds_query()
+    sql = build_teacher_student_match_per_entry_query()
     assert "PARSE_DATE" not in bounds_sql
     assert "PARSE_DATE" not in sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
@@ -59,6 +56,13 @@ def test_tool_match_queries_and_fetch():
     assert "Execute Action:" in sql
     assert "student_trace_id" not in sql
     assert "FULL OUTER JOIN" in sql
+    remapped = build_teacher_student_match_per_entry_query(remap_focused_entry_ids=True)
+    assert "@source_entry_ids" in remapped
+    assert "@focused_entry_ids" in remapped
+    assert "mapping.source_entry_id AS entry_id" in remapped
+    assert "mapping.focused_entry_id AS student_entry_id" in remapped
+    assert "LEFT JOIN student" in remapped
+    assert "FULL OUTER JOIN" not in remapped
     for skipped in SKIPPED_TOOL_NAMES:
         assert skipped in sql
 
@@ -70,7 +74,7 @@ def test_tool_match_queries_and_fetch():
             {"entry_id": "entry-2", "student_tools": [], "teacher_tools": ["search"]},
         ],
     ]
-    analysis = fetch_eval_run_tool_match_analysis(
+    analysis = fetch_eval_run_teacher_student_match_analysis(
         client,
         teacher_eval_id="teacher",
         student_eval_id="student",
@@ -81,7 +85,7 @@ def test_tool_match_queries_and_fetch():
     entry_params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
     assert search_params["eval_ids"] == ["teacher", "student"]
     assert search_params["search_start_date"] == "2026-08-04"
-    assert search_params["search_end_date"] == "2026-08-11"
+    assert search_params["search_end_date"] == "2026-08-12"
     assert entry_params["student_eval_id"] == "student"
     assert entry_params["teacher_eval_id"] == "teacher"
     assert analysis.per_entry["entry-1"].tools_match is False
@@ -90,19 +94,49 @@ def test_tool_match_queries_and_fetch():
     assert client.query.call_count == 2
 
 
+def test_fetch_tool_match_analysis_joins_on_source_and_focused_entry_ids():
+    client = MagicMock()
+    client.query.side_effect = [
+        [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
+        [
+            {
+                "entry_id": "source-1",
+                "student_entry_id": "fresh-1",
+                "student_tools": ["search"],
+                "teacher_tools": ["read"],
+            }
+        ],
+    ]
+    analysis = fetch_eval_run_teacher_student_match_analysis(
+        client,
+        teacher_eval_id="parent-teacher",
+        student_eval_id="child-student",
+        lookback_days=7,
+        end_date=date(2026, 8, 11),
+        entry_id_pairs=[("source-1", "fresh-1")],
+    )
+    sql = client.query.call_args_list[1].args[0]
+    params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
+    assert "mapping.source_entry_id AS entry_id" in sql
+    assert params["source_entry_ids"] == ["source-1"]
+    assert params["focused_entry_ids"] == ["fresh-1"]
+    assert analysis.per_entry["source-1"].student_entry_id == "fresh-1"
+    assert analysis.per_entry["source-1"].tools_match is False
+
+
 def test_aggregate_and_empty_analysis():
     per_entry = {
-        "a": ToolMatchEntryMetrics("a", ("search",), ("search",), True),
-        "b": ToolMatchEntryMetrics("b", ("read",), ("search",), False),
+        "a": TeacherStudentMatchEntryMetrics("a", ("search",), ("search",), True),
+        "b": TeacherStudentMatchEntryMetrics("b", ("read",), ("search",), False),
     }
-    aggregate = aggregate_tool_match_metrics("teacher", "student", per_entry)
+    aggregate = aggregate_teacher_student_match_metrics("teacher", "student", per_entry)
     assert aggregate.compared_entries == 2
     assert aggregate.matching_entries == 1
     assert aggregate.tool_match_rate == 0.5
-    empty = aggregate_tool_match_metrics("teacher", "student", {})
+    empty = aggregate_teacher_student_match_metrics("teacher", "student", {})
     assert empty.compared_entries == 0
     assert empty.tool_match_rate == 0.0
-    analysis = empty_tool_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))
+    analysis = empty_teacher_student_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))
     with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
         require_compared_eval_entries(analysis)
 

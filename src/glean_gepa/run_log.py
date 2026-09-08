@@ -7,6 +7,7 @@ adds reflection / high-signal / child-proposal reports after each proposer step.
 from __future__ import annotations
 
 import sys
+import traceback
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,7 +16,6 @@ from typing import Any, TextIO
 from glean_gepa.tool_match_util import (
     REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
     first_tool_mismatch_pair,
-    first_tool_name,
     scored_tool_sequence,
 )
 
@@ -54,6 +54,14 @@ def capture_run_log(path: Path):
         sys.stderr = _Tee(original_err, log_file)
         try:
             yield path
+        except BaseException:
+            # The interpreter prints the traceback only after `finally` restores
+            # the real streams, so without this the log ends mid-run with no sign
+            # of what killed it. Written straight to the file rather than through
+            # the tee so the terminal still shows it exactly once.
+            log_file.write("\n")
+            traceback.print_exc(file=log_file)
+            raise
         finally:
             sys.stdout = original_out
             sys.stderr = original_err
@@ -78,11 +86,11 @@ def format_eval_entry_report(trajectories: Sequence[Mapping[str, Any]] | None) -
     for trajectory in trajectories:
         output = trajectory.get("output") or {}
         metrics = trajectory.get("objective_scores") or {}
-        teacher_tools = output.get("teacher_tool_events")
-        student_tools = output.get("student_tool_events")
+        teacher_tools = scored_tool_sequence(output.get("teacher_tool_events"))
+        student_tools = scored_tool_sequence(output.get("student_tool_events"))
         pair = first_tool_mismatch_pair(teacher_tools, student_tools)
         if pair is None:
-            first_line = f"first-tool: match ({first_tool_name(teacher_tools) or '(none)'})"
+            first_line = f"first-tool: match ({teacher_tools[0] if teacher_tools else '(none)'})"
         else:
             first_line = f"first-tool: mismatch (teacher={pair[0] or '(none)'}, student={pair[1] or '(none)'})"
         query = " ".join(str(output.get("query", "")).split())
@@ -97,8 +105,8 @@ def format_eval_entry_report(trajectories: Sequence[Mapping[str, Any]] | None) -
             value = metrics.get(key)
             if value is not None:
                 metric_parts.append(f"{key}={_fmt_metric(value)}")
-        teacher_seq = " > ".join(scored_tool_sequence(teacher_tools)) or "(none)"
-        student_seq = " > ".join(scored_tool_sequence(student_tools)) or "(none)"
+        teacher_seq = " > ".join(teacher_tools) or "(none)"
+        student_seq = " > ".join(student_tools) or "(none)"
         blocks.append(
             "\n".join(
                 [

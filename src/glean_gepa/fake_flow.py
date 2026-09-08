@@ -48,10 +48,14 @@ def _iteration(candidate: dict[str, str]) -> int:
     return int(match.group(1)) if match else 0
 
 
+FAKE_SCORE_DIMENSION = "fake_score"
+
+
 class FakeFlowAdapter(GleanAdapterBase):
     """A deterministic adapter that produces realistic-looking eval outputs."""
 
     supports_high_signal_eval = False
+    telemetry_dimensions = (FAKE_SCORE_DIMENSION,)
 
     def __init__(self) -> None:
         # The base class supplies the same batch and reflection-dataset behavior
@@ -67,9 +71,11 @@ class FakeFlowAdapter(GleanAdapterBase):
             reflection_prompt_fn=lambda _module: FAKE_FLOW_RESPONSIBILITY,
             reflective_metrics_fn=lambda metrics: f"fake score={metrics['score']:.2f}",
             failure_label="Fake eval evidence",
-            primary_objective="fake_score",
+            primary_objective=FAKE_SCORE_DIMENSION,
             default_frontier_type="objective",
             editable_modules=list(MODULES),
+            composite_weights={FAKE_SCORE_DIMENSION: 1.0},
+            constant_scores={},
         )
 
     def evaluate(

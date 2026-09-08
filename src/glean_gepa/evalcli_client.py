@@ -484,9 +484,7 @@ class EvalCliClient:
                     raise
                 existing = self._find_judge_run_id_after_create_error(eval_run_id, judge_type)
                 if existing:
-                    print(
-                        f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}"
-                    )
+                    print(f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}")
                     return existing
                 if attempt + 1 >= JUDGE_CREATE_ATTEMPTS:
                     break

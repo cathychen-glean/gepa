@@ -1,0 +1,102 @@
+# Teacher-student experiment: the student's first tool call is scored against the
+# teacher's on paired traces.
+#
+# This mode requires `packs: [tools]` and objective.primary=tool_alignment — it has
+# no scoring path for shell telemetry, so use single_model.yaml for shell_success_rate.
+#
+# The pack (glean_gepa/configs/packs/tools.yaml) supplies the tool_alignment signal,
+# objective.primary, and the screening gate. Signals declared below are merged with
+# the pack's by name, and objective/screening keys set below override the pack's.
+
+schema_version: 1
+mode: teacher_student
+packs: [tools]
+
+run:
+  dir: run_ts
+  max_metric_calls: 10
+  eval_run_timeout_sec: 21600
+  seed_candidate: data/seed_candidate.json
+  editable_modules: [WRITING_CODE]
+
+models:
+  student: gpt
+  teacher: gpt
+  reflection: OPEN_AI:GPT5_LATEST
+
+data:
+  eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  # Pin both lists for a reproducible run, or omit them to auto-select.
+  # train_eval_versions: [20260813, 20260820]
+  # val_eval_versions: [20260827]
+  #
+  # lookback_days is the window size; days_back shifts the window's end date back
+  # from today. Automatic selection otherwise follows the calendar, so it picks up
+  # each newly published version and misses the eval-run cache. Setting days_back
+  # holds the window still without hardcoding version numbers.
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 2
+
+# Mode-owned Cortex judges. Pack signals (tool_alignment / shell_success_rate)
+# are merged in from `packs`.
+signals:
+  # Off by default: each judge run is started and awaited per eval, which is slow
+  # and has been the least reliable part of the run. To turn it back on, set
+  # `enabled: true` AND add a completeness weight under objective.composite below.
+  # Both are required — a weighted signal that is disabled fails to load, which is
+  # deliberate, so the objective can never silently weight a signal nothing scores.
+  - name: completeness
+    source: cortex_judge
+    type: COMPLETENESS
+    kind: pointwise
+    enabled: false
+    run_params:
+      llm_model: default
+      use_cache: true
+
+  - name: correctness
+    source: cortex_judge
+    type: CORRECTNESS
+    kind: pairwise
+    enabled: false
+    run_params:
+      judge_type: DIRECT_CORRECTNESS
+      llm_model: default
+      use_cache: true
+
+  - name: grounding
+    source: constant
+    value: 1.0
+
+objective:
+  frontier_type: hybrid
+  # tool_alignment carries the whole objective, so the score reads directly as the
+  # first-tool match rate. grounding is deliberately unweighted: it is a constant,
+  # so any weight on it adds the same offset to every candidate and can never
+  # change the ranking.
+  #
+  # The blend used while the completeness judge was enabled, for reference:
+  #   composite: {completeness: 0.5, tool_alignment: 0.3, grounding: 0.2}
+  composite:
+    tool_alignment: 1.0
+  # Enable the pairwise judge and uncomment to gate on correctness:
+  # validation:
+  #   - metric: correctness
+  #     min: 0.95
+  validation: []
+
+# Overrides the tools pack's 0.333 gate; `kind` and `high_signal` still come from
+# the pack. The screened set is exactly the entries the parent got wrong, so the
+# parent scores 0 on it and any positive fix rate is already an improvement. At
+# 1/3 a child fixing 17 of 52 real mismatches was discarded. 0.25 lets those reach
+# full validation, which is the step that can actually see a regression on the
+# entries the parent already had right.
+screening:
+  threshold: 0.25
+
+search:
+  offspring_count: 5
+  reflection_samples: 8
+  reflection_hamming_distance_k: null

@@ -13,9 +13,6 @@ from glean_gepa.adapter_types import (
 from glean_gepa.al_adapter import (
     ALRunner,
     GleanAdapterBase,
-    ReflectiveExample,
-    ReflectiveExampleInputs,
-    ReflectiveExampleMetrics,
     Thresholds,
     enrich_shell_error_action_inputs,
     log_shell_tool_error_analysis,
@@ -24,14 +21,19 @@ from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_examples import (
+    build_single_model_reflective_example,
+    format_single_model_reflective_metrics,
+)
 from glean_gepa.reflection_prompts import single_model_reflection_prompt
-from glean_gepa.reflection_sampling import strip_stdout_sections
 from glean_gepa.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
     fetch_eval_run_shell_tool_error_analysis,
     fetch_high_signal_evalset_entries,
 )
+
+DEFAULT_COMPOSITE_WEIGHTS = {SHELL_SUCCESS_OBJECTIVE: 1.0}
 
 
 class ShellToolTelemetryPendingError(RuntimeError):
@@ -42,6 +44,7 @@ class SingleModelAdapter(GleanAdapterBase):
     """Optimize prompts for a single student model using shell-tool error evidence."""
 
     supports_high_signal_eval = True
+    telemetry_dimensions = (SHELL_SUCCESS_OBJECTIVE,)
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
         """Keep the parent eval ID required to map trace-side UUIDs to source entries."""
@@ -132,6 +135,10 @@ class SingleModelAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
+        primary_objective: str = SHELL_SUCCESS_OBJECTIVE,
+        default_frontier_type: str = "objective",
+        composite_weights: dict[str, float] | None = None,
+        constant_scores: dict[str, float] | None = None,
     ):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
@@ -143,14 +150,18 @@ class SingleModelAdapter(GleanAdapterBase):
             student_model=student_model,
             evaluate_fn=self._evaluate_single_model,
             failure_pattern_fn=self._create_failure_pattern,
-            reflective_example_fn=self._build_reflective_example,
+            reflective_example_fn=build_single_model_reflective_example,
             reflection_prompt_fn=single_model_reflection_prompt,
-            reflective_metrics_fn=self._format_reflective_metrics,
+            reflective_metrics_fn=format_single_model_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES",
-            primary_objective=SHELL_SUCCESS_OBJECTIVE,
-            default_frontier_type="objective",
+            primary_objective=primary_objective,
+            default_frontier_type=default_frontier_type,
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
+            composite_weights=composite_weights if composite_weights is not None else DEFAULT_COMPOSITE_WEIGHTS,
+            constant_scores=constant_scores if constant_scores is not None else {},
             cache_file=cache_file,
+            diversify_reflective_examples=True,
+            dedupe_reflective_examples=True,
         )
 
     def _get_or_fetch_shell_error_analysis(
@@ -160,7 +171,7 @@ class SingleModelAdapter(GleanAdapterBase):
         include_error_examples: bool = True,
         include_per_entry: bool = True,
     ) -> EvalRunShellToolErrorAnalysis:
-        cached = self._eval_analysis_cache.get(eval_id)
+        cached = self._cached_analysis(self._eval_analysis_cache, eval_id)
         if cached is not None:
             missing_entry_breakdown = (
                 include_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0
@@ -185,9 +196,7 @@ class SingleModelAdapter(GleanAdapterBase):
             if analysis.aggregate.shell_executions == 0:
                 print(f"[Cache] Not caching provisional 0/0 shell analysis for eval_id: {eval_id}")
                 return analysis
-            with self._cache_lock:
-                self._eval_analysis_cache[eval_id] = analysis
-                self._save_cache()
+            self._store_analysis(self._eval_analysis_cache, eval_id, analysis)
         return analysis
 
     def _evaluate_single_model(
@@ -220,55 +229,6 @@ class SingleModelAdapter(GleanAdapterBase):
             int(output.get("student_tool_errors", 0) > 0),
             len(output.get("shell_error_messages", [])),
         )
-
-    def _build_reflective_example(
-        self,
-        component_name: str,
-        trajectory: SingleModelALTrajectory,
-        candidate: dict[str, str],
-    ) -> ReflectiveExample:
-        output = trajectory["output"]
-        shell_success_rate = trajectory.get("objective_scores", {}).get(SHELL_SUCCESS_OBJECTIVE, 1.0)
-        shell_error_messages = [
-            sanitized for error in output.get("shell_error_messages", []) if (sanitized := strip_stdout_sections(error))
-        ]
-        if shell_error_messages:
-            # Keep the concrete text solely in ``Execution Errors``. Repeating
-            # it in feedback wastes reflection context without adding signal.
-            feedback = "Resolve the shell execution failures shown above."
-        elif output.get("student_tool_errors", 0) > 0:
-            feedback = f"Tool errors: Student encountered {output.get('student_tool_errors', 0)} shell tool errors."
-        else:
-            feedback = "General shell tool reliability issue."
-
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        if eval_run_id := trajectory["data"].get("eval_run_id"):
-            inputs["eval_run_id"] = eval_run_id
-        if eval_trace_id := trajectory["data"].get("eval_trace_id"):
-            inputs["eval_trace_id"] = eval_trace_id
-
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
-                "student_answer": "",
-                "teacher_answer": "",
-                "student_tools": [],
-                "teacher_tools": [],
-            },
-            "Action Inputs": output.get("shell_action_inputs", [])[:5],
-            "Execution Errors": shell_error_messages[:5],
-            "Feedback": feedback,
-            "Metrics": {"score": trajectory["score"], "shell_success_rate": shell_success_rate},
-        }
-
-    @staticmethod
-    def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str | None:
-        return None
 
     def _evaluate_with_shell_error_rate(
         self,
@@ -394,10 +354,12 @@ class SingleModelAdapter(GleanAdapterBase):
                 ]
                 if shell_action_inputs:
                     output["shell_action_inputs"] = shell_action_inputs
-                aggregate_score = analysis.aggregate.shell_success_rate
-                objective_score = {SHELL_SUCCESS_OBJECTIVE: aggregate_score}
+                objective_score = {
+                    **self.constant_scores,
+                    SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
+                }
                 all_outputs.append(output)
-                all_scores.append(aggregate_score)
+                all_scores.append(self.composite_score(objective_score))
                 all_objective_scores.append(objective_score)
                 continue
 
@@ -419,17 +381,19 @@ class SingleModelAdapter(GleanAdapterBase):
                 }
                 if shell_action_inputs:
                     output["shell_action_inputs"] = shell_action_inputs
-                all_outputs.append(output)
-                all_scores.append(analysis.aggregate.shell_success_rate)
                 objective_score = {
+                    **self.constant_scores,
                     SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
                 }
+                score = self.composite_score(objective_score)
+                all_outputs.append(output)
+                all_scores.append(score)
                 all_objective_scores.append(objective_score)
                 all_trajectories.append(
                     {
                         "data": al_data_inst,
                         "output": output,
-                        "score": analysis.aggregate.shell_success_rate,
+                        "score": score,
                         "objective_scores": objective_score,
                     }
                 )
@@ -473,15 +437,17 @@ class SingleModelAdapter(GleanAdapterBase):
                 # Focused screening is entry-level: an entry passes only when it
                 # has no tool errors. This keeps the 50% gate independent of the
                 # number of shell calls each entry happens to make.
-                entry_score = (
+                shell_success = (
                     float(entry_id in analysis.per_entry and entry_metrics.shell_errors == 0)
                     if is_focused_eval
                     else entry_metrics.shell_success_rate
                 )
-                all_scores.append(entry_score)
                 entry_objective_score = {
-                    SHELL_SUCCESS_OBJECTIVE: entry_score,
+                    **self.constant_scores,
+                    SHELL_SUCCESS_OBJECTIVE: shell_success,
                 }
+                entry_score = self.composite_score(entry_objective_score)
+                all_scores.append(entry_score)
                 all_objective_scores.append(entry_objective_score)
                 all_trajectories.append(
                     {

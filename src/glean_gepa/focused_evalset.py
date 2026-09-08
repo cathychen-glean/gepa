@@ -9,8 +9,9 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from glean_gepa.adapter_types import ALDataInst
@@ -31,6 +32,7 @@ class FocusedEvalSet:
     name: str
     version: str
     entry_count: int
+    source_entry_ids_by_focused_id: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,9 @@ def prepare_high_signal_eval_batch(
                 "eval_set_version": focused.version,
                 "focused_eval_set_name": focused.name,
                 "focused_eval_set_version": focused.version,
+                "source_eval_set_name": data.get("source_eval_set_name") or data["eval_set_name"],
+                "source_eval_set_version": data.get("source_eval_set_version") or data["eval_set_version"],
+                "source_entry_ids_by_focused_id": dict(focused.source_entry_ids_by_focused_id),
             }
         )
     return prepared
@@ -167,11 +172,72 @@ def focused_eval_set_retry_version(version: str) -> str:
 def _source_session_token(source_entry: Mapping[str, Any]) -> str | None:
     tracking = source_entry.get("sourceTrackingInfo") or {}
     token = (
-        source_entry.get("stt")
-        or source_entry.get("session_tracking_token")
-        or tracking.get("sessionTrackingToken")
+        source_entry.get("stt") or source_entry.get("session_tracking_token") or tracking.get("sessionTrackingToken")
     )
     return str(token) if token else None
+
+
+def _entry_query(entry: Mapping[str, Any]) -> str:
+    entry_input = entry.get("input") or {}
+    return str(entry.get("query") or entry_input.get("query") or "")
+
+
+def _persisted_source_entry_id(entry: Mapping[str, Any]) -> str:
+    metadata = entry.get("metadata") or {}
+    return str(entry.get("sourceEntryId") or metadata.get("gepaSourceEntryId") or "")
+
+
+def _entry_join_key(entry: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    """Stable key for pairing a focused row with its source row.
+
+    Prefer query+deployment (QUERY_CANONICAL). Fall back to stt+deployment when
+    a SESSION row has no query. Duplicate keys are paired 1:1 in upload order.
+    """
+    deployment = str(entry.get("deploymentId") or "")
+    if not deployment:
+        return None
+    query = _entry_query(entry)
+    if query:
+        return ("query", query, deployment)
+    stt = _source_session_token(entry)
+    if stt:
+        return ("stt", stt, deployment)
+    return None
+
+
+def map_focused_to_source_entry_ids(
+    source_entries: Sequence[Mapping[str, Any]],
+    focused_entries: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """Map each focused entry id onto the source entry it was uploaded from."""
+    remaining: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
+    for source in source_entries:
+        source_id = str(source.get("id") or "")
+        key = _entry_join_key(source)
+        if source_id and key:
+            remaining[key].append(source_id)
+
+    mapping: dict[str, str] = {}
+    for focused in focused_entries:
+        focused_id = str(focused.get("id") or "")
+        if not focused_id:
+            continue
+        persisted = _persisted_source_entry_id(focused)
+        if persisted:
+            mapping[focused_id] = persisted
+            key = _entry_join_key(focused)
+            if key:
+                queued = remaining.get(key)
+                if queued:
+                    try:
+                        queued.remove(persisted)
+                    except ValueError:
+                        pass
+            continue
+        key = _entry_join_key(focused)
+        if key and remaining[key]:
+            mapping[focused_id] = remaining[key].popleft()
+    return mapping
 
 
 def _is_eval_set_already_exists_error(exc: BaseException) -> bool:
@@ -217,6 +283,7 @@ def build_upload_entry(
     query = source_entry.get("query") or entry_input.get("query")
     user = source_entry.get("user") or source_entry.get("user_id")
 
+    source_entry_id = str(source_entry.get("id") or "")
     if bucket_type == QUERY_CANONICAL_BUCKET_TYPE:
         # Fresh chat: query text only. Copying stt restores the source session.
         # Restore output is valid as stored. The Anthropic Messages-API adapter
@@ -231,6 +298,8 @@ def build_upload_entry(
         entry: dict[str, Any] = {"deploymentId": deployment_id, "query": str(query)}
         if user:
             entry["user"] = user
+        if source_entry_id:
+            entry["sourceEntryId"] = source_entry_id
         return entry
 
     entry = {"deploymentId": deployment_id}
@@ -244,12 +313,11 @@ def build_upload_entry(
         ),
         "stt": _source_session_token(source_entry),
         "qtt": (
-            source_entry.get("qtt")
-            or source_entry.get("query_tracking_token")
-            or tracking.get("queryTrackingToken")
+            source_entry.get("qtt") or source_entry.get("query_tracking_token") or tracking.get("queryTrackingToken")
         ),
         "runId": source_entry.get("runId") or source_entry.get("workflow_run_id") or tracking.get("runId"),
         "query": query,
+        "sourceEntryId": source_entry_id,
     }
     entry.update({key: value for key, value in optional_fields.items() if value})
     return entry if any(entry.get(key) for key in ("traceId", "stt", "qtt", "query")) else None
@@ -282,9 +350,7 @@ def _enrich_source_entries_with_tracking(
         entry_ids=missing_ids,
         deployment_ids=deployment_ids or None,
     )
-    print(
-        f"[Focused eval set] Resolved stt for {len(tracking_by_id)}/{len(missing_ids)} entries from BigQuery"
-    )
+    print(f"[Focused eval set] Resolved stt for {len(tracking_by_id)}/{len(missing_ids)} entries from BigQuery")
     for entry in enriched:
         extra = tracking_by_id.get(str(entry.get("id") or ""))
         if extra:
@@ -316,6 +382,50 @@ def build_upload_eval_set_request(
     return request
 
 
+def _selected_source_entries(
+    evalcli: EvalCliClient,
+    *,
+    base_eval_set_name: str,
+    base_eval_set_version: str,
+    deployment_ids: list[str],
+    entry_ids: Sequence[str],
+    source_entries: Sequence[Mapping[str, Any]] | None,
+    bucket_type: str,
+    bigquery_client: Any | None,
+) -> list[dict[str, Any]]:
+    if source_entries is None:
+        source_entries = evalcli.list_eval_set_entries(
+            eval_set_name=base_eval_set_name,
+            eval_set_version=base_eval_set_version,
+            deployment_ids=deployment_ids,
+        )
+    wanted = set(entry_ids)
+    selected = [dict(entry) for entry in source_entries if str(entry.get("id") or "") in wanted]
+    if bucket_type == SESSION_BUCKET_TYPE:
+        selected = _enrich_source_entries_with_tracking(
+            selected,
+            bigquery_client=bigquery_client,
+            base_eval_set_name=base_eval_set_name,
+            base_eval_set_version=base_eval_set_version,
+            deployment_ids=deployment_ids,
+        )
+    return selected
+
+
+def _focused_eval_set(
+    name: str,
+    version: str,
+    focused_entries: Sequence[Mapping[str, Any]],
+    source_entries: Sequence[Mapping[str, Any]],
+) -> FocusedEvalSet:
+    mapping = map_focused_to_source_entry_ids(source_entries, focused_entries)
+    print(
+        f"[Focused eval set] Mapped {len(mapping)}/{len(focused_entries)} "
+        f"focused entries to source entry ids for {name}:{version}"
+    )
+    return FocusedEvalSet(name, version, len(focused_entries), mapping)
+
+
 def _find_ingested_focused_version(
     evalcli: EvalCliClient,
     *,
@@ -323,6 +433,7 @@ def _find_ingested_focused_version(
     version_prefix: str,
     deployment_ids: list[str],
     min_count: int,
+    source_entries: Sequence[Mapping[str, Any]],
 ) -> FocusedEvalSet | None:
     """Reuse a retry version that already ingested enough entries for this fingerprint."""
     for row in evalcli.list_eval_set_versions(eval_set_name=name, deployment_ids=deployment_ids):
@@ -334,7 +445,7 @@ def _find_ingested_focused_version(
         )
         if len(entries) >= min_count:
             print(f"[Focused eval set] Reusing {name}:{version} with {len(entries)} entries")
-            return FocusedEvalSet(name, version, len(entries))
+            return _focused_eval_set(name, version, entries, source_entries)
     return None
 
 
@@ -356,6 +467,16 @@ def ensure_focused_eval_set(
     name = focused_eval_set_name(base_eval_set_name)
     version = focused_eval_set_version(base_eval_set_version, entry_ids, bucket_type=bucket_type)
     min_count = min_ingested_eval_set_entries(len(entry_ids))
+    selected = _selected_source_entries(
+        evalcli,
+        base_eval_set_name=base_eval_set_name,
+        base_eval_set_version=base_eval_set_version,
+        deployment_ids=deployment_ids,
+        entry_ids=entry_ids,
+        source_entries=source_entries,
+        bucket_type=bucket_type,
+        bigquery_client=bigquery_client,
+    )
     existing = evalcli.get_eval_set_version(eval_set_name=name, eval_set_version=version)
     if existing is not None:
         existing_entries = evalcli.list_eval_set_entries(
@@ -363,38 +484,21 @@ def ensure_focused_eval_set(
         )
         if len(existing_entries) >= min_count:
             print(f"[Focused eval set] Reusing {name}:{version} with {len(existing_entries)} entries")
-            return FocusedEvalSet(name, version, len(existing_entries))
+            return _focused_eval_set(name, version, existing_entries, selected)
         reused = _find_ingested_focused_version(
             evalcli,
             name=name,
             version_prefix=version,
             deployment_ids=deployment_ids,
             min_count=min_count,
+            source_entries=selected,
         )
         if reused is not None:
             return reused
         version = focused_eval_set_retry_version(version)
 
-    if source_entries is None:
-        source_entries = evalcli.list_eval_set_entries(
-            eval_set_name=base_eval_set_name,
-            eval_set_version=base_eval_set_version,
-            deployment_ids=deployment_ids,
-        )
-    wanted = set(entry_ids)
-    selected = [entry for entry in source_entries if str(entry.get("id") or "") in wanted]
-    if bucket_type == SESSION_BUCKET_TYPE:
-        selected = _enrich_source_entries_with_tracking(
-            selected,
-            bigquery_client=bigquery_client,
-            base_eval_set_name=base_eval_set_name,
-            base_eval_set_version=base_eval_set_version,
-            deployment_ids=deployment_ids,
-        )
     upload_entries = [
-        entry
-        for source in selected
-        if (entry := build_upload_entry(source, bucket_type=bucket_type)) is not None
+        entry for source in selected if (entry := build_upload_entry(source, bucket_type=bucket_type)) is not None
     ]
     if not upload_entries:
         missing = "queries" if bucket_type == QUERY_CANONICAL_BUCKET_TYPE else "session tracking tokens"
@@ -455,7 +559,7 @@ def ensure_focused_eval_set(
     except EvalCliError as exc:
         print(f"[Focused eval set] {exc}")
         return None
-    return FocusedEvalSet(name, version, len(ingested))
+    return _focused_eval_set(name, version, ingested, selected)
 
 
 __all__ = [
@@ -472,6 +576,7 @@ __all__ = [
     "ensure_focused_eval_set",
     "focused_eval_set_name",
     "focused_eval_set_version",
+    "map_focused_to_source_entry_ids",
     "prepare_high_signal_eval_batch",
     "resolve_eval_run_target",
 ]

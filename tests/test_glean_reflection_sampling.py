@@ -7,6 +7,7 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.reflection_sampling import (
     deduplicate_reflective_examples,
     is_within_hamming_distance,
+    select_diverse_by_failure_pattern,
     strip_stdout_sections,
 )
 from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
@@ -65,6 +66,35 @@ def test_deduplicate_reflective_examples_keeps_entries_without_errors():
 def test_hamming_distance_rejects_negative_k():
     with pytest.raises(ValueError, match="non-negative"):
         is_within_hamming_distance("a", "b", -1)
+
+
+def test_select_diverse_by_failure_pattern_allows_duplicates_until_slack():
+    trajectories = [
+        {"id": "a1", "score": 0.1, "pattern": "a"},
+        {"id": "a2", "score": 0.2, "pattern": "a"},
+        {"id": "a3", "score": 0.3, "pattern": "a"},
+        {"id": "b1", "score": 0.4, "pattern": "b"},
+        {"id": "c1", "score": 0.5, "pattern": "c"},
+    ]
+    selected = select_diverse_by_failure_pattern(
+        trajectories,
+        pattern_fn=lambda trajectory: (trajectory["pattern"],),
+        relevance_fn=lambda _trajectory: 1.0,
+        score_fn=lambda trajectory: trajectory["score"],
+        k=5,
+        duplicate_slack=3,
+    )
+    assert [trajectory["id"] for trajectory in selected] == ["a1", "a2", "a3", "b1", "c1"]
+
+    capped = select_diverse_by_failure_pattern(
+        trajectories,
+        pattern_fn=lambda trajectory: (trajectory["pattern"],),
+        relevance_fn=lambda _trajectory: 1.0,
+        score_fn=lambda trajectory: trajectory["score"],
+        k=4,
+        duplicate_slack=3,
+    )
+    assert [trajectory["id"] for trajectory in capped] == ["a1", "a2", "b1", "c1"]
 
 
 def test_single_model_adapter_all_mode_deduplicates_errors_before_prompting():

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any, Callable, NotRequired, TypedDict, cast
+from typing import Any, Callable, Mapping, NotRequired, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
@@ -43,7 +43,7 @@ from glean_gepa.reflection_prompts import (
     consolidate_prompt,
     diagnosis_prompt,
 )
-from glean_gepa.reflection_sampling import deduplicate_reflective_examples
+from glean_gepa.reflection_sampling import deduplicate_reflective_examples, select_diverse_by_failure_pattern
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
 from glean_gepa.shell_tool_error_util import (
     EvalRunShellToolErrorAnalysis,
@@ -372,6 +372,14 @@ FailurePatternFn = Callable[[str, Any], tuple[Any, ...]]
 ReflectiveExampleFn = Callable[[str, Any, dict[str, str]], ReflectiveExample]
 ReflectionPromptFn = Callable[[str], str]
 ReflectiveMetricsFn = Callable[[ReflectiveExampleMetrics], str | None]
+
+
+@dataclass
+class ReflectiveSelection:
+    """Trajectories in play for reflection, plus optional judging-mode metadata."""
+
+    trajectories: list[ALTrajectory]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1185,6 +1193,10 @@ class Thresholds:
 class GleanAdapterBase:
     supports_high_signal_eval = False
 
+    #: Dimensions the subclass resolves from evaluation telemetry, as opposed to the
+    #: constants and judge scores the base already knows about.
+    telemetry_dimensions: tuple[str, ...] = ()
+
     def __init__(
         self,
         runner: ALRunner,
@@ -1200,15 +1212,24 @@ class GleanAdapterBase:
         primary_objective: str,
         default_frontier_type: str,
         editable_modules: list[str],
+        composite_weights: dict[str, float],
+        constant_scores: dict[str, float],
         cache_file: str | None = None,
+        diversify_reflective_examples: bool = True,
+        dedupe_reflective_examples: bool = True,
     ):
         self.runner = runner
         self.thresholds = thresholds
         self.student_model = student_model
         self.primary_objective = primary_objective
         self.default_frontier_type = default_frontier_type
+        self.composite_weights = dict(composite_weights)
+        self.constant_scores = dict(constant_scores)
+        self._require_scorable_composite_weights()
         self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
+        self.diversify_reflective_examples = diversify_reflective_examples
+        self.dedupe_reflective_examples = dedupe_reflective_examples
         self._cache_lock = threading.RLock()
         self._evaluate_fn = evaluate_fn
         self._failure_pattern_fn = failure_pattern_fn
@@ -1236,6 +1257,28 @@ class GleanAdapterBase:
         # Load cache if file exists
         if self.cache_file:
             self._load_cache()
+
+    def scorable_dimensions(self) -> set[str]:
+        """Composite dimensions this adapter can resolve a per-entry value for."""
+        return {*self.telemetry_dimensions, *self.constant_scores}
+
+    def composite_score(self, dimension_values: Mapping[str, float]) -> float:
+        """Weight the resolved dimensions by ``objective.composite``.
+
+        Indexes rather than defaulting to 0.0: a weight that resolves to nothing is a
+        wiring bug, and silently dropping it would report a composite the run never
+        actually applied.
+        """
+        return sum(weight * dimension_values[name] for name, weight in self.composite_weights.items())
+
+    def _require_scorable_composite_weights(self) -> None:
+        scorable = self.scorable_dimensions()
+        unscorable = sorted(set(self.composite_weights) - scorable)
+        if unscorable:
+            raise ValueError(
+                f"composite_weights name dimensions {type(self).__name__} cannot score: "
+                f"{', '.join(unscorable)}; scorable dimensions are {', '.join(sorted(scorable))}"
+            )
 
     def _load_cache(self) -> None:
         """Load analysis and judge-trigger state from the adapter cache."""
@@ -1285,6 +1328,23 @@ class GleanAdapterBase:
                 )
         except Exception as e:
             print(f"[GleanAdapter] Failed to save cache to {self.cache_file}: {e}")
+
+    def _cached_analysis(self, store: dict[Any, Any], key: Any) -> Any:
+        """Read a cached analysis under the lock that guards cache serialization."""
+        with self._cache_lock:
+            return store.get(key)
+
+    def _store_analysis(self, store: dict[Any, Any], key: Any, analysis: Any) -> None:
+        """Record an analysis and persist it.
+
+        Child screens run concurrently, and ``_save_cache`` iterates these stores.
+        Writing one without the lock races that iteration; ``_save_cache`` catches
+        the resulting error and logs it, so the cost is a silently dropped write
+        rather than a crash.
+        """
+        with self._cache_lock:
+            store[key] = analysis
+            self._save_cache()
 
     def _extra_cache_payload(self) -> dict[str, Any]:
         return {}
@@ -1487,95 +1547,127 @@ class GleanAdapterBase:
         k: int | None,  # max return; None includes all examples
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[ReflectiveExample]]:
-        """
-        Build reflective dataset from evaluation results, selecting examples with lowest scores.
+        """Select trajectories, format examples, and optionally Hamming-dedupe.
 
-        Args:
-            candidate: Current candidate prompt modules
-            eval_batch: Results from evaluate() with trajectories
-            components_to_update: List of component names to generate datasets for
-
-        Returns:
-            Dict mapping component_name -> list of reflective examples
+        Subclasses customize selection via ``_reflective_trajectory_pool`` and
+        ``_filter_reflective_trajectories``, and the constructor flags
+        ``diversify_reflective_examples`` / ``dedupe_reflective_examples``.
         """
-        if not eval_batch.trajectories:
+        trajectories = list(eval_batch.trajectories or [])
+        if not trajectories:
             return {comp: [] for comp in components_to_update}
 
+        selection = self._reflective_trajectory_pool(trajectories)
         result: dict[str, list[ReflectiveExample]] = {}
-
         for component_name in components_to_update:
-            # Compute module-specific relevance scores for each example
-            scored_trajectories = []
-
-            for idx, trajectory in enumerate(eval_batch.trajectories):
-                relevance = self._compute_module_relevance(component_name, trajectory, eval_batch.scores[idx])
-                scored_trajectories.append((relevance, idx, trajectory))
-
-            # Sort by relevance (higher = more relevant for improvement)
-            # Then by score (lower = worse performance, needs more attention)
-            scored_trajectories.sort(key=lambda x: (-x[0], x[2]["score"]))
-
-            # Select diverse examples with poor performance
-            reflective_examples = []
-            seen_patterns = set()
-
-            for _relevance, _idx, trajectory in scored_trajectories:
-                # Create a pattern signature for diversity
-                pattern = self._failure_pattern_fn(component_name, trajectory)
-
-                # Allow some duplicates near the end to fill quota
-                # TODO(Cathy) check with claude why it was < k-2
-                if k is not None and pattern in seen_patterns and len(reflective_examples) > k - 3:
-                    continue
-
-                # Build reflective example in standard format
-                example = self._reflective_example_fn(component_name, trajectory, candidate)
-
-                reflective_examples.append(example)
-                seen_patterns.add(pattern)
-
-                if k is not None and len(reflective_examples) >= k:
-                    break
-
-            if error_hamming_distance_k is not None:
-                before_dedupe = len(reflective_examples)
-                reflective_examples = deduplicate_reflective_examples(
-                    reflective_examples,
+            chosen = self._select_reflective_trajectories(component_name, selection, k)
+            examples = [self._reflective_example_fn(component_name, trajectory, candidate) for trajectory in chosen]
+            if self.dedupe_reflective_examples and error_hamming_distance_k is not None:
+                before_dedupe = len(examples)
+                examples = deduplicate_reflective_examples(
+                    examples,
                     k=error_hamming_distance_k,
                     log=print,
                 )
-                removed = before_dedupe - len(reflective_examples)
+                removed = before_dedupe - len(examples)
                 if removed:
                     print(
                         f"Reflection sampling removed {removed} near-duplicate {component_name} example(s) "
                         f"within Hamming distance {error_hamming_distance_k}."
                     )
+            result[component_name] = examples
 
-            result[component_name] = reflective_examples
-
-        module_lines = []
-        for module_name, examples in result.items():
-            entry_ids = selected_entry_ids_from_examples(examples)
-            module_lines.append(f"  {module_name}: {', '.join(entry_ids) if entry_ids else '(none)'}")
-        k_label = "all" if k is None else str(k)
-        log_section("REFLECTION: eval entries", format_eval_entry_report(eval_batch.trajectories))
-        log_section(
-            "REFLECTION: high-signal dataset",
-            "\n".join(
-                [
-                    f"Justification: module relevance, then lowest score, up to k={k_label} examples.",
-                    (
-                        f"Near-duplicate execution errors within Hamming distance "
-                        f"{error_hamming_distance_k} are dropped."
-                        if error_hamming_distance_k is not None
-                        else "No Hamming-distance dedupe."
-                    ),
-                    "Selected entry_ids by module:",
-                    *module_lines,
-                ]
-            ),
+        self._log_reflective_dataset(
+            trajectories=trajectories,
+            examples=result,
+            k=k,
+            error_hamming_distance_k=error_hamming_distance_k,
+            selection=selection,
         )
         return result
+
+    def _reflective_trajectory_pool(self, trajectories: list[ALTrajectory]) -> ReflectiveSelection:
+        """Return the trajectories available before per-module filtering."""
+        return ReflectiveSelection(trajectories=list(trajectories))
+
+    def _filter_reflective_trajectories(
+        self,
+        component_name: str,
+        selection: ReflectiveSelection,
+    ) -> list[ALTrajectory]:
+        """Keep the subset of the pool that is relevant to ``component_name``."""
+        del component_name
+        return list(selection.trajectories)
+
+    def _select_reflective_trajectories(
+        self,
+        component_name: str,
+        selection: ReflectiveSelection,
+        k: int | None,
+    ) -> list[ALTrajectory]:
+        """Filter the pool, then optionally rank and diversify up to ``k``."""
+        filtered = self._filter_reflective_trajectories(component_name, selection)
+        if not self.diversify_reflective_examples:
+            return filtered
+        return select_diverse_by_failure_pattern(
+            filtered,
+            pattern_fn=lambda trajectory: self._failure_pattern_fn(component_name, trajectory),
+            relevance_fn=lambda trajectory: self._compute_module_relevance(
+                component_name, trajectory, trajectory["score"]
+            ),
+            score_fn=lambda trajectory: trajectory["score"],
+            k=k,
+        )
+
+    def _reflective_eval_entries_log_title(self) -> str:
+        return "REFLECTION: eval entries"
+
+    def _reflective_dataset_justification(
+        self,
+        *,
+        k: int | None,
+        error_hamming_distance_k: int | None,
+        selection: ReflectiveSelection,
+        examples: dict[str, list[ReflectiveExample]],
+    ) -> str:
+        del selection
+        module_lines = []
+        for module_name, module_examples in examples.items():
+            entry_ids = selected_entry_ids_from_examples(module_examples)
+            module_lines.append(f"  {module_name}: {', '.join(entry_ids) if entry_ids else '(none)'}")
+        k_label = "all" if k is None else str(k)
+        return "\n".join(
+            [
+                f"Justification: module relevance, then lowest score, up to k={k_label} examples.",
+                (
+                    f"Near-duplicate execution errors within Hamming distance {error_hamming_distance_k} are dropped."
+                    if self.dedupe_reflective_examples and error_hamming_distance_k is not None
+                    else "No Hamming-distance dedupe."
+                ),
+                "Selected entry_ids by module:",
+                *module_lines,
+            ]
+        )
+
+    def _log_reflective_dataset(
+        self,
+        *,
+        trajectories: list[ALTrajectory],
+        examples: dict[str, list[ReflectiveExample]],
+        k: int | None,
+        error_hamming_distance_k: int | None,
+        selection: ReflectiveSelection,
+    ) -> None:
+        log_section(self._reflective_eval_entries_log_title(), format_eval_entry_report(trajectories))
+        log_section(
+            "REFLECTION: high-signal dataset",
+            self._reflective_dataset_justification(
+                k=k,
+                error_hamming_distance_k=error_hamming_distance_k,
+                selection=selection,
+                examples=examples,
+            ),
+        )
 
     # TODO(Cathy): Implement this
     def _compute_module_relevance(self, module_name: str, trajectory: ALTrajectory, score: float) -> float:
