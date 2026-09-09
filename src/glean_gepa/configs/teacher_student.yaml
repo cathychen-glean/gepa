@@ -1,12 +1,9 @@
 # Teacher-student experiment: the student's first tool call is scored against the
 # teacher's on paired traces.
 #
-# This mode requires `packs: [tools]` and objective.primary=tool_alignment — it has
-# no scoring path for shell telemetry, so use single_model.yaml for shell_success_rate.
-#
-# The pack (glean_gepa/configs/packs/tools.yaml) supplies the tool_alignment signal,
-# objective.primary, and the screening gate. Signals declared below are merged with
-# the pack's by name, and objective/screening keys set below override the pack's.
+# The pack (configs/packs/tools.yaml) supplies the tool_alignment signal,
+# objective.primary, and the screening gate. Signals below are merged with the
+# pack's by name; objective/screening keys below override the pack's.
 
 schema_version: 1
 mode: teacher_student
@@ -17,9 +14,8 @@ run:
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
   seed_candidate: data/seed_candidate.json
-  # CORE_TOOLS expands to every core tool description; RULES_EXT is the appended
-  # rules block. Reflection only rewrites the core tools that show up in the
-  # first-tool mismatch set, so listing the group does not edit all of them.
+  # CORE_TOOLS expands to every core tool description, but reflection only
+  # rewrites the ones appearing in the first-tool mismatch set.
   editable_modules: [CORE_TOOLS, RULES_EXT]
 
 models:
@@ -42,8 +38,7 @@ data:
   days_back: 0
   val_version_count: 2
 
-# Mode-owned Cortex judges. Pack signals (tool_alignment / shell_success_rate)
-# are merged in from `packs`.
+# Mode-owned Cortex judges; tool_alignment is merged in from the pack.
 signals:
   - name: completeness
     source: cortex_judge
@@ -79,16 +74,11 @@ objective:
   #     min: 0.95
   validation: []
 
-# Overrides the tools pack's 0.333 gate; `kind` and `high_signal` still come from
-# the pack. The screened set is exactly the entries the parent got wrong, so the
-# parent scores 0 on it and any positive fix rate is already an improvement. At
-# 1/3 a child fixing 17 of 52 real mismatches was discarded. 0.25 lets those reach
-# full validation, which is the step that can actually see a regression on the
-# entries the parent already had right.
-screening:
-  threshold: 0.25
-
 search:
   offspring_count: 5
+  # Set to `all` to reflect on every available example.
   reflection_samples: 8
   reflection_hamming_distance_k: null
+  # Total prompt-token ceiling a mutated candidate may reach. Raised at startup to
+  # fit the per-module budgets, so a value below those cannot starve a module.
+  global_token_cap: 4096

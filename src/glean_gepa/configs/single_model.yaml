@@ -45,5 +45,9 @@ objective:
 
 search:
   offspring_count: 5
+  # Set to `all` to reflect on every available example.
   reflection_samples: 8
   reflection_hamming_distance_k: null
+  # Total prompt-token ceiling a mutated candidate may reach. Raised at startup to
+  # fit the per-module budgets, so a value below those cannot starve a module.
+  global_token_cap: 4096

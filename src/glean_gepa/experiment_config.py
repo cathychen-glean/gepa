@@ -162,6 +162,8 @@ def runner_arg_defaults(config: ExperimentConfig) -> dict[str, Any]:
     if "reflection_hamming_distance_k" in search:
         hamming = search["reflection_hamming_distance_k"]
         defaults["reflection_hamming_distance_k"] = None if hamming is None else int(hamming)
+    if search.get("global_token_cap") is not None:
+        defaults["global_token_cap"] = int(search["global_token_cap"])
     lookback = agentspan_lookback_days(config)
     if lookback is not None:
         defaults["agentspan_lookback_days"] = lookback

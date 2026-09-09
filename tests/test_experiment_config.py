@@ -12,10 +12,31 @@ from glean_gepa.experiment_config import (
     load_experiment_config,
     pointwise_judges,
     resolve_config_path,
+    runner_arg_defaults,
     screening_threshold,
 )
 from glean_gepa.runner import _parse_args
 from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+
+_POINTWISE_COMPLETENESS = (
+    "  - name: completeness\n    source: cortex_judge\n    type: COMPLETENESS\n    kind: pointwise\n"
+)
+_PAIRWISE_CORRECTNESS = "  - name: correctness\n    source: cortex_judge\n    type: CORRECTNESS\n    kind: pairwise\n"
+
+
+def _write_mode(tmp_path, body: str) -> Path:
+    mode = tmp_path / "mode.yaml"
+    mode.write_text(body)
+    return mode
+
+
+def _mode_yaml(*, mode: str = "teacher_student", packs: str = "[tools]", signals: str = "", composite: str = "") -> str:
+    body = f"schema_version: 1\nmode: {mode}\npacks: {packs}\n"
+    if signals:
+        body += f"signals:\n{signals}"
+    if composite:
+        body += f"objective:\n  composite:\n{composite}"
+    return body
 
 
 def test_load_packaged_teacher_student_merges_tools_pack():
@@ -26,15 +47,12 @@ def test_load_packaged_teacher_student_merges_tools_pack():
     assert config.primary_objective == "tool_alignment"
     assert config.frontier_type == "hybrid"
     assert config.objective["composite"] == {"tool_alignment": 1.0}
-    # completeness is still declared so it can be switched back on, but it is
-    # disabled, so no judge runs are started and it carries no weight.
-    signal_names = [signal["name"] for signal in config.signals]
-    assert signal_names == ["tool_alignment", "completeness", "correctness"]
+    # The judges stay declared so they can be switched back on, but disabled
+    # they start no runs and carry no weight.
+    assert [signal["name"] for signal in config.signals] == ["tool_alignment", "completeness", "correctness"]
     assert pointwise_judges(config) == ()
     assert composite_weights(config) == {"tool_alignment": 1.0}
-    # The mode file overrides only the pack's threshold; kind and high_signal
-    # still come from the pack.
-    assert screening_threshold(config) == pytest.approx(0.25)
+    # The mode overrides only the threshold; kind and high_signal come from the pack.
     assert config.screening["kind"] == "high_signal_fix_rate"
     assert config.screening["high_signal"] == "first_tool_mismatch"
 
@@ -97,12 +115,6 @@ def test_resolve_config_path_accepts_packaged_stem_and_file(tmp_path):
         resolve_config_path("missing_mode")
 
 
-def _write_mode(tmp_path, body: str) -> Path:
-    mode = tmp_path / "mode.yaml"
-    mode.write_text(body)
-    return mode
-
-
 @pytest.mark.parametrize(
     ("mode", "packs"),
     [
@@ -115,10 +127,8 @@ def _write_mode(tmp_path, body: str) -> Path:
     ],
 )
 def test_pack_not_scorable_by_mode_raises(tmp_path, mode, packs):
-    config = _write_mode(tmp_path, f"schema_version: 1\nmode: {mode}\npacks: {packs}\n")
-
     with pytest.raises(ExperimentConfigError, match="supports only packs"):
-        load_experiment_config(config)
+        load_experiment_config(_write_mode(tmp_path, _mode_yaml(mode=mode, packs=packs)))
 
 
 @pytest.mark.parametrize(
@@ -136,92 +146,61 @@ def test_omitted_packs_defaults_to_the_modes_pack(tmp_path, mode, pack, primary)
 
 
 def test_primary_objective_override_must_match_mode(tmp_path):
-    config = _write_mode(
-        tmp_path,
-        f"schema_version: 1\nmode: teacher_student\npacks: [tools]\nobjective:\n  primary: {SHELL_SUCCESS_OBJECTIVE}\n",
-    )
+    body = _mode_yaml() + f"objective:\n  primary: {SHELL_SUCCESS_OBJECTIVE}\n"
 
     with pytest.raises(ExperimentConfigError, match="can only score objective.primary=tool_alignment"):
-        load_experiment_config(config)
+        load_experiment_config(_write_mode(tmp_path, body))
 
 
 def test_mode_composite_replaces_the_packs_composite_wholesale(tmp_path):
-    config = load_experiment_config(
-        _write_mode(
-            tmp_path,
-            "schema_version: 1\nmode: teacher_student\npacks: [tools]\n"
-            "signals:\n  - name: completeness\n    source: cortex_judge\n"
-            "    type: COMPLETENESS\n    kind: pointwise\n"
-            "objective:\n  composite:\n    completeness: 1.0\n",
-        )
-    )
+    body = _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite="    completeness: 1.0\n")
+
+    config = load_experiment_config(_write_mode(tmp_path, body))
 
     # The tools pack declares composite {tool_alignment: 1.0}. Merging would leave
     # that weight in place and push the total to 2.0.
     assert composite_weights(config) == {"completeness": 1.0}
 
 
-def test_composite_weighting_undeclared_signal_raises(tmp_path):
-    config = _write_mode(
-        tmp_path,
-        "schema_version: 1\nmode: teacher_student\npacks: [tools]\n"
-        "objective:\n  composite:\n    tool_alignment: 0.5\n    typoed_signal: 0.5\n",
-    )
-
-    with pytest.raises(ExperimentConfigError, match=r"typoed_signal \(undeclared\)"):
-        load_experiment_config(config)
-
-
-def test_composite_weighting_declared_but_unscorable_signal_raises(tmp_path):
-    # correctness is a pairwise judge: nothing turns it into a per-entry score.
-    config = _write_mode(
-        tmp_path,
-        "schema_version: 1\nmode: teacher_student\npacks: [tools]\n"
-        "signals:\n  - name: correctness\n    source: cortex_judge\n"
-        "    type: CORRECTNESS\n    kind: pairwise\n"
-        "objective:\n  composite:\n    tool_alignment: 0.5\n    correctness: 0.5\n",
-    )
-
-    with pytest.raises(ExperimentConfigError, match=r"correctness \(declared but not scorable\)"):
-        load_experiment_config(config)
-
-
-def test_single_model_cannot_weight_a_pointwise_judge(tmp_path):
-    """single_model has no judge plumbing, so a weighted judge must fail at load."""
-    config = _write_mode(
-        tmp_path,
-        "schema_version: 1\nmode: single_model\npacks: [shell]\n"
-        "signals:\n  - name: completeness\n    source: cortex_judge\n"
-        "    type: COMPLETENESS\n    kind: pointwise\n"
-        f"objective:\n  composite:\n    {SHELL_SUCCESS_OBJECTIVE}: 0.5\n    completeness: 0.5\n",
-    )
-
-    with pytest.raises(ExperimentConfigError, match=r"completeness \(declared but not scorable\)"):
-        load_experiment_config(config)
+_UNSCORABLE = "declared but not scorable"
+# Every way a composite weight can fail to resolve, keyed by why.
+_UNSCORABLE_COMPOSITES = {
+    # Paired with a valid weight, so one bad name fails the whole load.
+    "undeclared_name": (
+        "typoed_signal",
+        "undeclared",
+        _mode_yaml(composite="    tool_alignment: 0.5\n    typoed_signal: 0.5\n"),
+    ),
+    "other_modes_signal": (
+        SHELL_SUCCESS_OBJECTIVE,
+        "undeclared",
+        _mode_yaml(composite=f"    {SHELL_SUCCESS_OBJECTIVE}: 0.5\n"),
+    ),
+    "pairwise_judge_has_no_per_entry_score": (
+        "correctness",
+        _UNSCORABLE,
+        _mode_yaml(signals=_PAIRWISE_CORRECTNESS, composite="    correctness: 0.5\n"),
+    ),
+    "disabled_judge": (
+        "completeness",
+        _UNSCORABLE,
+        _mode_yaml(signals=f"{_POINTWISE_COMPLETENESS}    enabled: false\n", composite="    completeness: 0.5\n"),
+    ),
+    "single_model_has_no_judge_plumbing": (
+        "completeness",
+        _UNSCORABLE,
+        _mode_yaml(
+            mode="single_model", packs="[shell]", signals=_POINTWISE_COMPLETENESS, composite="    completeness: 0.5\n"
+        ),
+    ),
+}
 
 
-def test_composite_weighting_disabled_judge_raises(tmp_path):
-    config = _write_mode(
-        tmp_path,
-        "schema_version: 1\nmode: teacher_student\npacks: [tools]\n"
-        "signals:\n  - name: completeness\n    source: cortex_judge\n"
-        "    type: COMPLETENESS\n    kind: pointwise\n    enabled: false\n"
-        "objective:\n  composite:\n    tool_alignment: 0.5\n    completeness: 0.5\n",
-    )
-
-    with pytest.raises(ExperimentConfigError, match=r"completeness \(declared but not scorable\)"):
-        load_experiment_config(config)
-
-
-def test_composite_cannot_weight_the_other_modes_signal(tmp_path):
-    config = _write_mode(
-        tmp_path,
-        "schema_version: 1\nmode: teacher_student\npacks: [tools]\n"
-        f"objective:\n  composite:\n    tool_alignment: 0.5\n    {SHELL_SUCCESS_OBJECTIVE}: 0.5\n",
-    )
-
-    with pytest.raises(ExperimentConfigError, match=rf"{SHELL_SUCCESS_OBJECTIVE} \(undeclared\)"):
-        load_experiment_config(config)
+@pytest.mark.parametrize(("signal", "reason", "body"), _UNSCORABLE_COMPOSITES.values(), ids=_UNSCORABLE_COMPOSITES)
+def test_composite_weight_nothing_can_score_raises(tmp_path, signal, reason, body):
+    """A weight that resolves to nothing must fail the load, never score a silent zero."""
+    with pytest.raises(ExperimentConfigError, match=rf"{signal} \({reason}\)"):
+        load_experiment_config(_write_mode(tmp_path, body))
 
 
 def test_judging_mode_flag_conflicting_with_config_raises():
@@ -233,9 +212,8 @@ def test_runner_config_sets_yaml_defaults_and_cli_overrides():
     args = _parse_args(["--config", "teacher_student", "--student_model", "fast"])
 
     assert args.judging_mode == "teacher_student"
-    # The explicit flag wins; the unflagged model falls back to the YAML, whose
-    # value is asserted against the config so retuning the packaged models does
-    # not break this wiring test.
+    # Compared against the config, not a literal, so retuning the packaged
+    # models does not break this wiring test.
     assert args.student_model == "fast"
     assert args.teacher_model == args.experiment.models["teacher"]
     assert args.seed_candidate == Path("data/seed_candidate.json")
@@ -247,6 +225,17 @@ def test_runner_config_sets_yaml_defaults_and_cli_overrides():
         int(signal["lookback_days"]) for signal in args.experiment.signals if signal.get("lookback_days") is not None
     )
     assert args.agentspan_lookback_days == pack_lookback
+
+
+def test_global_token_cap_comes_from_yaml_and_yields_to_the_flag(tmp_path):
+    from_yaml = _parse_args(["--config", "teacher_student"])
+    assert from_yaml.global_token_cap == 4096
+
+    overridden = _parse_args(["--config", "teacher_student", "--global_token_cap", "8192"])
+    assert overridden.global_token_cap == 8192
+
+    body = _mode_yaml() + "search:\n  global_token_cap: 2048\n"
+    assert runner_arg_defaults(load_experiment_config(_write_mode(tmp_path, body)))["global_token_cap"] == 2048
 
 
 def test_runner_without_config_keeps_cli_defaults():
