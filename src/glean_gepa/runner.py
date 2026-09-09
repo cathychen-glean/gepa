@@ -497,14 +497,14 @@ def _validate_best_candidate_on_customer_eval(
     if best_wait:
         runner.wait(best_eval_id)
 
-    judge_run_id = evalcli.create_judge_run(
+    judge_run_id = runner.ensure_judge_run(
         eval_run_id=best_eval_id,
         judge_type=CORRECTNESS_JUDGE_TYPE,
         run_params=CORRECTNESS_RUN_PARAMS,
         base_eval_run_id=baseline_eval_id,
         input_mappings=CORRECTNESS_INPUT_MAPPINGS,
     )
-    evalcli.wait_for_judge_run(judge_run_id)
+    evalcli.wait_for_judge_run(judge_run_id, eval_run_id=best_eval_id)
     metrics = evalcli.compare_eval_metrics(best_eval_id, baseline_eval_id)
     run_details = [
         f"baseline_eval_id={baseline_eval_id}",

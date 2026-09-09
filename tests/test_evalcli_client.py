@@ -381,6 +381,44 @@ def test_compare_eval_metrics_uses_pairwise_compare_command():
     )
 
 
+def test_find_judge_run_id_matches_base_eval_run():
+    """The list filter matches base OR test eval, so the base must be checked explicitly."""
+    client = EvalCliClient(binary="/fake/evalcli")
+    listing = {
+        "judgeRuns": [
+            # Same test eval, but scored against a different baseline.
+            {"id": "judge-other-base", "evalRunId": "eval-best", "n": "eval-base-old"},
+            {"id": "judge-wanted", "evalRunId": "eval-best", "n": "eval-base"},
+        ]
+    }
+    with patch.object(client, "_invoke_json", return_value=listing):
+        found = client.find_judge_run_id(
+            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
+        )
+    assert found == "judge-wanted"
+
+
+def test_find_judge_run_id_skips_rows_where_id_is_only_the_base():
+    """Filtering by eval run also returns judges where it was the baseline."""
+    client = EvalCliClient(binary="/fake/evalcli")
+    listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "some-other-eval", "n": "eval-best"}]}
+    with patch.object(client, "_invoke_json", return_value=listing):
+        found = client.find_judge_run_id(
+            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
+        )
+    assert found is None
+
+
+def test_find_judge_run_id_reads_canonical_base_field():
+    client = EvalCliClient(binary="/fake/evalcli")
+    listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "eval-best", "baseEvalRunId": "eval-base"}]}
+    with patch.object(client, "_invoke_json", return_value=listing):
+        found = client.find_judge_run_id(
+            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
+        )
+    assert found == "judge-1"
+
+
 def test_wait_for_judge_run_raises_on_failure():
     client = EvalCliClient(binary="/fake/evalcli")
     listing = {"judgeRuns": [{"id": "judge_456", "status": "FAILED"}]}

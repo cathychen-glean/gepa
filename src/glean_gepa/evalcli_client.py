@@ -140,6 +140,19 @@ def classify_eval_run_status(status: Any) -> str:
     return "usable"
 
 
+def judge_run_base_eval_id(row: dict[str, Any]) -> str | None:
+    """Read a judge run's base eval run ID.
+
+    The generated Cortex model serializes ``baseEvalRunId`` under the alias ``n``, so accept
+    both spellings rather than depending on which one a given evalcli build emits.
+    """
+    for key in ("baseEvalRunId", "base_eval_run_id", "n"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def is_missing_eval_job(exc: EvalCliError) -> bool:
     message = str(exc).lower()
     return "no job found" in message or "not found" in message
@@ -515,13 +528,28 @@ class EvalCliClient:
             return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
         return []
 
-    def find_judge_run_id(self, eval_run_id: str, *, judge_type: str) -> str | None:
-        """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list)."""
+    def find_judge_run_id(
+        self,
+        eval_run_id: str,
+        *,
+        judge_type: str,
+        base_eval_run_id: str | None = None,
+    ) -> str | None:
+        """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list).
+
+        ``base_eval_run_id`` restricts the match to comparative judges scored against that
+        baseline. The list filter matches either the test or the base eval run, so without
+        it a pairwise judge for an unrelated baseline could be returned.
+        """
         wanted_type = judge_type.upper()
         for row in self.list_judge_runs(eval_run_id, judge_type=wanted_type):
             config = row.get("config") if isinstance(row.get("config"), dict) else {}
             row_type = config.get("judgeType") or row.get("judgeType") or row.get("judge_type")
             if str(row_type or wanted_type).upper() != wanted_type:
+                continue
+            if str(row.get("evalRunId") or row.get("eval_run_id") or eval_run_id) != eval_run_id:
+                continue
+            if base_eval_run_id is not None and judge_run_base_eval_id(row) != base_eval_run_id:
                 continue
             judge_run_id = row.get("id")
             if judge_run_id:
