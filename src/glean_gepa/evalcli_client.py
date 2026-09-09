@@ -502,25 +502,23 @@ class EvalCliClient:
         except EvalCliError:
             return None
 
+    def list_judge_runs(self, eval_run_id: str, *, judge_type: str | None = None) -> list[dict[str, Any]]:
+        """List judge runs via GET /judgeruns?evalRunIds= (evalcli judge list)."""
+        cmd = ["judge", "list", "--eval-run-ids", eval_run_id]
+        if judge_type:
+            cmd.extend(["--judge-types", judge_type.upper()])
+        result = self._invoke_json(*cmd)
+        if isinstance(result, list):
+            return [row for row in result if isinstance(row, dict)]
+        if isinstance(result, dict):
+            raw = result.get("judgeRuns") or result.get("runs") or result.get("items") or []
+            return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+        return []
+
     def find_judge_run_id(self, eval_run_id: str, *, judge_type: str) -> str | None:
         """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list)."""
         wanted_type = judge_type.upper()
-        result = self._invoke_json(
-            "judge",
-            "list",
-            "--eval-run-ids",
-            eval_run_id,
-            "--judge-types",
-            wanted_type,
-        )
-        if isinstance(result, list):
-            rows = [row for row in result if isinstance(row, dict)]
-        elif isinstance(result, dict):
-            raw = result.get("judgeRuns") or result.get("runs") or result.get("items") or []
-            rows = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
-        else:
-            rows = []
-        for row in rows:
+        for row in self.list_judge_runs(eval_run_id, judge_type=wanted_type):
             config = row.get("config") if isinstance(row.get("config"), dict) else {}
             row_type = config.get("judgeType") or row.get("judgeType") or row.get("judge_type")
             if str(row_type or wanted_type).upper() != wanted_type:
@@ -540,6 +538,16 @@ class EvalCliClient:
             raise EvalCliError(f"Unexpected metrics summary response: {result!r}")
         return result
 
+    def get_judge_run(self, judge_run_id: str, *, eval_run_id: str) -> dict[str, Any] | None:
+        """Return a single judge run.
+
+        Cortex has no judge-run-by-id endpoint, so this filters the eval run's judge list.
+        """
+        for row in self.list_judge_runs(eval_run_id):
+            if str(row.get("id") or "") == judge_run_id:
+                return row
+        return None
+
     def compare_eval_metrics(self, test_eval_id: str, base_eval_id: str) -> dict[str, Any]:
         """Return paired judge and system metrics for two eval runs."""
         result = self._invoke_json(
@@ -558,14 +566,17 @@ class EvalCliClient:
         self,
         judge_run_id: str,
         *,
+        eval_run_id: str,
         poll_interval_sec: int = 60,
         timeout_sec: int = 3600,
     ) -> None:
         print(f"Waiting for judge run {judge_run_id} to complete...")
         elapsed = 0
         while elapsed < timeout_sec:
-            run = self._invoke_json("judge", "get", "--id", judge_run_id)
+            run = self.get_judge_run(judge_run_id, eval_run_id=eval_run_id)
             status = run.get("status") if isinstance(run, dict) else None
+            if isinstance(status, dict):
+                status = status.get("value")
             if status in TERMINAL_JUDGE_STATUSES:
                 if status != "SUCCEEDED":
                     raise EvalCliError(f"Judge run {judge_run_id} ended with status {status}")
