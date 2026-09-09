@@ -18,13 +18,13 @@ The Glean adapter optimizes prompts for the Glean Assistant by running eval sets
    - Make a request to glean.com
    - Copy the `cookie` header value
 
-2. **Seed candidate**: A JSON file with initial prompt components (see `data/seed_candidate.json`)
+2. **Seed candidate**: A JSON file with initial prompt components (see `data/seed_single_model.json`)
 
 ## Running
 
 ```bash
 uv run python -m gepa.api \
-  --seed_candidate data/seed_candidate.json \
+  --seed_candidate data/seed_single_model.json \
   --cookie "your_cookie_string_from_browser" \
   --eval_set_version "20260308" \
   --model claude \

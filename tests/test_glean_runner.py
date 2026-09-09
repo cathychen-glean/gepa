@@ -167,15 +167,30 @@ def test_load_seed_candidate_rejects_invalid(tmp_path, raw, match):
         _load_seed_candidate(path)
 
 
-def test_committed_seed_candidate_is_overrides_only():
-    path = Path(__file__).resolve().parents[1] / "data" / "seed_candidate.json"
-    raw = _load_seed_candidate(path)
+def _committed_seed(name: str) -> dict[str, str]:
+    return _load_seed_candidate(Path(__file__).resolve().parents[1] / "data" / name)
 
-    assert WRITING_CODE_KEY not in raw
-    assert FULL_PROMPT_KEY not in raw
+
+def test_teacher_student_seed_is_overrides_only():
+    """Empty on purpose: candidate ids hash the resolved modules, so pinning text
+    here shifts the compiled prompt hash and misses the eval-run cache."""
+    raw = _committed_seed("seed_teacher_student.json")
+
+    assert raw == {}
     seed = _seed_for_editable_modules(raw, [WRITING_CODE_KEY, RULES_EXT_KEY])
     assert seed[WRITING_CODE_KEY] == PROMPT_MODULE_DEFAULTS[WRITING_CODE_KEY]
     assert seed[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
+
+
+def test_single_model_seed_pins_its_own_writing_code():
+    """Kept separate from the teacher-student seed: WRITING_CODE feeds the
+    materialized FULL_PROMPT, so one shared file would let this text silently
+    change the teacher-student baseline."""
+    raw = _committed_seed("seed_single_model.json")
+
+    assert set(raw) == {WRITING_CODE_KEY}
+    assert raw[WRITING_CODE_KEY] != PROMPT_MODULE_DEFAULTS[WRITING_CODE_KEY]
+    assert _seed_for_editable_modules(raw, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: raw[WRITING_CODE_KEY]}
 
 
 def test_parse_args_defaults_editable_modules_to_writing_code():

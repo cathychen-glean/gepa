@@ -216,7 +216,7 @@ def test_runner_config_sets_yaml_defaults_and_cli_overrides():
     # models does not break this wiring test.
     assert args.student_model == "fast"
     assert args.teacher_model == args.experiment.models["teacher"]
-    assert args.seed_candidate == Path("data/seed_candidate.json")
+    assert args.seed_candidate == Path("data/seed_teacher_student.json")
     assert args.run_dir == Path("run_ts")
     assert args.experiment.primary_objective == "tool_alignment"
     # Derived from the widest lookback_days across the merged signals, so it
