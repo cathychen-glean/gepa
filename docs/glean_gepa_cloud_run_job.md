@@ -149,7 +149,7 @@ checkpoint and candidate artifacts.
 First upload the seed candidate to the mounted bucket:
 
 ```bash
-gcloud storage cp data/seed_single_model.json "gs://${RUN_BUCKET}/configs/writing-code-seed.json"
+gcloud storage cp data/seed_candidate.json "gs://${RUN_BUCKET}/configs/writing-code-seed.json"
 ```
 
 Then pass the normal runner arguments as a JSON array. The train/validation

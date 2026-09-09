@@ -18,7 +18,7 @@ run:
   dir: run_sm
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
-  seed_candidate: data/seed_single_model.json
+  seed_candidate: data/seed_candidate.json
   editable_modules: [WRITING_CODE]
 
 models:

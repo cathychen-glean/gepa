@@ -89,7 +89,7 @@ whose errors are within the configured Hamming distance of an earlier error:
 
 ```bash
 uv run python -m glean_gepa.runner \
-  --seed_candidate data/seed_single_model.json \
+  --seed_candidate data/seed_candidate.json \
   --run_dir gepa_runs/run-002 \
   --max_metric_calls 10 \
   --judging_mode single_model \
