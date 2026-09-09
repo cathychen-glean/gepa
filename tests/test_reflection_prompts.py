@@ -9,10 +9,12 @@ from glean_gepa.reflection_prompts import (
 
 def test_reflection_prompts_route_by_module():
     assert "ENTIRE student system prompt" in teacher_student_reflection_prompt(FULL_PROMPT_KEY)
+    assert "<<<[[hitl_approval_instructions]]>>>" in teacher_student_reflection_prompt(FULL_PROMPT_KEY)
     assert teacher_student_reflection_prompt(RULES_EXT_KEY) == RULES_EXT_RESPONSIBILITY
     assert "glean_search" in teacher_student_reflection_prompt("glean_search")
     assert teacher_student_reflection_prompt(WRITING_CODE_KEY) == "Focus only on this module's responsibilities."
 
     assert single_model_reflection_prompt(WRITING_CODE_KEY) == WRITING_CODE_SINGLE_MODEL_RESPONSIBILITY
+    assert "<<<[[hitl_approval_instructions]]>>>" in single_model_reflection_prompt(WRITING_CODE_KEY)
     assert "glean_search" in single_model_reflection_prompt("glean_search")
     assert single_model_reflection_prompt(FULL_PROMPT_KEY) == "Focus only on this module's responsibilities."

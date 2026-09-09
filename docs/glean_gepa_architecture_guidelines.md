@@ -66,6 +66,20 @@ Both adapters satisfy the same GEPA-facing contract: candidates are `dict[str, s
 
 Keep evaluation behavior stable while changing the surrounding code. Do not simultaneously change scoring, candidate selection, or remote-evaluation semantics.
 
+## Customer eval after optimization
+
+When a real (non-`--fake_flow`) run finishes, `runner.py` runs the seed baseline
+and best candidate on the same **Glean Chat V2 Medium** customer entries. The
+eval-set **version is not configured**: EvalCLI is queried at runtime, and the
+newest `YYYYMMDD` version available to every configured customer is used.
+
+The best run is judged for pairwise correctness against the baseline. The
+held-out check passes only when correctness is above 80% and the EvalCLI paired
+comparison finds no statistically significant change (Benjamini-Hochberg
+adjusted `p >= 0.05`) in average cost, average loops, or any tool invocation
+rate. A failed gate exits the run unsuccessfully. These evals do not feed the
+search.
+
 ## Reflection sampling CLI
 
 Use all available reflective examples when each iteration's example set is
@@ -93,6 +107,46 @@ uv run python -m glean_gepa.runner \
 5. Preserve the distinction between a selection score and reflection diagnostics. Scores choose candidates; traces, error strings, and per-entry data explain what to edit.
 6. Cache keys must include every result-changing input: eval-set identity/version, model, prompt hash, and run label. Keep fresh eval-set cache behavior explicit.
 7. Every extraction step gets characterization tests before cleanup. Remote EvalCLI/BigQuery runs are smoke tests, not unit tests.
+
+## Children cache (`glean_children_cache.json`)
+
+`EvolutionaryProposer` persists generated children so a resumed run does not
+re-reflect the same root on the same training slice. The file lives at
+`<run_dir>/cache/glean_children_cache.json` unless `--children_cache_file` is set.
+
+There is no schema version field. The file is the current record shape only;
+unreadable files degrade to an empty cache and those children are proposed
+again. Do not reintroduce version numbers or compatibility shims.
+
+```json
+{
+  "training_slices": [
+    {
+      "train_ids": [0],
+      "root_screening_scores": {"<root_id>": 0.75},
+      "roots": {
+        "<root_id>": [
+          {
+            "prompt_modules": {"WRITING_CODE": "..."},
+            "eval_run_ids": [
+              {
+                "eval_set_name": "focused",
+                "eval_set_version": "v1",
+                "student_eval_run_id": "eval-child-1"
+              }
+            ],
+            "screening_score": 0.5,
+            "screening_passed": true
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+`screening_passed` is stored, but a high-signal resume recomputes pass/fail
+from `screening_score` and the current threshold.
 
 ## Suggested ownership split
 

@@ -12,7 +12,6 @@ from glean_gepa.al_adapter import Candidate, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import (
-    CHILDREN_CACHE_SCHEMA_VERSION,
     EvolutionaryProposer,
     make_children_for_generation,
 )
@@ -248,38 +247,36 @@ def test_children_cache_survives_proposer_restart(tmp_path) -> None:
     ]
 
 
-@pytest.mark.parametrize("schema_version", range(2, CHILDREN_CACHE_SCHEMA_VERSION + 1))
-def test_loads_every_released_children_cache_schema(tmp_path, schema_version) -> None:
-    cache_file = tmp_path / "children.json"
-    cache_file.write_text(
-        json.dumps(
+def _children_cache_payload() -> dict:
+    return {
+        "training_slices": [
             {
-                "schema_version": schema_version,
-                "training_slices": [
-                    {
-                        "train_ids": [0],
-                        "root_screening_scores": {"root": 0.75},
-                        "roots": {
-                            "root": [
+                "train_ids": [0],
+                "root_screening_scores": {"root": 0.75},
+                "roots": {
+                    "root": [
+                        {
+                            "prompt_modules": {"WRITING_CODE": "cached rewrite"},
+                            "eval_run_ids": [
                                 {
-                                    "prompt_modules": {"WRITING_CODE": "cached rewrite"},
-                                    "eval_run_ids": [
-                                        {
-                                            "eval_set_name": "focused",
-                                            "eval_set_version": "v1",
-                                            "student_eval_run_id": "eval-child-1",
-                                        }
-                                    ],
-                                    "screening_score": 0.5,
-                                    "screening_passed": True,
+                                    "eval_set_name": "focused",
+                                    "eval_set_version": "v1",
+                                    "student_eval_run_id": "eval-child-1",
                                 }
-                            ]
-                        },
-                    }
-                ],
+                            ],
+                            "screening_score": 0.5,
+                            "screening_passed": True,
+                        }
+                    ]
+                },
             }
-        )
-    )
+        ],
+    }
+
+
+def test_loads_children_cache(tmp_path) -> None:
+    cache_file = tmp_path / "children.json"
+    cache_file.write_text(json.dumps(_children_cache_payload()))
 
     proposer = _proposer(_ReflectionAdapter(), str(cache_file))
     child = proposer._children_by_root_by_train_slice[(0,)]["root"][0]
@@ -290,14 +287,15 @@ def test_loads_every_released_children_cache_schema(tmp_path, schema_version) ->
     assert proposer._cached_screening_scores((0,), [child], use_high_signal_gate=True) == [(0.5, True)]
 
 
-def test_ignores_children_cache_written_by_a_newer_schema(tmp_path) -> None:
-    """A cache from a future version is unreadable, so it must not be trusted."""
-    cache_file = tmp_path / "children.json"
-    cache_file.write_text(json.dumps({"schema_version": CHILDREN_CACHE_SCHEMA_VERSION + 1, "training_slices": []}))
+def test_children_cache_save_has_no_schema_version(tmp_path) -> None:
+    cache_file = str(tmp_path / "children.json")
+    proposer = _proposer(_ReflectionAdapter(), cache_file)
+    proposer._children_by_root_by_train_slice[(0,)] = {"root": []}
+    proposer._save_children_cache()
 
-    proposer = _proposer(_ReflectionAdapter(), str(cache_file))
-
-    assert proposer._children_by_root_by_train_slice == {}
+    saved = json.loads((tmp_path / "children.json").read_text())
+    assert "schema_version" not in saved
+    assert "training_slices" in saved
 
 
 def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None:

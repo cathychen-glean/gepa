@@ -19,13 +19,19 @@ from glean_gepa.prompt_constants import (
 from glean_gepa.runner import (
     ADAPTER_CACHE_FILENAME,
     CACHE_DIRECTORY_NAME,
+    CUSTOMER_EVAL_DEPLOYMENT_IDS,
+    GLEAN_CHAT_EVAL_SET_NAME,
     _default_cache_file,
+    _latest_dated_eval_version,
     _load_seed_candidate,
+    _make_evalset,
     _parse_args,
     _parse_editable_modules,
     _resolve_eval_version_split,
     _seed_for_editable_modules,
     _select_recent_train_and_val_versions,
+    _validate_best_candidate_on_customer_eval,
+    _verify_customer_eval_metrics,
 )
 
 SEED_BOTH = {"WRITING_CODE": "patterns", "FULL_PROMPT": "PREFIX\n{WRITING_CODE}\nSUFFIX"}
@@ -98,9 +104,7 @@ def test_load_seed_candidate_accepts_known_keys(tmp_path, raw):
 
 
 def test_seed_for_editable_modules():
-    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == {
-        FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"
-    }
+    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
     assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: "patterns"}
 
     raw = {**SEED_BOTH, "glean_search": "Search less."}
@@ -298,3 +302,109 @@ def test_recent_versions_fall_back_to_one_val_version_when_only_two_are_availabl
 
     assert train_versions == ["20260820"]
     assert val_versions == ["20260827"]
+
+
+def test_latest_dated_eval_version_picks_newest_customer_version():
+    assert (
+        _latest_dated_eval_version(
+            [
+                {"version": "20260908", "availableDeploymentIds": ["bill"]},
+                {"evalSetVersion": "20260905", "availableDeploymentIds": list(CUSTOMER_EVAL_DEPLOYMENT_IDS)},
+                {"version": "latest"},
+                {"version": "20260827"},
+            ],
+            required_deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
+        )
+        == "20260905"
+    )
+
+
+def test_latest_dated_eval_version_fails_without_dated_versions():
+    with pytest.raises(SystemExit, match="dated"):
+        _latest_dated_eval_version([{"version": "latest"}])
+
+
+def _passing_customer_metrics():
+    return {
+        "systemMetrics": {
+            "additional_properties": {
+                "COST": {
+                    "category": "COST",
+                    "metrics": [{"metric": "avg_cost_usd", "base": 0.10, "test": 0.11, "pValue": 0.2}],
+                },
+                "LOOP_COUNT_PERCENTILE": {
+                    "category": "LOOP_COUNT_PERCENTILE",
+                    "metrics": [{"metric": "avg_al_loops", "base": 2.0, "test": 2.1, "pValue": 0.3}],
+                },
+                "TOOL_INVOCATION_RATE": {
+                    "category": "TOOL_INVOCATION_RATE",
+                    "metrics": [
+                        {"metric": "glean_search", "base": 0.5, "test": 0.52, "pValue": 0.4},
+                        {"metric": "code_search", "base": 0.1, "test": 0.09, "pValue": 0.5},
+                    ],
+                },
+            }
+        },
+        "judgeMetrics": {
+            "additional_properties": {
+                "CORRECTNESS": [{"metric": "CORRECTNESS", "base": 0.79, "test": 0.81, "pValue": 0.2}]
+            }
+        },
+    }
+
+
+def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
+    evalcli = MagicMock()
+    evalcli.list_eval_set_versions.return_value = [{"version": "20260820"}, {"version": "20260908"}]
+    evalcli.create_judge_run.return_value = "judge-1"
+    evalcli.compare_eval_metrics.return_value = _passing_customer_metrics()
+    runner = MagicMock()
+    runner.start.side_effect = [("eval-base", True), ("eval-best", True)]
+    baseline = {"WRITING_CODE": "baseline"}
+    best = {"WRITING_CODE": "updated"}
+
+    _validate_best_candidate_on_customer_eval(
+        runner=runner,
+        student_model="gpt",
+        baseline_candidate=baseline,
+        best_candidate=best,
+        evalcli=evalcli,
+    )
+
+    evalcli.list_eval_set_versions.assert_called_once_with(
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
+    )
+    assert runner.start.call_count == 2
+    runner.wait.assert_any_call("eval-base")
+    runner.wait.assert_any_call("eval-best")
+    evalcli.create_judge_run.assert_called_once()
+    evalcli.wait_for_judge_run.assert_called_once_with("judge-1")
+    evalcli.compare_eval_metrics.assert_called_once_with("eval-best", "eval-base")
+
+
+def test_customer_metric_validation_rejects_significant_system_change():
+    metrics = _passing_customer_metrics()
+    metrics["systemMetrics"]["additional_properties"]["COST"]["metrics"][0]["pValue"] = 0.001
+
+    with pytest.raises(SystemExit, match="COST/avg_cost_usd differs significantly"):
+        _verify_customer_eval_metrics(metrics)
+
+
+def test_customer_metric_validation_requires_correctness_above_80_percent():
+    metrics = _passing_customer_metrics()
+    metrics["judgeMetrics"]["additional_properties"]["CORRECTNESS"][0]["test"] = 0.8
+
+    with pytest.raises(SystemExit, match="correctness 80.00% is not above 80%"):
+        _verify_customer_eval_metrics(metrics)
+
+
+def test_make_customer_evalset_uses_all_customer_deployments():
+    assert _make_evalset(["20260908"], deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS)) == [
+        {
+            "eval_set_name": GLEAN_CHAT_EVAL_SET_NAME,
+            "eval_set_version": "20260908",
+            "deployment_ids": list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
+            "status": "active",
+        }
+    ]
