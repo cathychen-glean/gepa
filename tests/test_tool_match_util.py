@@ -81,7 +81,8 @@ def test_tool_match_queries_and_fetch():
     entry_params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
     assert search_params["eval_ids"] == ["teacher", "student"]
     assert search_params["search_start_date"] == "2026-08-04"
-    assert search_params["search_end_date"] == "2026-08-11"
+    # One day past end_date: _TABLE_SUFFIX is UTC, so tomorrow's shard is scanned too.
+    assert search_params["search_end_date"] == "2026-08-12"
     assert entry_params["student_eval_id"] == "student"
     assert entry_params["teacher_eval_id"] == "teacher"
     assert analysis.per_entry["entry-1"].tools_match is False
