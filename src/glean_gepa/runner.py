@@ -69,8 +69,8 @@ CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
 RUN_LOG_FILENAME = "gepa_run.log"
 EVALSET_SCHEDULE_FILENAME = "glean_evalset_schedule.json"
 # Same values the config falls back to when `data` omits them.
-GLEAN_CHAT_EVAL_SET_NAME = DEFAULT_EVAL_SET_NAME
-SCIO_PROD_DEPLOYMENT_IDS = list(DEFAULT_DEPLOYMENT_IDS)
+GLEAN_CHAT_EVAL_SET_NAME: str = DEFAULT_EVAL_SET_NAME
+SCIO_PROD_DEPLOYMENT_IDS: list[str] = list(DEFAULT_DEPLOYMENT_IDS)
 CUSTOMER_EVAL_DEPLOYMENT_IDS = [
     "bill",
     "guild",
@@ -709,7 +709,7 @@ def _format_run_config(
 def _build_adapter(
     args: argparse.Namespace,
     judging_mode: JudgingMode,
-    adapter_kwargs: dict[str, object],
+    adapter_kwargs: dict[str, Any],
     experiment: ExperimentConfig | None,
 ) -> TeacherStudentAdapter | SingleModelAdapter:
     # load_experiment_config pins each mode to the one pack and primary objective
