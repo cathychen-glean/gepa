@@ -68,7 +68,8 @@ objective:
   #   composite: {completeness: 0.5, tool_alignment: 0.5}
   composite:
     tool_alignment: 1.0
-  # Enable the pairwise judge and uncomment to gate on correctness:
+  # Not enforced: nothing reads validation, and only pointwise signals become
+  # judges, so correctness never runs.
   # validation:
   #   - metric: correctness
   #     min: 0.95

@@ -105,6 +105,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     merged_screening = _overlay(pack.get("screening") or {}, raw.get("screening") or {})
     _require_mode_primary_objective(merged_objective.get("primary"), mode=mode)
     _require_scorable_composite_signals(merged_objective, merged_signals, mode=mode)
+    _require_normalized_composite_weights(merged_objective.get("composite"))
     return ExperimentConfig(
         schema_version=schema_version,
         mode=mode,
@@ -245,6 +246,8 @@ def _require_mode_pack(raw_packs: Any, *, mode: JudgingMode) -> tuple[str, ...]:
 
 
 def _pointwise_judges(signals: list[dict[str, Any]]) -> list[PointwiseJudge]:
+    """Pairwise signals are skipped: nothing scores them per entry. Same for
+    ``objective.validation``, which is carried on the config but never read."""
     judges: list[PointwiseJudge] = []
     for signal in signals:
         if signal.get("source") != "cortex_judge" or signal.get("kind") != "pointwise":
@@ -304,6 +307,33 @@ def _require_scorable_composite_signals(
         )
 
 
+def _require_normalized_composite_weights(composite: Any) -> None:
+    """Reject weights that cannot produce a score inside 0..1.
+
+    High-signal selection treats ``score >= 1.0`` as a pass, so weights summing
+    above 1 would mark failing entries perfect and drop them from the set the
+    next generation reflects on. Rejected rather than normalized: rescaling
+    would silently score a different objective than the one written down.
+    """
+    if not isinstance(composite, Mapping) or not composite:
+        return
+    weights: dict[str, float] = {}
+    for name, raw_weight in composite.items():
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, int | float):
+            raise ExperimentConfigError(f"objective.composite weight for {name} must be a number, got {raw_weight!r}")
+        weights[str(name)] = float(raw_weight)
+    negative = sorted(name for name, weight in weights.items() if weight < 0)
+    if negative:
+        raise ExperimentConfigError(f"objective.composite weights must be non-negative: {', '.join(negative)}")
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-6:
+        detail = ", ".join(f"{name}={weight:g}" for name, weight in sorted(weights.items()))
+        raise ExperimentConfigError(
+            f"objective.composite weights must sum to 1, got {total:g} ({detail}); "
+            "a larger sum can push a failing entry to a passing score"
+        )
+
+
 def _require_mode_primary_objective(primary: Any, *, mode: JudgingMode) -> None:
     required = MODE_PRIMARY_OBJECTIVE[mode]
     if primary is not None and str(primary) != required:
@@ -330,6 +360,14 @@ def _load_yaml(path: Path) -> Any:
 
 
 def _merge_signals(*groups: list[Any]) -> list[dict[str, Any]]:
+    """Merge signals by name, field by field.
+
+    A mode that re-declares a pack signal usually means to adjust one field, so
+    replacing the whole entry would drop the rest -- losing ``source`` leaves a
+    signal nothing can score, which fails the load. Nested values such as
+    ``run_params`` are still replaced whole, matching ``_overlay``: a partial
+    judge payload is more likely a mistake than an intended merge.
+    """
     by_name: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for group in groups:
@@ -339,7 +377,7 @@ def _merge_signals(*groups: list[Any]) -> list[dict[str, Any]]:
             name = str(signal["name"])
             if name not in by_name:
                 order.append(name)
-            by_name[name] = dict(signal)
+            by_name[name] = {**by_name.get(name, {}), **signal}
     return [by_name[name] for name in order]
 
 

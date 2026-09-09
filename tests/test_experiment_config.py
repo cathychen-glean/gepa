@@ -238,6 +238,37 @@ def test_global_token_cap_comes_from_yaml_and_yields_to_the_flag(tmp_path):
     assert runner_arg_defaults(load_experiment_config(_write_mode(tmp_path, body)))["global_token_cap"] == 2048
 
 
+def test_mode_signal_override_keeps_the_packs_other_fields(tmp_path):
+    """Re-declaring a pack signal adjusts one field; it must not drop `source`,
+    which would leave the signal unscorable and fail the load."""
+    body = _mode_yaml(signals="  - name: tool_alignment\n    lookback_days: 30\n")
+
+    config = load_experiment_config(_write_mode(tmp_path, body))
+
+    (tool_alignment,) = [s for s in config.signals if s["name"] == "tool_alignment"]
+    assert tool_alignment["lookback_days"] == 30
+    assert tool_alignment["source"] == "tool_match"
+    assert composite_weights(config) == {"tool_alignment": 1.0}
+
+
+@pytest.mark.parametrize(
+    ("expected", "composite"),
+    [
+        # high-signal selection treats score >= 1.0 as a pass, so an inflated sum
+        # would mark a failing entry perfect and drop it from reflection.
+        ("must sum to 1", "    tool_alignment: 2.0\n"),
+        ("must sum to 1", "    tool_alignment: 0.3\n"),
+        ("must be non-negative", "    tool_alignment: -1.0\n    completeness: 2.0\n"),
+        ("must be a number", "    tool_alignment: high\n"),
+    ],
+)
+def test_composite_weights_must_be_a_normalized_distribution(tmp_path, expected, composite):
+    body = _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite=composite)
+
+    with pytest.raises(ExperimentConfigError, match=expected):
+        load_experiment_config(_write_mode(tmp_path, body))
+
+
 def test_runner_without_config_keeps_cli_defaults():
     args = _parse_args(["--seed_candidate", "seed.json"])
 

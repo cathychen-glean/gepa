@@ -1263,6 +1263,18 @@ class GleanAdapterBase:
                 f"composite_weights name dimensions {type(self).__name__} cannot score: "
                 f"{', '.join(unscorable)}; scorable dimensions are {', '.join(sorted(scorable))}"
             )
+        # Also checked when loading a config, but defaults and direct construction
+        # skip that path, and this is where composite_score turns weights into the
+        # score that high-signal selection compares against 1.0.
+        negative = sorted(name for name, weight in self.composite_weights.items() if weight < 0)
+        if negative:
+            raise ValueError(f"composite_weights must be non-negative: {', '.join(negative)}")
+        total = sum(self.composite_weights.values())
+        if self.composite_weights and abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"composite_weights must sum to 1, got {total:g}; a larger sum can push a "
+                f"failing entry to a passing score"
+            )
 
     def _load_cache(self) -> None:
         """Load analysis and judge-trigger state from the adapter cache."""
