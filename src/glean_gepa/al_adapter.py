@@ -416,6 +416,8 @@ class ALRunner:
         self._eval_run_ids: dict[tuple[str, str, str, str, str], str] = {}
         # Started-but-not-yet-complete runs: eval_run_id -> cache_key
         self._in_flight: dict[str, tuple[str, str, str, str, str]] = {}
+        # Judge runs: (eval_run_id, base_eval_run_id, judge_type) -> judge_run_id
+        self._judge_run_ids: dict[tuple[str, str, str], str] = {}
         # Eval IDs created or verified in this process; disk-loaded IDs are probed.
         self._verified_eval_ids: set[str] = set()
 
@@ -436,6 +438,21 @@ class ALRunner:
         if not isinstance(parsed, list) or len(parsed) != 5:
             return None
         return (str(parsed[0]), str(parsed[1]), str(parsed[2]), str(parsed[3]), str(parsed[4]))
+
+    @staticmethod
+    def _parse_judge_cache_key(raw_key: Any) -> tuple[str, str, str] | None:
+        if isinstance(raw_key, list):
+            parsed = raw_key
+        elif isinstance(raw_key, str):
+            try:
+                parsed = json.loads(raw_key)
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+        if not isinstance(parsed, list) or len(parsed) != 3:
+            return None
+        return (str(parsed[0]), str(parsed[1]), str(parsed[2]))
 
     def _load_cache(self) -> None:
         """Load completed and in-flight eval run IDs from file."""
@@ -470,14 +487,23 @@ class ALRunner:
                     if cache_key is None:
                         continue
                     self._in_flight[str(eval_id)] = cache_key
+                self._judge_run_ids = {}
+                judge_items = data.get("judge_runs")
+                if isinstance(judge_items, dict):
+                    for raw_key, judge_run_id in judge_items.items():
+                        judge_key = self._parse_judge_cache_key(raw_key)
+                        if judge_key is None or not isinstance(judge_run_id, str):
+                            continue
+                        self._judge_run_ids[judge_key] = judge_run_id
                 print(
                     f"Loaded {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
-                    "eval run IDs from cache"
+                    f"eval run IDs and {len(self._judge_run_ids)} judge run IDs from cache"
                 )
         except Exception as e:
             print(f"Failed to load cache from {self.cache_file}: {e}")
             self._eval_run_ids = {}
             self._in_flight = {}
+            self._judge_run_ids = {}
 
     def _save_cache(self) -> None:
         """Save completed and in-flight eval run IDs to file."""
@@ -489,11 +515,12 @@ class ALRunner:
                 data = {
                     "completed": {json.dumps(list(k)): v for k, v in self._eval_run_ids.items()},
                     "in_flight": {eval_id: list(cache_key) for eval_id, cache_key in self._in_flight.items()},
+                    "judge_runs": {json.dumps(list(k)): v for k, v in self._judge_run_ids.items()},
                 }
                 _write_json_atomically(self.cache_file, data)
                 print(
                     f"Saved {len(self._eval_run_ids)} completed and {len(self._in_flight)} in-flight "
-                    "eval run IDs to cache"
+                    f"eval run IDs and {len(self._judge_run_ids)} judge run IDs to cache"
                 )
         except Exception as e:
             print(f"Failed to save cache to {self.cache_file}: {e}")
@@ -505,6 +532,10 @@ class ALRunner:
             stale_keys = [key for key, cached_id in self._eval_run_ids.items() if cached_id == eval_run_id]
             for key in stale_keys:
                 self._eval_run_ids.pop(key, None)
+            # Judges scored against a vanished eval are no longer reusable.
+            stale_judges = [key for key in self._judge_run_ids if eval_run_id in (key[0], key[1])]
+            for key in stale_judges:
+                self._judge_run_ids.pop(key, None)
             self._save_cache()
 
     def _promote_completed(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
@@ -679,6 +710,55 @@ class ALRunner:
         elif eval_run_id in self._in_flight:
             self._promote_completed(self._in_flight[eval_run_id], eval_run_id)
 
+    def ensure_judge_run(
+        self,
+        *,
+        eval_run_id: str,
+        judge_type: str,
+        run_params: str,
+        base_eval_run_id: str | None = None,
+        input_mappings: str | None = None,
+    ) -> str:
+        """Return a judge run for this eval pair, reusing one if it already exists.
+
+        Judge runs are expensive, so this checks the persistent cache first, then Cortex
+        itself, and only creates a new run when neither turns one up.
+        """
+        cache_key = (eval_run_id, base_eval_run_id or "", judge_type.upper())
+        with self._cache_lock:
+            cached = self._judge_run_ids.get(cache_key)
+        if cached:
+            print(f"[{judge_type}] Reusing cached judge run {cached} for eval {eval_run_id}")
+            return cached
+
+        existing = self.evalcli.find_judge_run_id(
+            eval_run_id,
+            judge_type=judge_type,
+            base_eval_run_id=base_eval_run_id,
+        )
+        if existing:
+            print(f"[{judge_type}] Reusing existing judge run {existing} for eval {eval_run_id}")
+            self._remember_judge_run(cache_key, existing)
+            return existing
+
+        judge_run_id = self.evalcli.create_judge_run(
+            eval_run_id=eval_run_id,
+            judge_type=judge_type,
+            run_params=run_params,
+            base_eval_run_id=base_eval_run_id,
+            input_mappings=input_mappings,
+        )
+        print(f"[{judge_type}] Started judge run {judge_run_id} for eval {eval_run_id}")
+        self._remember_judge_run(cache_key, judge_run_id)
+        return judge_run_id
+
+    def _remember_judge_run(self, cache_key: tuple[str, str, str], judge_run_id: str) -> None:
+        with self._cache_lock:
+            if self._judge_run_ids.get(cache_key) == judge_run_id:
+                return
+            self._judge_run_ids[cache_key] = judge_run_id
+            self._save_cache()
+
     def run(
         self,
         model: str,
@@ -750,14 +830,22 @@ class Judge:
             return self._judge_cache[cache_key]
 
         if not skip_trigger:
-            print(f"Triggering judge run for {teacher_eval_id} vs {student_eval_id}...")
-            judge_run_id = self.evalcli.create_judge_run(
-                eval_run_id=student_eval_id,
+            judge_run_id = self.evalcli.find_judge_run_id(
+                student_eval_id,
                 judge_type=CORRECTNESS_JUDGE_TYPE,
-                run_params=CORRECTNESS_RUN_PARAMS,
                 base_eval_run_id=teacher_eval_id,
-                input_mappings=CORRECTNESS_INPUT_MAPPINGS,
             )
+            if judge_run_id:
+                print(f"Reusing judge run {judge_run_id} for {teacher_eval_id} vs {student_eval_id}")
+            else:
+                print(f"Triggering judge run for {teacher_eval_id} vs {student_eval_id}...")
+                judge_run_id = self.evalcli.create_judge_run(
+                    eval_run_id=student_eval_id,
+                    judge_type=CORRECTNESS_JUDGE_TYPE,
+                    run_params=CORRECTNESS_RUN_PARAMS,
+                    base_eval_run_id=teacher_eval_id,
+                    input_mappings=CORRECTNESS_INPUT_MAPPINGS,
+                )
             self.evalcli.wait_for_judge_run(judge_run_id, eval_run_id=student_eval_id)
         else:
             print(

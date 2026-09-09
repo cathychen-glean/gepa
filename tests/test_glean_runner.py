@@ -355,10 +355,10 @@ def _passing_customer_metrics():
 def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
     evalcli = MagicMock()
     evalcli.list_eval_set_versions.return_value = [{"version": "20260820"}, {"version": "20260908"}]
-    evalcli.create_judge_run.return_value = "judge-1"
     evalcli.compare_eval_metrics.return_value = _passing_customer_metrics()
     runner = MagicMock()
     runner.start.side_effect = [("eval-base", True), ("eval-best", True)]
+    runner.ensure_judge_run.return_value = "judge-1"
     baseline = {"WRITING_CODE": "baseline"}
     best = {"WRITING_CODE": "updated"}
 
@@ -377,8 +377,13 @@ def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
     assert runner.start.call_count == 2
     runner.wait.assert_any_call("eval-base")
     runner.wait.assert_any_call("eval-best")
-    evalcli.create_judge_run.assert_called_once()
-    evalcli.wait_for_judge_run.assert_called_once_with("judge-1")
+    # The judge must go through the runner's cache, not straight to create.
+    evalcli.create_judge_run.assert_not_called()
+    runner.ensure_judge_run.assert_called_once()
+    judge_kwargs = runner.ensure_judge_run.call_args.kwargs
+    assert judge_kwargs["eval_run_id"] == "eval-best"
+    assert judge_kwargs["base_eval_run_id"] == "eval-base"
+    evalcli.wait_for_judge_run.assert_called_once_with("judge-1", eval_run_id="eval-best")
     evalcli.compare_eval_metrics.assert_called_once_with("eval-best", "eval-base")
 
 

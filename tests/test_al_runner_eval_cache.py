@@ -131,6 +131,68 @@ def test_repeated_start_keeps_waiting_while_in_flight(tmp_path):
     client.create_eval_run.assert_called_once()
 
 
+def _ensure_correctness_judge(runner: ALRunner) -> str:
+    return runner.ensure_judge_run(
+        eval_run_id="eval-best",
+        judge_type="CORRECTNESS",
+        run_params="{}",
+        base_eval_run_id="eval-base",
+    )
+
+
+def test_ensure_judge_run_creates_then_persists_for_next_process(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = MagicMock()
+    client.find_judge_run_id.return_value = None
+    client.create_judge_run.return_value = "judge-1"
+    runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+
+    assert _ensure_correctness_judge(runner) == "judge-1"
+    client.create_judge_run.assert_called_once()
+    saved = json.loads(cache_file.read_text())
+    assert saved["judge_runs"][json.dumps(["eval-best", "eval-base", "CORRECTNESS"])] == "judge-1"
+
+    # A fresh process must reuse the cached judge instead of restarting it.
+    resumed_client = MagicMock()
+    resumed = ALRunner(evalcli=resumed_client, cache_file=str(cache_file))
+    assert _ensure_correctness_judge(resumed) == "judge-1"
+    resumed_client.create_judge_run.assert_not_called()
+    resumed_client.find_judge_run_id.assert_not_called()
+
+
+def test_ensure_judge_run_adopts_existing_cortex_run_with_empty_cache(tmp_path):
+    """A judge that already ran must be adopted even when the local cache is gone."""
+    cache_file = tmp_path / "eval-runs.json"
+    client = MagicMock()
+    client.find_judge_run_id.return_value = "abe8650e-2c44-4dc5-bdd0-a36485f74483"
+    runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+
+    assert _ensure_correctness_judge(runner) == "abe8650e-2c44-4dc5-bdd0-a36485f74483"
+    client.create_judge_run.assert_not_called()
+    client.find_judge_run_id.assert_called_once_with(
+        "eval-best",
+        judge_type="CORRECTNESS",
+        base_eval_run_id="eval-base",
+    )
+    saved = json.loads(cache_file.read_text())
+    assert saved["judge_runs"][json.dumps(["eval-best", "eval-base", "CORRECTNESS"])] == (
+        "abe8650e-2c44-4dc5-bdd0-a36485f74483"
+    )
+
+
+def test_dropping_stale_eval_discards_its_judge_runs(tmp_path):
+    cache_file = tmp_path / "eval-runs.json"
+    client = MagicMock()
+    client.find_judge_run_id.return_value = None
+    client.create_judge_run.return_value = "judge-1"
+    runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+    _ensure_correctness_judge(runner)
+
+    runner._drop_eval("eval-base")
+
+    assert json.loads(cache_file.read_text())["judge_runs"] == {}
+
+
 def test_v1_eval_run_cache_still_loads(tmp_path):
     cache_file = tmp_path / "eval-runs.json"
     prompt_hash = hashlib.md5(b"prompt").hexdigest()[:16]
