@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77.0.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glean-gepa-core"
+version = "0.1.0"
+description = "GEPA engine subset used by Cortex prompt optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+checkpoint = ["cloudpickle>=3.0.0"]
+wandb = ["wandb"]
+mlflow = ["mlflow"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["gepa", "gepa.core", "gepa.logging", "gepa.proposer", "gepa.strategies", "gepa.utils"]
+include-package-data = false
+
+[tool.uv]
+managed = false
