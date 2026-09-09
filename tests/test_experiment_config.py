@@ -7,13 +7,13 @@ import pytest
 from glean_gepa.adapter_types import PointwiseJudge
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.experiment_config import (
+    ExperimentConfig,
     ExperimentConfigError,
     composite_weights,
     load_experiment_config,
     pointwise_judges,
     resolve_config_path,
     runner_arg_defaults,
-    screening_threshold,
 )
 from glean_gepa.runner import _parse_args
 from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
@@ -24,10 +24,10 @@ _POINTWISE_COMPLETENESS = (
 _PAIRWISE_CORRECTNESS = "  - name: correctness\n    source: cortex_judge\n    type: CORRECTNESS\n    kind: pairwise\n"
 
 
-def _write_mode(tmp_path, body: str) -> Path:
+def _load_mode(tmp_path, body: str) -> ExperimentConfig:
     mode = tmp_path / "mode.yaml"
     mode.write_text(body)
-    return mode
+    return load_experiment_config(mode)
 
 
 def _mode_yaml(*, mode: str = "teacher_student", packs: str = "[tools]", signals: str = "", composite: str = "") -> str:
@@ -36,6 +36,21 @@ def _mode_yaml(*, mode: str = "teacher_student", packs: str = "[tools]", signals
         body += f"signals:\n{signals}"
     if composite:
         body += f"objective:\n  composite:\n{composite}"
+    return body
+
+
+def _packaged_teacher_student(*, enable_completeness: bool = False) -> str:
+    """The shipped teacher-student config with completeness weighted into the composite.
+
+    Weighting alone is half the re-enable path; `enable_completeness` supplies the
+    other half by clearing the judge's `enabled: false`.
+    """
+    body = resolve_config_path("teacher_student").read_text()
+    body = body.replace(
+        "  composite:\n    tool_alignment: 1.0", "  composite:\n    completeness: 0.5\n    tool_alignment: 0.5"
+    )
+    if enable_completeness:
+        body = body.replace("    enabled: false\n    run_params:\n      llm_model", "    run_params:\n      llm_model")
     return body
 
 
@@ -59,18 +74,7 @@ def test_load_packaged_teacher_student_merges_tools_pack():
 
 def test_completeness_can_be_switched_back_on(tmp_path):
     """The documented re-enable path: flip `enabled` and add the composite weight."""
-    packaged = resolve_config_path("teacher_student").read_text()
-    reenabled = packaged.replace(
-        "    enabled: false\n    run_params:\n      llm_model", "    run_params:\n      llm_model"
-    )
-    config = load_experiment_config(
-        _write_mode(
-            tmp_path,
-            reenabled.replace(
-                "  composite:\n    tool_alignment: 1.0", "  composite:\n    completeness: 0.5\n    tool_alignment: 0.5"
-            ),
-        )
-    )
+    config = _load_mode(tmp_path, _packaged_teacher_student(enable_completeness=True))
 
     # The signal name is what objective.composite weights, so it has to travel
     # with the judge type the adapter uses to start the Cortex run.
@@ -82,16 +86,8 @@ def test_completeness_can_be_switched_back_on(tmp_path):
 
 def test_weighting_completeness_without_enabling_it_raises(tmp_path):
     """Half of the re-enable path is a load error rather than a silent zero."""
-    packaged = resolve_config_path("teacher_student").read_text()
-    config = _write_mode(
-        tmp_path,
-        packaged.replace(
-            "  composite:\n    tool_alignment: 1.0", "  composite:\n    completeness: 0.5\n    tool_alignment: 0.5"
-        ),
-    )
-
     with pytest.raises(ExperimentConfigError, match=r"completeness \(declared but not scorable\)"):
-        load_experiment_config(config)
+        _load_mode(tmp_path, _packaged_teacher_student())
 
 
 def test_load_packaged_single_model_merges_shell_pack():
@@ -128,7 +124,7 @@ def test_resolve_config_path_accepts_packaged_stem_and_file(tmp_path):
 )
 def test_pack_not_scorable_by_mode_raises(tmp_path, mode, packs):
     with pytest.raises(ExperimentConfigError, match="supports only packs"):
-        load_experiment_config(_write_mode(tmp_path, _mode_yaml(mode=mode, packs=packs)))
+        _load_mode(tmp_path, _mode_yaml(mode=mode, packs=packs))
 
 
 @pytest.mark.parametrize(
@@ -139,7 +135,7 @@ def test_pack_not_scorable_by_mode_raises(tmp_path, mode, packs):
     ],
 )
 def test_omitted_packs_defaults_to_the_modes_pack(tmp_path, mode, pack, primary):
-    config = load_experiment_config(_write_mode(tmp_path, f"schema_version: 1\nmode: {mode}\n"))
+    config = _load_mode(tmp_path, f"schema_version: 1\nmode: {mode}\n")
 
     assert config.packs == (pack,)
     assert config.primary_objective == primary
@@ -149,58 +145,66 @@ def test_primary_objective_override_must_match_mode(tmp_path):
     body = _mode_yaml() + f"objective:\n  primary: {SHELL_SUCCESS_OBJECTIVE}\n"
 
     with pytest.raises(ExperimentConfigError, match="can only score objective.primary=tool_alignment"):
-        load_experiment_config(_write_mode(tmp_path, body))
+        _load_mode(tmp_path, body)
 
 
 def test_mode_composite_replaces_the_packs_composite_wholesale(tmp_path):
     body = _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite="    completeness: 1.0\n")
 
-    config = load_experiment_config(_write_mode(tmp_path, body))
+    config = _load_mode(tmp_path, body)
 
     # The tools pack declares composite {tool_alignment: 1.0}. Merging would leave
     # that weight in place and push the total to 2.0.
     assert composite_weights(config) == {"completeness": 1.0}
 
 
-_UNSCORABLE = "declared but not scorable"
-# Every way a composite weight can fail to resolve, keyed by why.
-_UNSCORABLE_COMPOSITES = {
+_UNSCORABLE = r"\(declared but not scorable\)"
+_UNDECLARED = r"\(undeclared\)"
+# Every way a composite can fail to load, keyed by cause. The loader checks that
+# each weighted name is scorable before it checks the weights distribute, so the
+# first group never reaches the arithmetic.
+_INVALID_COMPOSITES = {
     # Paired with a valid weight, so one bad name fails the whole load.
     "undeclared_name": (
-        "typoed_signal",
-        "undeclared",
+        rf"typoed_signal {_UNDECLARED}",
         _mode_yaml(composite="    tool_alignment: 0.5\n    typoed_signal: 0.5\n"),
     ),
     "other_modes_signal": (
-        SHELL_SUCCESS_OBJECTIVE,
-        "undeclared",
+        rf"{SHELL_SUCCESS_OBJECTIVE} {_UNDECLARED}",
         _mode_yaml(composite=f"    {SHELL_SUCCESS_OBJECTIVE}: 0.5\n"),
     ),
     "pairwise_judge_has_no_per_entry_score": (
-        "correctness",
-        _UNSCORABLE,
+        rf"correctness {_UNSCORABLE}",
         _mode_yaml(signals=_PAIRWISE_CORRECTNESS, composite="    correctness: 0.5\n"),
     ),
     "disabled_judge": (
-        "completeness",
-        _UNSCORABLE,
+        rf"completeness {_UNSCORABLE}",
         _mode_yaml(signals=f"{_POINTWISE_COMPLETENESS}    enabled: false\n", composite="    completeness: 0.5\n"),
     ),
     "single_model_has_no_judge_plumbing": (
-        "completeness",
-        _UNSCORABLE,
+        rf"completeness {_UNSCORABLE}",
         _mode_yaml(
             mode="single_model", packs="[shell]", signals=_POINTWISE_COMPLETENESS, composite="    completeness: 0.5\n"
         ),
     ),
+    # High-signal selection treats score >= 1.0 as a pass, so an inflated sum
+    # would mark a failing entry perfect and drop it from reflection.
+    "weights_above_one": ("must sum to 1", _mode_yaml(composite="    tool_alignment: 2.0\n")),
+    "weights_below_one": ("must sum to 1", _mode_yaml(composite="    tool_alignment: 0.3\n")),
+    "negative_weight": (
+        "must be non-negative",
+        _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite="    tool_alignment: -1.0\n    completeness: 2.0\n"),
+    ),
+    "non_numeric_weight": ("must be a number", _mode_yaml(composite="    tool_alignment: high\n")),
 }
 
 
-@pytest.mark.parametrize(("signal", "reason", "body"), _UNSCORABLE_COMPOSITES.values(), ids=_UNSCORABLE_COMPOSITES)
-def test_composite_weight_nothing_can_score_raises(tmp_path, signal, reason, body):
-    """A weight that resolves to nothing must fail the load, never score a silent zero."""
-    with pytest.raises(ExperimentConfigError, match=rf"{signal} \({reason}\)"):
-        load_experiment_config(_write_mode(tmp_path, body))
+@pytest.mark.parametrize(("match", "body"), _INVALID_COMPOSITES.values(), ids=_INVALID_COMPOSITES)
+def test_invalid_composite_fails_the_load(tmp_path, match, body):
+    """A composite that names nothing scorable, or does not distribute over 0..1,
+    must fail the load rather than score a silent zero or an inflated pass."""
+    with pytest.raises(ExperimentConfigError, match=match):
+        _load_mode(tmp_path, body)
 
 
 def test_judging_mode_flag_conflicting_with_config_raises():
@@ -235,7 +239,7 @@ def test_global_token_cap_comes_from_yaml_and_yields_to_the_flag(tmp_path):
     assert overridden.global_token_cap == 8192
 
     body = _mode_yaml() + "search:\n  global_token_cap: 2048\n"
-    assert runner_arg_defaults(load_experiment_config(_write_mode(tmp_path, body)))["global_token_cap"] == 2048
+    assert runner_arg_defaults(_load_mode(tmp_path, body))["global_token_cap"] == 2048
 
 
 def test_mode_signal_override_keeps_the_packs_other_fields(tmp_path):
@@ -243,30 +247,12 @@ def test_mode_signal_override_keeps_the_packs_other_fields(tmp_path):
     which would leave the signal unscorable and fail the load."""
     body = _mode_yaml(signals="  - name: tool_alignment\n    lookback_days: 30\n")
 
-    config = load_experiment_config(_write_mode(tmp_path, body))
+    config = _load_mode(tmp_path, body)
 
     (tool_alignment,) = [s for s in config.signals if s["name"] == "tool_alignment"]
     assert tool_alignment["lookback_days"] == 30
     assert tool_alignment["source"] == "tool_match"
     assert composite_weights(config) == {"tool_alignment": 1.0}
-
-
-@pytest.mark.parametrize(
-    ("expected", "composite"),
-    [
-        # high-signal selection treats score >= 1.0 as a pass, so an inflated sum
-        # would mark a failing entry perfect and drop it from reflection.
-        ("must sum to 1", "    tool_alignment: 2.0\n"),
-        ("must sum to 1", "    tool_alignment: 0.3\n"),
-        ("must be non-negative", "    tool_alignment: -1.0\n    completeness: 2.0\n"),
-        ("must be a number", "    tool_alignment: high\n"),
-    ],
-)
-def test_composite_weights_must_be_a_normalized_distribution(tmp_path, expected, composite):
-    body = _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite=composite)
-
-    with pytest.raises(ExperimentConfigError, match=expected):
-        load_experiment_config(_write_mode(tmp_path, body))
 
 
 def test_runner_without_config_keeps_cli_defaults():
