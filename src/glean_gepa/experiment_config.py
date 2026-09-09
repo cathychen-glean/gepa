@@ -92,7 +92,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     raw = _load_yaml(source_path)
     if not isinstance(raw, dict):
         raise ExperimentConfigError(f"{source_path} must be a mapping")
-    schema_version = int(raw.get("schema_version") or 1)
+    schema_version = _require_int(raw.get("schema_version"), field="schema_version", default=1)
     if schema_version != 1:
         raise ExperimentConfigError(f"unsupported schema_version {schema_version}")
     mode = raw.get("mode")
@@ -106,6 +106,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     _require_mode_primary_objective(merged_objective.get("primary"), mode=mode)
     _require_scorable_composite_signals(merged_objective, merged_signals, mode=mode)
     _require_normalized_composite_weights(merged_objective.get("composite"))
+    _require_unit_valued_weighted_constants(merged_objective, merged_signals)
     return ExperimentConfig(
         schema_version=schema_version,
         mode=mode,
@@ -225,6 +226,16 @@ def judge_run_params_json(signal: Mapping[str, Any]) -> str:
     return json.dumps(mapped)
 
 
+def _require_int(raw: Any, *, field: str, default: int) -> int:
+    """Coerce to int as ExperimentConfigError. Only None defaults, so 0 stays 0."""
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ExperimentConfigError(f"{field} must be an integer, got {raw!r}") from exc
+
+
 def _require_mode_pack(raw_packs: Any, *, mode: JudgingMode) -> tuple[str, ...]:
     """Pin the mode to its one scorable pack, defaulting when ``packs`` is omitted."""
     required = MODE_PACK[mode]
@@ -252,11 +263,12 @@ def _pointwise_judges(signals: list[dict[str, Any]]) -> list[PointwiseJudge]:
     for signal in signals:
         if signal.get("source") != "cortex_judge" or signal.get("kind") != "pointwise":
             continue
-        if signal.get("enabled", True) is False:
-            continue
+        # Before the enabled check, so flipping enabled on cannot surface a new error.
         judge_type = signal.get("type")
         if not judge_type:
-            raise ExperimentConfigError("pointwise cortex_judge signals require type")
+            raise ExperimentConfigError(f"pointwise cortex_judge signal {signal.get('name')!r} requires type")
+        if signal.get("enabled", True) is False:
+            continue
         judges.append(PointwiseJudge(str(signal["name"]), str(judge_type), judge_run_params_json(signal)))
     return judges
 
@@ -315,8 +327,13 @@ def _require_normalized_composite_weights(composite: Any) -> None:
     next generation reflects on. Rejected rather than normalized: rescaling
     would silently score a different objective than the one written down.
     """
-    if not isinstance(composite, Mapping) or not composite:
+    if composite is None:
         return
+    if not isinstance(composite, Mapping):
+        return
+    # Omitting it falls back to the adapter default; writing it empty scores 0.0.
+    if not composite:
+        raise ExperimentConfigError("objective.composite must weight at least one signal; omit it to use the default")
     weights: dict[str, float] = {}
     for name, raw_weight in composite.items():
         if isinstance(raw_weight, bool) or not isinstance(raw_weight, int | float):
@@ -331,6 +348,30 @@ def _require_normalized_composite_weights(composite: Any) -> None:
         raise ExperimentConfigError(
             f"objective.composite weights must sum to 1, got {total:g} ({detail}); "
             "a larger sum can push a failing entry to a passing score"
+        )
+
+
+def _require_unit_valued_weighted_constants(objective: Mapping[str, Any], signals: list[dict[str, Any]]) -> None:
+    """Reject a weighted constant below 1.0.
+
+    A constant adds the same amount to every candidate, so a value under 1 caps the
+    composite below the ``score >= 1.0`` pass gate and nothing is ever selected.
+    """
+    composite = objective.get("composite")
+    if not isinstance(composite, Mapping):
+        return
+    values = {
+        str(signal["name"]): float(signal.get("value", 0.0))
+        for signal in signals
+        if signal.get("source") == "constant" and signal.get("name")
+    }
+    offenders = sorted(
+        f"{name}={values[name]:g}" for name in composite if name in values and abs(values[name] - 1.0) > 1e-6
+    )
+    if offenders:
+        raise ExperimentConfigError(
+            f"weighted constant signals must have value 1.0: {', '.join(offenders)}; "
+            "a lower value caps every composite score below the 1.0 high-signal pass gate"
         )
 
 

@@ -17,6 +17,9 @@ from glean_gepa.experiment_config import (
 )
 from glean_gepa.runner import _parse_args
 from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.single_model_adapter import DEFAULT_COMPOSITE_WEIGHTS as SINGLE_MODEL_DEFAULT_WEIGHTS
+from glean_gepa.teacher_student_adapter import DEFAULT_COMPOSITE_WEIGHTS as TEACHER_STUDENT_DEFAULT_WEIGHTS
+from glean_gepa.teacher_student_adapter import POINTWISE_JUDGES as TEACHER_STUDENT_POINTWISE_JUDGES
 
 _POINTWISE_COMPLETENESS = (
     "  - name: completeness\n    source: cortex_judge\n    type: COMPLETENESS\n    kind: pointwise\n"
@@ -70,6 +73,22 @@ def test_load_packaged_teacher_student_merges_tools_pack():
     # The mode overrides only the threshold; kind and high_signal come from the pack.
     assert config.screening["kind"] == "high_signal_fix_rate"
     assert config.screening["high_signal"] == "first_tool_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("config_name", "default_weights", "default_judges"),
+    [
+        ("teacher_student", TEACHER_STUDENT_DEFAULT_WEIGHTS, TEACHER_STUDENT_POINTWISE_JUDGES),
+        ("single_model", SINGLE_MODEL_DEFAULT_WEIGHTS, ()),
+    ],
+)
+def test_adapter_defaults_match_the_packaged_config(config_name, default_weights, default_judges):
+    """Where these drift, the same run scores a different objective depending on
+    whether it was launched by direct construction or by --config."""
+    config = load_experiment_config(config_name)
+
+    assert composite_weights(config) == default_weights
+    assert pointwise_judges(config) == default_judges
 
 
 def test_completeness_can_be_switched_back_on(tmp_path):
@@ -196,6 +215,23 @@ _INVALID_COMPOSITES = {
         _mode_yaml(signals=_POINTWISE_COMPLETENESS, composite="    tool_alignment: -1.0\n    completeness: 2.0\n"),
     ),
     "non_numeric_weight": ("must be a number", _mode_yaml(composite="    tool_alignment: high\n")),
+    "empty_composite": (
+        "must weight at least one signal",
+        "schema_version: 1\nmode: teacher_student\nobjective:\n  composite: {}\n",
+    ),
+    "constant_below_one": (
+        "must have value 1.0",
+        _mode_yaml(
+            signals="  - name: freebie\n    source: constant\n    value: 0.0\n",
+            composite="    tool_alignment: 0.5\n    freebie: 0.5\n",
+        ),
+    ),
+    "disabled_judge_without_type": (
+        "requires type",
+        _mode_yaml(
+            signals="  - name: completeness\n    source: cortex_judge\n    kind: pointwise\n    enabled: false\n"
+        ),
+    ),
 }
 
 
@@ -205,6 +241,26 @@ def test_invalid_composite_fails_the_load(tmp_path, match, body):
     must fail the load rather than score a silent zero or an inflated pass."""
     with pytest.raises(ExperimentConfigError, match=match):
         _load_mode(tmp_path, body)
+
+
+def test_config_help_shows_the_configs_defaults(capsys):
+    """--help must run after the config is applied, not on the --config pre-scan."""
+    with pytest.raises(SystemExit):
+        _parse_args(["--config", "teacher_student", "--help"])
+    with_config = capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        _parse_args(["--help"])
+    without_config = capsys.readouterr().out
+
+    # The config sets student_model; the bare parser's own default is gpt.
+    assert "(default: claude_sonnet)" in with_config
+    assert "(default: gpt)" in without_config
+
+
+def test_parsed_args_always_carry_experiment():
+    assert _parse_args(["--seed_candidate", "seed.json"]).experiment is None
+    assert _parse_args(["--config", "teacher_student"]).experiment is not None
 
 
 def test_judging_mode_flag_conflicting_with_config_raises():

@@ -291,16 +291,16 @@ def _latest_dated_eval_version(
 
 
 def _select_recent_train_and_val_versions(
-    version_rows: list[dict[str, object]], *, today: date, lookback_days: int, valset_size: int
+    version_rows: list[dict[str, object]], *, as_of: date, lookback_days: int, valset_size: int
 ) -> tuple[list[str], list[str]]:
     """Reserve the newest one or two versions for validation and schedule older ones for training."""
-    earliest = today - timedelta(days=lookback_days)
+    earliest = as_of - timedelta(days=lookback_days)
     ordered_versions = [
-        version for version_date, version in _dated_eval_versions(version_rows) if earliest <= version_date <= today
+        version for version_date, version in _dated_eval_versions(version_rows) if earliest <= version_date <= as_of
     ]
     if len(ordered_versions) < 2:
         raise SystemExit(
-            f"Need at least two scio-prod eval versions dated {earliest.isoformat()} through {today.isoformat()}; "
+            f"Need at least two scio-prod eval versions dated {earliest.isoformat()} through {as_of.isoformat()}; "
             f"found {len(ordered_versions)}."
         )
     actual_valset_size = min(valset_size, len(ordered_versions) - 1)
@@ -308,7 +308,7 @@ def _select_recent_train_and_val_versions(
 
 
 def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient) -> tuple[list[str], list[str]]:
-    eval_set_name, deployment_ids = evalset_identity(getattr(args, "experiment", None))
+    eval_set_name, deployment_ids = evalset_identity(args.experiment)
     if bool(args.train_eval_versions) != bool(args.val_eval_versions):
         raise SystemExit("Set both --train_eval_versions and --val_eval_versions, or neither for automatic selection.")
     if args.train_eval_versions:
@@ -320,7 +320,7 @@ def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient
         as_of = date.today() - timedelta(days=days_back)
         train_versions, val_versions = _select_recent_train_and_val_versions(
             rows,
-            today=as_of,
+            as_of=as_of,
             lookback_days=args.eval_version_lookback_days,
             valset_size=args.val_eval_version_count,
         )
@@ -523,7 +523,11 @@ def _validate_best_candidate_on_customer_eval(
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optimize Glean prompts with GEPA's low-level engine.")
+    # Renders defaults so `--config X --help` reports what that config supplies.
+    parser = argparse.ArgumentParser(
+        description="Optimize Glean prompts with GEPA's low-level engine.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -657,7 +661,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Show eval-set payloads and shell-tool action/error details.",
     )
-    pre, _unknown = parser.parse_known_args(argv)
+    # Help-less, so `--config X --help` reaches the real parse instead of exiting here.
+    config_scanner = argparse.ArgumentParser(add_help=False)
+    config_scanner.add_argument("--config", default=None)
+    pre, _unknown = config_scanner.parse_known_args(argv)
     experiment = None
     if pre.config:
         try:
@@ -665,8 +672,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         except ExperimentConfigError as exc:
             raise SystemExit(str(exc)) from exc
         parser.set_defaults(**runner_arg_defaults(experiment))
+    parser.set_defaults(experiment=experiment)
     args = parser.parse_args(argv)
-    args.experiment = experiment
     if experiment is not None and args.judging_mode != experiment.mode:
         raise SystemExit(
             f"--judging_mode {args.judging_mode} conflicts with {experiment.source_path} "
@@ -756,7 +763,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         _run_fake_flow(args)
         return
 
-    experiment = getattr(args, "experiment", None)
+    experiment = args.experiment
     if args.seed_candidate is None:
         raise SystemExit("--seed_candidate is required unless --fake_flow or --config with run.seed_candidate is set")
     editable_modules = _parse_editable_modules(args.editable_modules)

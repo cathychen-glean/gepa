@@ -226,8 +226,23 @@ def test_parse_args_rejects_invalid_reflection_sample_count(value):
         _parse_args(["--seed_candidate", "seed.json", "--reflection_samples", value])
 
 
+_FIXED_TODAY = date(2026, 8, 27)
+
+
 def _version(days_ago: int) -> str:
-    return (date.today() - timedelta(days=days_ago)).strftime("%Y%m%d")
+    return (_FIXED_TODAY - timedelta(days=days_ago)).strftime("%Y%m%d")
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    """Pin today so expected versions cannot drift across a midnight boundary."""
+
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return _FIXED_TODAY
+
+    monkeypatch.setattr("glean_gepa.runner.date", _FixedDate)
 
 
 def _auto_selected_split(days_back: int | None) -> tuple[list[str], list[str]]:
@@ -240,7 +255,7 @@ def _auto_selected_split(days_back: int | None) -> tuple[list[str], list[str]]:
     return _resolve_eval_version_split(_parse_args(argv), evalcli)
 
 
-def test_eval_version_days_back_holds_the_auto_selection_window_still():
+def test_eval_version_days_back_holds_the_auto_selection_window_still(frozen_today):
     """Without this the window tracks the calendar, so a new daily version lands in
     the valset and misses the eval-run cache."""
     train_today, val_today = _auto_selected_split(0)
@@ -254,7 +269,7 @@ def test_eval_version_days_back_holds_the_auto_selection_window_still():
     assert _version(0) not in train_shifted and _version(0) not in val_shifted
 
 
-def test_eval_version_days_back_defaults_to_today():
+def test_eval_version_days_back_defaults_to_today(frozen_today):
     assert _auto_selected_split(None) == _auto_selected_split(0)
     assert _parse_args(["--seed_candidate", "seed.json"]).eval_version_days_back == 0
 
@@ -267,7 +282,7 @@ def test_eval_version_days_back_rejects_negative_values():
 def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
     train_versions, val_versions = _select_recent_train_and_val_versions(
         [{"version": "20260813"}, {"version": "20260820"}, {"version": "20260827"}],
-        today=date(2026, 8, 27),
+        as_of=date(2026, 8, 27),
         lookback_days=14,
         valset_size=2,
     )
@@ -279,7 +294,7 @@ def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
 def test_recent_versions_fall_back_to_one_val_version_when_only_two_are_available():
     train_versions, val_versions = _select_recent_train_and_val_versions(
         [{"version": "20260820"}, {"version": "20260827"}],
-        today=date(2026, 8, 27),
+        as_of=date(2026, 8, 27),
         lookback_days=14,
         valset_size=2,
     )

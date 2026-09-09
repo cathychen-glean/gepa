@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any, Callable, Mapping, NotRequired, TypedDict, cast
+from typing import Any, Callable, Iterable, Mapping, NotRequired, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
@@ -1202,6 +1202,7 @@ class GleanAdapterBase:
         editable_modules: list[str],
         composite_weights: dict[str, float],
         constant_scores: dict[str, float],
+        extra_scorable_dimensions: Iterable[str] = (),
         cache_file: str | None = None,
     ):
         self.runner = runner
@@ -1210,6 +1211,7 @@ class GleanAdapterBase:
         self.primary_objective = primary_objective
         self.composite_weights = dict(composite_weights)
         self.constant_scores = dict(constant_scores)
+        self._extra_scorable_dimensions = frozenset(extra_scorable_dimensions)
         self._require_scorable_composite_weights()
         self.default_frontier_type = default_frontier_type
         self.editable_modules = list(editable_modules)
@@ -1244,7 +1246,7 @@ class GleanAdapterBase:
 
     def scorable_dimensions(self) -> set[str]:
         """Composite dimensions this adapter can resolve a per-entry value for."""
-        return {*self.telemetry_dimensions, *self.constant_scores}
+        return {*self.telemetry_dimensions, *self.constant_scores, *self._extra_scorable_dimensions}
 
     def composite_score(self, dimension_values: Mapping[str, float]) -> float:
         """Weight the resolved dimensions by ``objective.composite``.
@@ -1256,6 +1258,8 @@ class GleanAdapterBase:
         return sum(weight * dimension_values[name] for name, weight in self.composite_weights.items())
 
     def _require_scorable_composite_weights(self) -> None:
+        if not self.composite_weights:
+            raise ValueError(f"{type(self).__name__} requires a non-empty composite_weights")
         scorable = self.scorable_dimensions()
         unscorable = sorted(set(self.composite_weights) - scorable)
         if unscorable:
@@ -1270,7 +1274,7 @@ class GleanAdapterBase:
         if negative:
             raise ValueError(f"composite_weights must be non-negative: {', '.join(negative)}")
         total = sum(self.composite_weights.values())
-        if self.composite_weights and abs(total - 1.0) > 1e-6:
+        if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 f"composite_weights must sum to 1, got {total:g}; a larger sum can push a "
                 f"failing entry to a passing score"

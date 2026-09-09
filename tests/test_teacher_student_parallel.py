@@ -10,8 +10,14 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
 from glean_gepa.prompt_constants import RULES_EXT_KEY
-from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
+from glean_gepa.teacher_student_adapter import (
+    COMPLETENESS_DIMENSION,
+    COMPLETENESS_JUDGE,
+    TeacherStudentAdapter,
+    _StartedPair,
+)
 from glean_gepa.tool_match_util import (
+    TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
     NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
@@ -45,13 +51,26 @@ def _evalcli_with_ordered_events(events: list[str]) -> MagicMock:
     return evalcli
 
 
-def _teacher_student_adapter(evalcli: MagicMock, cache_file: str | None = None) -> TeacherStudentAdapter:
+def _teacher_student_adapter(
+    evalcli: MagicMock, cache_file: str | None = None, *, judge_completeness: bool = False
+) -> TeacherStudentAdapter:
+    """Shipped defaults are tool_alignment only; judge-path tests opt into the
+    completeness blend that configs/teacher_student.yaml documents."""
+    judge_kwargs = (
+        {
+            "pointwise_judges": [COMPLETENESS_JUDGE],
+            "composite_weights": {COMPLETENESS_DIMENSION: 0.5, TOOL_ALIGNMENT_OBJECTIVE: 0.5},
+        }
+        if judge_completeness
+        else {}
+    )
     return TeacherStudentAdapter(
         runner=ALRunner(evalcli=evalcli),
         teacher_model="gpt",
         student_model="claude_sonnet",
         thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         cache_file=cache_file,
+        **judge_kwargs,
     )
 
 
@@ -240,7 +259,7 @@ def test_get_or_fetch_tool_match_analysis_caches_fetch():
 
 
 def test_finish_batch_evals_uses_tool_match_and_completeness():
-    adapter = _teacher_student_adapter(MagicMock())
+    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
     analysis = EvalRunToolMatchAnalysis(
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
@@ -301,7 +320,7 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
     ``strict=False``, so entry-level rows would record an arbitrary entry's 0/1
     outcome as the whole eval set's validation score.
     """
-    adapter = _teacher_student_adapter(MagicMock())
+    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
     adapter._tool_match_cache[("teacher-1", "student-1")] = EvalRunToolMatchAnalysis(
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
@@ -327,8 +346,13 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
         high_signal_entry_ids=("entry-2",),
     )
     for eval_id, aggregate in (("student-1", 1.0), ("teacher-1", 0.9)):
+        # Per-entry scores differ from the aggregate, so the eval-set row must pick
+        # the aggregate rather than fall through to it on a missed lookup.
         adapter._judge_cache[(eval_id, COMPLETENESS_JUDGE_TYPE)] = JudgeAnalysis(
-            eval_id=eval_id, aggregate=aggregate, per_entry={}, judge_type=COMPLETENESS_JUDGE_TYPE
+            eval_id=eval_id,
+            aggregate=aggregate,
+            per_entry={"entry-1": 0.2, "entry-2": 0.3},
+            judge_type=COMPLETENESS_JUDGE_TYPE,
         )
     started = [_StartedPair(al_data_inst=EVAL_SET, teacher_eval_id="teacher-1", student_eval_id="student-1")]
 
@@ -418,7 +442,7 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
 
 
 def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
-    adapter = _teacher_student_adapter(MagicMock())
+    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
     adapter._tool_match_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
     result = adapter._finish_batch_evals(
         [
@@ -504,7 +528,7 @@ def test_completeness_judges_run_for_teacher_and_student_after_evals():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
     _stub_completeness_judge(evalcli, events)
-    adapter = _teacher_student_adapter(evalcli)
+    adapter = _teacher_student_adapter(evalcli, judge_completeness=True)
 
     with patch.object(adapter, "_get_or_fetch_tool_match_analysis", return_value=_tool_match_analysis()):
         result = adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
@@ -528,7 +552,7 @@ def test_completeness_judge_for_teacher_is_created_once_across_candidates():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
     _stub_completeness_judge(evalcli, events)
-    adapter = _teacher_student_adapter(evalcli)
+    adapter = _teacher_student_adapter(evalcli, judge_completeness=True)
 
     with patch.object(adapter, "_get_or_fetch_tool_match_analysis", return_value=_tool_match_analysis()):
         adapter.evaluate_many(

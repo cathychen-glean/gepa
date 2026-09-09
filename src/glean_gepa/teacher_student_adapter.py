@@ -54,15 +54,10 @@ from glean_gepa.tool_match_util import (
 
 PRIMARY_OBJECTIVE = TOOL_ALIGNMENT_OBJECTIVE
 COMPLETENESS_DIMENSION = "completeness"
-COMPLETENESS_WEIGHT = 0.5
-TOOL_ALIGNMENT_WEIGHT = 0.5
-POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = (
-    PointwiseJudge(COMPLETENESS_DIMENSION, COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),
-)
-DEFAULT_COMPOSITE_WEIGHTS = {
-    COMPLETENESS_DIMENSION: COMPLETENESS_WEIGHT,
-    TOOL_ALIGNMENT_OBJECTIVE: TOOL_ALIGNMENT_WEIGHT,
-}
+# Declared but shipped disabled in configs/teacher_student.yaml.
+COMPLETENESS_JUDGE = PointwiseJudge(COMPLETENESS_DIMENSION, COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS)
+POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = ()
+DEFAULT_COMPOSITE_WEIGHTS = {TOOL_ALIGNMENT_OBJECTIVE: 1.0}
 DEFAULT_CONSTANT_SCORES: dict[str, float] = {}
 
 
@@ -128,8 +123,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
         constant_scores: dict[str, float] | None = None,
         pointwise_judges: Sequence[PointwiseJudge] | None = None,
     ):
-        # Set before super().__init__ so the base can validate composite weights
-        # against the judge dimensions scorable_dimensions() adds below.
         self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
@@ -152,11 +145,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
             composite_weights=dict(DEFAULT_COMPOSITE_WEIGHTS if composite_weights is None else composite_weights),
             constant_scores=dict(DEFAULT_CONSTANT_SCORES if constant_scores is None else constant_scores),
+            extra_scorable_dimensions={judge.name for judge in self.pointwise_judges},
             cache_file=cache_file,
         )
-
-    def scorable_dimensions(self) -> set[str]:
-        return super().scorable_dimensions() | {judge.name for judge in self.pointwise_judges}
 
     def _get_or_fetch_tool_match_analysis(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunToolMatchAnalysis:
         cache_key = (teacher_eval_id, student_eval_id)
@@ -683,9 +674,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
             # validation score. Entry-level rows are kept for trace-capturing
             # training evals, where reflection needs the individual examples.
             if not is_focused_eval and not capture_traces:
+                # entry_id None marks a run-level row, selecting the judge aggregate
+                # below. Tool lists stay empty so first_tool_mismatch_pair sees no
+                # first tool to compare; the counts are run totals.
                 scored_rows = [
                     (
-                        query,
+                        None,
                         tool_match_analysis.aggregate.tool_match_rate,
                         _rollout_output(
                             entry_id=query,
@@ -724,7 +718,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     **self.constant_scores,
                     TOOL_ALIGNMENT_OBJECTIVE: tool_alignment,
                     **{
-                        name: analysis.per_entry.get(entry_id, analysis.aggregate)
+                        name: analysis.aggregate
+                        if entry_id is None
+                        else analysis.per_entry.get(entry_id, analysis.aggregate)
                         for name, analysis in student_judges.items()
                     },
                 }
