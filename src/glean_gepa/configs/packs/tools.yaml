@@ -1,0 +1,17 @@
+# Pack: teacher/student first-tool alignment from paired traces.
+# Scorable only by teacher_student mode, which requires `packs: [tools]`.
+
+signals:
+  - name: tool_alignment
+    source: tool_match
+    lookback_days: 7
+
+objective:
+  primary: tool_alignment
+  composite:
+    tool_alignment: 1.0
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: first_tool_mismatch

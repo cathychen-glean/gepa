@@ -1210,6 +1210,7 @@ full = [
 glean = [
     { name = "google-cloud-bigquery" },
     { name = "openai" },
+    { name = "pyyaml" },
     { name = "tiktoken", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "tiktoken", version = "0.12.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
     { name = "truststore" },
@@ -1286,6 +1287,7 @@ requires-dist = [
     { name = "pyright", marker = "extra == 'test'" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "python-dotenv", marker = "extra == 'gskill'" },
+    { name = "pyyaml", marker = "extra == 'glean'", specifier = ">=6,<7" },
     { name = "pyyaml", marker = "extra == 'gskill'" },
     { name = "requests", marker = "extra == 'build'", specifier = ">=2.33.0" },
     { name = "requests", marker = "extra == 'full'", specifier = ">=2.31.0" },

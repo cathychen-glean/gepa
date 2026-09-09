@@ -17,6 +17,7 @@ from glean_gepa.shell_tool_error_util import (
     wildcard_shard_filter,
 )
 
+TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
 REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT = 20
 SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool"})
 _EXECUTE_ACTION_FILTER = (

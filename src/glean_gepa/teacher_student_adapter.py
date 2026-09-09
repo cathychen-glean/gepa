@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -11,6 +12,7 @@ from glean_gepa.adapter_types import (
     ALDataInst,
     ALRolloutOutput,
     ALTrajectory,
+    PointwiseJudge,
     TeacherStudentALDataInst,
     TeacherStudentALRolloutOutput,
     TeacherStudentALTrajectory,
@@ -40,6 +42,7 @@ from glean_gepa.run_log import (
     selected_entry_ids_from_examples,
 )
 from glean_gepa.tool_match_util import (
+    TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
@@ -49,12 +52,45 @@ from glean_gepa.tool_match_util import (
     select_first_tool_mismatch_groups,
 )
 
-PRIMARY_OBJECTIVE = "tool_alignment"
-FIXED_GROUNDING = 1.0
-COMPLETENESS_WEIGHT = 0.5
-TOOL_ALIGNMENT_WEIGHT = 0.3
-GROUNDING_WEIGHT = 0.2
-POINTWISE_JUDGES: tuple[tuple[str, str], ...] = ((COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),)
+PRIMARY_OBJECTIVE = TOOL_ALIGNMENT_OBJECTIVE
+COMPLETENESS_DIMENSION = "completeness"
+# Declared but shipped disabled in configs/teacher_student.yaml.
+COMPLETENESS_JUDGE = PointwiseJudge(COMPLETENESS_DIMENSION, COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS)
+POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = ()
+DEFAULT_COMPOSITE_WEIGHTS = {TOOL_ALIGNMENT_OBJECTIVE: 1.0}
+DEFAULT_CONSTANT_SCORES: dict[str, float] = {}
+
+
+def _rollout_output(
+    *,
+    entry_id: str,
+    deployment_id: str,
+    query: str,
+    student_tools: list[str],
+    teacher_tools: list[str],
+    student_tool_calls: int | None = None,
+    teacher_tool_calls: int | None = None,
+) -> TeacherStudentALRolloutOutput:
+    """One rollout row. Tool-call counts default to the listed events."""
+    return {
+        "deployment_id": deployment_id,
+        "query": query,
+        "student_answer": "",
+        "student_tool_events": student_tools,
+        "student_loops": 0,
+        "student_tool_calls": len(student_tools) if student_tool_calls is None else student_tool_calls,
+        "student_tool_errors": 0,
+        "student_input_tokens": 0,
+        "student_output_tokens": 0,
+        "student_latency_ms": None,
+        "teacher_answer": "",
+        "teacher_tool_events": teacher_tools,
+        "teacher_loops": 0,
+        "teacher_tool_calls": len(teacher_tools) if teacher_tool_calls is None else teacher_tool_calls,
+        "teacher_input_tokens": 0,
+        "teacher_output_tokens": 0,
+        "entry_id": entry_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -68,6 +104,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
     """Optimize instructions from teacher-vs-student tool-usage comparisons."""
 
     supports_high_signal_eval = True
+    telemetry_dimensions = (TOOL_ALIGNMENT_OBJECTIVE,)
 
     def __init__(
         self,
@@ -80,7 +117,13 @@ class TeacherStudentAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
+        primary_objective: str = PRIMARY_OBJECTIVE,
+        default_frontier_type: str = "hybrid",
+        composite_weights: dict[str, float] | None = None,
+        constant_scores: dict[str, float] | None = None,
+        pointwise_judges: Sequence[PointwiseJudge] | None = None,
     ):
+        self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
@@ -97,9 +140,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
             reflection_prompt_fn=teacher_student_reflection_prompt,
             reflective_metrics_fn=self._format_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES (teacher vs student tool match)",
-            primary_objective=PRIMARY_OBJECTIVE,
-            default_frontier_type="hybrid",
+            primary_objective=primary_objective,
+            default_frontier_type=default_frontier_type,
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
+            composite_weights=dict(DEFAULT_COMPOSITE_WEIGHTS if composite_weights is None else composite_weights),
+            constant_scores=dict(DEFAULT_CONSTANT_SCORES if constant_scores is None else constant_scores),
+            extra_scorable_dimensions={judge.name for judge in self.pointwise_judges},
             cache_file=cache_file,
         )
 
@@ -252,8 +298,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
         for eval_id, (_cache_key, role) in pending_waits.items():
             self.runner.wait(eval_id)
             print(f"Recorded completed {role} eval_id: {eval_id}")
-            for judge_type, run_params in POINTWISE_JUDGES:
-                self._ensure_judge(eval_id, judge_type=judge_type, run_params=run_params)
+            for judge in self.pointwise_judges:
+                self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
 
     def _extra_cache_payload(self) -> dict[str, Any]:
         judge_runs: dict[str, dict[str, str]] = {}
@@ -336,15 +382,15 @@ class TeacherStudentAdapter(GleanAdapterBase):
         seen: set[tuple[str, str]] = set()
         for pair in started:
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
-                for judge_type, run_params in POINTWISE_JUDGES:
-                    cache_key = (eval_id, judge_type)
+                for judge in self.pointwise_judges:
+                    cache_key = (eval_id, judge.judge_type)
                     if cache_key in seen:
                         continue
                     seen.add(cache_key)
                     if cache_key in self._judge_cache:
                         continue
-                    judge_run_id = self._ensure_judge(eval_id, judge_type=judge_type, run_params=run_params)
-                    pending.append((eval_id, judge_type, judge_run_id))
+                    judge_run_id = self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
+                    pending.append((eval_id, judge.judge_type, judge_run_id))
         for eval_id, judge_type, judge_run_id in pending:
             analysis = wait_for_judge_metrics(
                 self.runner.evalcli,
@@ -609,49 +655,77 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 log_tool_match_analysis(tool_match_analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
             query = f"{al_data_inst.get('eval_set_name', '')}:{al_data_inst.get('eval_set_version', '')}"
-            student_completeness = self._judge_for(pair.student_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE)
-            teacher_completeness = self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE)
-            print(
-                f"[{COMPLETENESS_JUDGE_TYPE}] student {pair.student_eval_id}={student_completeness.aggregate:.2f} "
-                f"teacher {pair.teacher_eval_id}={teacher_completeness.aggregate:.2f}"
-            )
-
-            for entry_id, tool_match in tool_match_analysis.per_entry.items():
-                student_tools = list(tool_match.student_tools)
-                teacher_tools = list(tool_match.teacher_tools)
-                tool_alignment = float(tool_match.tools_match)
-                completeness = student_completeness.per_entry.get(entry_id, student_completeness.aggregate)
-                output: TeacherStudentALRolloutOutput = {
-                    "deployment_id": deployment_id,
-                    "query": query,
-                    "student_answer": "",
-                    "student_tool_events": student_tools,
-                    "student_loops": 0,
-                    "student_tool_calls": len(student_tools),
-                    "student_tool_errors": 0,
-                    "student_input_tokens": 0,
-                    "student_output_tokens": 0,
-                    "student_latency_ms": None,
-                    "teacher_answer": "",
-                    "teacher_tool_events": teacher_tools,
-                    "teacher_loops": 0,
-                    "teacher_tool_calls": len(teacher_tools),
-                    "teacher_input_tokens": 0,
-                    "teacher_output_tokens": 0,
-                    "entry_id": entry_id,
-                }
-                all_outputs.append(output)
-                score = (
-                    COMPLETENESS_WEIGHT * completeness
-                    + TOOL_ALIGNMENT_WEIGHT * tool_alignment
-                    + GROUNDING_WEIGHT * FIXED_GROUNDING
+            student_judges = {
+                judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
+                for judge in self.pointwise_judges
+            }
+            for judge in self.pointwise_judges:
+                teacher_analysis = self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type)
+                print(
+                    f"[{judge.judge_type}] student {pair.student_eval_id}="
+                    f"{student_judges[judge.name].aggregate:.2f} "
+                    f"teacher {pair.teacher_eval_id}={teacher_analysis.aggregate:.2f}"
                 )
-                all_scores.append(score)
+
+            # A full-validation eval-set item stands for the whole eval run, not for
+            # each of its entries. The engine has one val ID per configured eval set
+            # and zips it against these rows with strict=False, so entry-level rows
+            # let one arbitrary entry's 0/1 outcome be recorded as the eval set's
+            # validation score. Entry-level rows are kept for trace-capturing
+            # training evals, where reflection needs the individual examples.
+            if not is_focused_eval and not capture_traces:
+                # entry_id None marks a run-level row, selecting the judge aggregate
+                # below. Tool lists stay empty so first_tool_mismatch_pair sees no
+                # first tool to compare; the counts are run totals.
+                scored_rows = [
+                    (
+                        None,
+                        tool_match_analysis.aggregate.tool_match_rate,
+                        _rollout_output(
+                            entry_id=query,
+                            deployment_id=deployment_id,
+                            query=query,
+                            student_tools=[],
+                            teacher_tools=[],
+                            student_tool_calls=sum(
+                                len(m.student_tools) for m in tool_match_analysis.per_entry.values()
+                            ),
+                            teacher_tool_calls=sum(
+                                len(m.teacher_tools) for m in tool_match_analysis.per_entry.values()
+                            ),
+                        ),
+                    )
+                ]
+            else:
+                scored_rows = [
+                    (
+                        entry_id,
+                        float(tool_match.tools_match),
+                        _rollout_output(
+                            entry_id=entry_id,
+                            deployment_id=deployment_id,
+                            query=query,
+                            student_tools=list(tool_match.student_tools),
+                            teacher_tools=list(tool_match.teacher_tools),
+                        ),
+                    )
+                    for entry_id, tool_match in tool_match_analysis.per_entry.items()
+                ]
+
+            for entry_id, tool_alignment, output in scored_rows:
+                all_outputs.append(output)
                 objective_score = {
-                    "completeness": completeness,
-                    "tool_alignment": tool_alignment,
-                    "grounding": FIXED_GROUNDING,
+                    **self.constant_scores,
+                    TOOL_ALIGNMENT_OBJECTIVE: tool_alignment,
+                    **{
+                        name: analysis.aggregate
+                        if entry_id is None
+                        else analysis.per_entry.get(entry_id, analysis.aggregate)
+                        for name, analysis in student_judges.items()
+                    },
                 }
+                score = self.composite_score(objective_score)
+                all_scores.append(score)
                 all_objective_scores.append(objective_score)
                 if capture_traces and all_trajectories is not None:
                     trajectory: TeacherStudentALTrajectory = {
@@ -673,13 +747,15 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 summary[dim] = sum(values) / len(values) if values else 0.0
         if focused_alignment_rates:
             if summary is None:
-                summary = {"completeness": 0.0, "grounding": FIXED_GROUNDING}
-            summary["tool_alignment"] = sum(focused_alignment_rates) / len(focused_alignment_rates)
+                summary = {judge.name: 0.0 for judge in self.pointwise_judges}
+                summary.update(self.constant_scores)
+            summary[TOOL_ALIGNMENT_OBJECTIVE] = sum(focused_alignment_rates) / len(focused_alignment_rates)
         if summary is not None and started:
-            teacher_scores = [
-                self._judge_for(pair.teacher_eval_id, judge_type=COMPLETENESS_JUDGE_TYPE).aggregate for pair in started
-            ]
-            summary["teacher_completeness"] = sum(teacher_scores) / len(teacher_scores)
+            for judge in self.pointwise_judges:
+                teacher_scores = [
+                    self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type).aggregate for pair in started
+                ]
+                summary[f"teacher_{judge.name}"] = sum(teacher_scores) / len(teacher_scores)
 
         return GleanEvaluationBatch(
             outputs=all_outputs,

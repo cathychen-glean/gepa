@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any, Callable, NotRequired, TypedDict, cast
+from typing import Any, Callable, Iterable, Mapping, NotRequired, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
@@ -378,7 +378,6 @@ ReflectiveMetricsFn = Callable[[ReflectiveExampleMetrics], str | None]
 class JudgeResult:
     correctness: float  # 0..1
     tool_alignment: float
-    grounding: float
     rationale: str
     traces: dict[str, list[TraceInfo]] | None = None  # Maps entry_id -> list of trace_info dicts
 
@@ -920,13 +919,10 @@ class Judge:
         correctness = sum(correctness_score_list) / len(correctness_score_list) if correctness_score_list else 0.0
         tool_alignment = get_tool_alignment(trace_map, student_eval_id, teacher_eval_id)
 
-        # Use correctness as proxy for other metrics
-        grounding = correctness
         rationale = f"Correctness: {correctness:.2f} (avg of {len(correctness_score_list)} entries)"
 
         return JudgeResult(
             correctness=correctness,
-            grounding=grounding,
             tool_alignment=tool_alignment,
             rationale=rationale,
             traces=dict(trace_map),
@@ -1185,6 +1181,10 @@ class Thresholds:
 class GleanAdapterBase:
     supports_high_signal_eval = False
 
+    #: Dimensions the subclass resolves from evaluation telemetry, as opposed to the
+    #: constants and judge scores the base already knows about.
+    telemetry_dimensions: tuple[str, ...] = ()
+
     def __init__(
         self,
         runner: ALRunner,
@@ -1200,12 +1200,19 @@ class GleanAdapterBase:
         primary_objective: str,
         default_frontier_type: str,
         editable_modules: list[str],
+        composite_weights: dict[str, float],
+        constant_scores: dict[str, float],
+        extra_scorable_dimensions: Iterable[str] = (),
         cache_file: str | None = None,
     ):
         self.runner = runner
         self.thresholds = thresholds
         self.student_model = student_model
         self.primary_objective = primary_objective
+        self.composite_weights = dict(composite_weights)
+        self.constant_scores = dict(constant_scores)
+        self._extra_scorable_dimensions = frozenset(extra_scorable_dimensions)
+        self._require_scorable_composite_weights()
         self.default_frontier_type = default_frontier_type
         self.editable_modules = list(editable_modules)
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
@@ -1236,6 +1243,42 @@ class GleanAdapterBase:
         # Load cache if file exists
         if self.cache_file:
             self._load_cache()
+
+    def scorable_dimensions(self) -> set[str]:
+        """Composite dimensions this adapter can resolve a per-entry value for."""
+        return {*self.telemetry_dimensions, *self.constant_scores, *self._extra_scorable_dimensions}
+
+    def composite_score(self, dimension_values: Mapping[str, float]) -> float:
+        """Weight the resolved dimensions by ``objective.composite``.
+
+        Indexes rather than defaulting to 0.0: a weight that resolves to nothing is a
+        wiring bug, and silently dropping it would report a composite the run never
+        actually applied.
+        """
+        return sum(weight * dimension_values[name] for name, weight in self.composite_weights.items())
+
+    def _require_scorable_composite_weights(self) -> None:
+        if not self.composite_weights:
+            raise ValueError(f"{type(self).__name__} requires a non-empty composite_weights")
+        scorable = self.scorable_dimensions()
+        unscorable = sorted(set(self.composite_weights) - scorable)
+        if unscorable:
+            raise ValueError(
+                f"composite_weights name dimensions {type(self).__name__} cannot score: "
+                f"{', '.join(unscorable)}; scorable dimensions are {', '.join(sorted(scorable))}"
+            )
+        # Also checked when loading a config, but defaults and direct construction
+        # skip that path, and this is where composite_score turns weights into the
+        # score that high-signal selection compares against 1.0.
+        negative = sorted(name for name, weight in self.composite_weights.items() if weight < 0)
+        if negative:
+            raise ValueError(f"composite_weights must be non-negative: {', '.join(negative)}")
+        total = sum(self.composite_weights.values())
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"composite_weights must sum to 1, got {total:g}; a larger sum can push a "
+                f"failing entry to a passing score"
+            )
 
     def _load_cache(self) -> None:
         """Load analysis and judge-trigger state from the adapter cache."""

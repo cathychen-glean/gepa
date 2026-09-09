@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -27,6 +27,7 @@ from glean_gepa.runner import (
     _make_evalset,
     _parse_args,
     _parse_editable_modules,
+    _resolve_eval_version_split,
     _seed_for_editable_modules,
     _select_recent_train_and_val_versions,
     _validate_best_candidate_on_customer_eval,
@@ -170,15 +171,14 @@ def test_load_seed_candidate_rejects_invalid(tmp_path, raw, match):
         _load_seed_candidate(path)
 
 
-def test_committed_seed_candidate_is_overrides_only():
-    path = Path(__file__).resolve().parents[1] / "data" / "seed_candidate.json"
-    raw = _load_seed_candidate(path)
+def test_committed_seed_candidate_pins_only_writing_code():
+    """The single seed both configs point at: it overrides WRITING_CODE and leaves
+    every other module to PROMPT_MODULE_DEFAULTS."""
+    raw = _load_seed_candidate(Path(__file__).resolve().parents[1] / "data" / "seed_candidate.json")
 
-    assert WRITING_CODE_KEY not in raw
-    assert FULL_PROMPT_KEY not in raw
-    seed = _seed_for_editable_modules(raw, [WRITING_CODE_KEY, RULES_EXT_KEY])
-    assert seed[WRITING_CODE_KEY] == PROMPT_MODULE_DEFAULTS[WRITING_CODE_KEY]
-    assert seed[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
+    assert set(raw) == {WRITING_CODE_KEY}
+    assert _seed_for_editable_modules(raw, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: raw[WRITING_CODE_KEY]}
+    assert _seed_for_editable_modules(raw, [RULES_EXT_KEY])[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
 
 
 def test_parse_args_defaults_editable_modules_to_writing_code():
@@ -226,10 +226,63 @@ def test_parse_args_rejects_invalid_reflection_sample_count(value):
         _parse_args(["--seed_candidate", "seed.json", "--reflection_samples", value])
 
 
+_FIXED_TODAY = date(2026, 8, 27)
+
+
+def _version(days_ago: int) -> str:
+    return (_FIXED_TODAY - timedelta(days=days_ago)).strftime("%Y%m%d")
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    """Pin today so expected versions cannot drift across a midnight boundary."""
+
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return _FIXED_TODAY
+
+    monkeypatch.setattr("glean_gepa.runner.date", _FixedDate)
+
+
+def _auto_selected_split(days_back: int | None) -> tuple[list[str], list[str]]:
+    """Resolve the automatic split against six consecutive daily versions."""
+    argv = ["--seed_candidate", "seed.json"]
+    if days_back is not None:
+        argv += ["--eval_version_days_back", str(days_back)]
+    evalcli = MagicMock()
+    evalcli.list_eval_set_versions.return_value = [{"version": _version(n)} for n in range(6)]
+    return _resolve_eval_version_split(_parse_args(argv), evalcli)
+
+
+def test_eval_version_days_back_holds_the_auto_selection_window_still(frozen_today):
+    """Without this the window tracks the calendar, so a new daily version lands in
+    the valset and misses the eval-run cache."""
+    train_today, val_today = _auto_selected_split(0)
+    train_shifted, val_shifted = _auto_selected_split(2)
+
+    assert val_today == [_version(1), _version(0)]
+    assert val_shifted == [_version(3), _version(2)]
+    assert train_today[-1] == _version(2)
+    assert train_shifted[-1] == _version(4)
+    # The shifted window excludes everything newer than the as-of date.
+    assert _version(0) not in train_shifted and _version(0) not in val_shifted
+
+
+def test_eval_version_days_back_defaults_to_today(frozen_today):
+    assert _auto_selected_split(None) == _auto_selected_split(0)
+    assert _parse_args(["--seed_candidate", "seed.json"]).eval_version_days_back == 0
+
+
+def test_eval_version_days_back_rejects_negative_values():
+    with pytest.raises(SystemExit):
+        _parse_args(["--seed_candidate", "seed.json", "--eval_version_days_back", "-1"])
+
+
 def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
     train_versions, val_versions = _select_recent_train_and_val_versions(
         [{"version": "20260813"}, {"version": "20260820"}, {"version": "20260827"}],
-        today=date(2026, 8, 27),
+        as_of=date(2026, 8, 27),
         lookback_days=14,
         valset_size=2,
     )
@@ -241,7 +294,7 @@ def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
 def test_recent_versions_fall_back_to_one_val_version_when_only_two_are_available():
     train_versions, val_versions = _select_recent_train_and_val_versions(
         [{"version": "20260820"}, {"version": "20260827"}],
-        today=date(2026, 8, 27),
+        as_of=date(2026, 8, 27),
         lookback_days=14,
         valset_size=2,
     )

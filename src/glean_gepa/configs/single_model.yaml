@@ -1,0 +1,53 @@
+# Single-model experiment: the student's shell-tool success rate is read from
+# Agentspan telemetry. No teacher eval runs.
+#
+# This mode requires `packs: [shell]` and objective.primary=shell_success_rate — it
+# has no teacher traces to compare tools against, so use teacher_student.yaml for
+# tool_alignment.
+#
+# The pack (glean_gepa/configs/packs/shell.yaml) supplies the shell_success_rate
+# signal, objective.primary, its composite, and the screening gate. Signals declared
+# below are merged with the pack's by name, and objective/screening keys set below
+# override the pack's.
+
+schema_version: 1
+mode: single_model
+packs: [shell]
+
+run:
+  dir: run_sm
+  max_metric_calls: 10
+  eval_run_timeout_sec: 21600
+  seed_candidate: data/seed_candidate.json
+  editable_modules: [WRITING_CODE]
+
+models:
+  student: gpt
+  reflection: OPEN_AI:GPT5_LATEST
+
+data:
+  eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  # Pin both lists for a reproducible run, or omit them to auto-select.
+  # train_eval_versions: [20260813, 20260820]
+  # val_eval_versions: [20260827]
+  #
+  # lookback_days is the window size; days_back shifts the window's end date back
+  # from today, which holds automatic selection still across days instead of
+  # letting it follow the calendar into uncached versions.
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 2
+
+objective:
+  frontier_type: objective
+  validation: []
+
+search:
+  offspring_count: 5
+  # Set to `all` to reflect on every available example.
+  reflection_samples: 8
+  reflection_hamming_distance_k: null
+  # Total prompt-token ceiling a mutated candidate may reach. Raised at startup to
+  # fit the per-module budgets, so a value below those cannot starve a module.
+  global_token_cap: 4096
