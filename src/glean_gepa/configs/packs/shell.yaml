@@ -1,0 +1,17 @@
+# Pack: shell-tool success from Agentspan telemetry.
+# Scorable only by single_model mode, which requires `packs: [shell]`.
+
+signals:
+  - name: shell_success_rate
+    source: shell_telemetry
+    lookback_days: 1
+
+objective:
+  primary: shell_success_rate
+  composite:
+    shell_success_rate: 1.0
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.333
+  high_signal: shell_error_entries

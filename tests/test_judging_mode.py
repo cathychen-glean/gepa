@@ -51,7 +51,7 @@ def test_concrete_adapters_own_screening_configuration():
     tool_match_eval = GleanEvaluationBatch(
         outputs=[],
         scores=[0.85],
-        summary={"tool_alignment": 0.5, "completeness": 1.0, "grounding": 1.0},
+        summary={"tool_alignment": 0.5, "completeness": 1.0},
     )
 
     assert single_adapter.primary_objective == SHELL_SUCCESS_OBJECTIVE

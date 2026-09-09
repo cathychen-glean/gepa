@@ -484,9 +484,7 @@ class EvalCliClient:
                     raise
                 existing = self._find_judge_run_id_after_create_error(eval_run_id, judge_type)
                 if existing:
-                    print(
-                        f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}"
-                    )
+                    print(f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}")
                     return existing
                 if attempt + 1 >= JUDGE_CREATE_ATTEMPTS:
                     break
@@ -549,6 +547,20 @@ class EvalCliClient:
             if str(row.get("id") or "") == judge_run_id:
                 return row
         return None
+
+    def compare_eval_metrics(self, test_eval_id: str, base_eval_id: str) -> dict[str, Any]:
+        """Return paired judge and system metrics for two eval runs."""
+        result = self._invoke_json(
+            "metrics",
+            "compare",
+            "--test-eval-id",
+            test_eval_id,
+            "--base-eval-id",
+            base_eval_id,
+        )
+        if not isinstance(result, dict):
+            raise EvalCliError(f"Unexpected metrics compare response: {result!r}")
+        return result
 
     def wait_for_judge_run(
         self,

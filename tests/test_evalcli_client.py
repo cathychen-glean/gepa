@@ -364,6 +364,23 @@ def test_list_eval_set_versions_returns_version_rows():
     )
 
 
+def test_compare_eval_metrics_uses_pairwise_compare_command():
+    client = EvalCliClient(binary="/fake/evalcli")
+    payload = {"systemMetrics": {}, "judgeMetrics": {}}
+    with patch.object(client, "_invoke_json", return_value=payload) as mock_invoke:
+        result = client.compare_eval_metrics("test-run", "base-run")
+
+    assert result == payload
+    assert mock_invoke.call_args[0] == (
+        "metrics",
+        "compare",
+        "--test-eval-id",
+        "test-run",
+        "--base-eval-id",
+        "base-run",
+    )
+
+
 def test_wait_for_judge_run_raises_on_failure():
     client = EvalCliClient(binary="/fake/evalcli")
     listing = {"judgeRuns": [{"id": "judge_456", "status": "FAILED"}]}

@@ -38,10 +38,14 @@ class ShellToolTelemetryPendingError(RuntimeError):
     """Raised when an eval has not yet emitted shell telemetry."""
 
 
+DEFAULT_COMPOSITE_WEIGHTS = {SHELL_SUCCESS_OBJECTIVE: 1.0}
+
+
 class SingleModelAdapter(GleanAdapterBase):
     """Optimize prompts for a single student model using shell-tool error evidence."""
 
     supports_high_signal_eval = True
+    telemetry_dimensions = (SHELL_SUCCESS_OBJECTIVE,)
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
         """Keep the parent eval ID required to map trace-side UUIDs to source entries."""
@@ -132,6 +136,10 @@ class SingleModelAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
+        primary_objective: str = SHELL_SUCCESS_OBJECTIVE,
+        default_frontier_type: str = "objective",
+        composite_weights: dict[str, float] | None = None,
+        constant_scores: dict[str, float] | None = None,
     ):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
@@ -147,9 +155,11 @@ class SingleModelAdapter(GleanAdapterBase):
             reflection_prompt_fn=single_model_reflection_prompt,
             reflective_metrics_fn=self._format_reflective_metrics,
             failure_label="HIGH-SIGNAL FAILURES",
-            primary_objective=SHELL_SUCCESS_OBJECTIVE,
-            default_frontier_type="objective",
+            primary_objective=primary_objective,
+            default_frontier_type=default_frontier_type,
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
+            composite_weights=dict(DEFAULT_COMPOSITE_WEIGHTS if composite_weights is None else composite_weights),
+            constant_scores=dict(constant_scores or {}),
             cache_file=cache_file,
         )
 
@@ -394,10 +404,12 @@ class SingleModelAdapter(GleanAdapterBase):
                 ]
                 if shell_action_inputs:
                     output["shell_action_inputs"] = shell_action_inputs
-                aggregate_score = analysis.aggregate.shell_success_rate
-                objective_score = {SHELL_SUCCESS_OBJECTIVE: aggregate_score}
+                objective_score = {
+                    **self.constant_scores,
+                    SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
+                }
                 all_outputs.append(output)
-                all_scores.append(aggregate_score)
+                all_scores.append(self.composite_score(objective_score))
                 all_objective_scores.append(objective_score)
                 continue
 
@@ -419,17 +431,19 @@ class SingleModelAdapter(GleanAdapterBase):
                 }
                 if shell_action_inputs:
                     output["shell_action_inputs"] = shell_action_inputs
-                all_outputs.append(output)
-                all_scores.append(analysis.aggregate.shell_success_rate)
                 objective_score = {
+                    **self.constant_scores,
                     SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
                 }
+                score = self.composite_score(objective_score)
+                all_outputs.append(output)
+                all_scores.append(score)
                 all_objective_scores.append(objective_score)
                 all_trajectories.append(
                     {
                         "data": al_data_inst,
                         "output": output,
-                        "score": analysis.aggregate.shell_success_rate,
+                        "score": score,
                         "objective_scores": objective_score,
                     }
                 )
@@ -473,15 +487,17 @@ class SingleModelAdapter(GleanAdapterBase):
                 # Focused screening is entry-level: an entry passes only when it
                 # has no tool errors. This keeps the 50% gate independent of the
                 # number of shell calls each entry happens to make.
-                entry_score = (
+                shell_success = (
                     float(entry_id in analysis.per_entry and entry_metrics.shell_errors == 0)
                     if is_focused_eval
                     else entry_metrics.shell_success_rate
                 )
-                all_scores.append(entry_score)
                 entry_objective_score = {
-                    SHELL_SUCCESS_OBJECTIVE: entry_score,
+                    **self.constant_scores,
+                    SHELL_SUCCESS_OBJECTIVE: shell_success,
                 }
+                entry_score = self.composite_score(entry_objective_score)
+                all_scores.append(entry_score)
                 all_objective_scores.append(entry_objective_score)
                 all_trajectories.append(
                     {
