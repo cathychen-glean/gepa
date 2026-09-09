@@ -366,9 +366,26 @@ def test_list_eval_set_versions_returns_version_rows():
 
 def test_wait_for_judge_run_raises_on_failure():
     client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(client, "_invoke_json", return_value={"id": "judge_456", "status": "FAILED"}):
+    listing = {"judgeRuns": [{"id": "judge_456", "status": "FAILED"}]}
+    with patch.object(client, "_invoke_json", return_value=listing) as mock_invoke:
         with pytest.raises(EvalCliError, match="ended with status FAILED"):
-            client.wait_for_judge_run("judge_456", poll_interval_sec=0, timeout_sec=1)
+            client.wait_for_judge_run("judge_456", eval_run_id="student-run", poll_interval_sec=0, timeout_sec=1)
+
+    args = mock_invoke.call_args[0]
+    assert args[0:2] == ("judge", "list")
+    assert args[args.index("--eval-run-ids") + 1] == "student-run"
+
+
+def test_wait_for_judge_run_succeeds_on_listed_status():
+    client = EvalCliClient(binary="/fake/evalcli")
+    listing = {
+        "judgeRuns": [
+            {"id": "other_judge", "status": "RUNNING"},
+            {"id": "judge_456", "status": "SUCCEEDED"},
+        ]
+    }
+    with patch.object(client, "_invoke_json", return_value=listing):
+        client.wait_for_judge_run("judge_456", eval_run_id="student-run", poll_interval_sec=0, timeout_sec=1)
 
 
 def test_subprocess_env_replaces_unreliable_ssl_cert(monkeypatch, tmp_path):

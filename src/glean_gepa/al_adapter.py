@@ -759,7 +759,7 @@ class Judge:
                 base_eval_run_id=teacher_eval_id,
                 input_mappings=CORRECTNESS_INPUT_MAPPINGS,
             )
-            self.evalcli.wait_for_judge_run(judge_run_id)
+            self.evalcli.wait_for_judge_run(judge_run_id, eval_run_id=student_eval_id)
         else:
             print(
                 f"Skipping judge trigger (already triggered), fetching results for {teacher_eval_id} vs {student_eval_id}."
