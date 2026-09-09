@@ -66,6 +66,38 @@ DEFAULT_COMPOSITE_WEIGHTS = {
 DEFAULT_CONSTANT_SCORES: dict[str, float] = {}
 
 
+def _rollout_output(
+    *,
+    entry_id: str,
+    deployment_id: str,
+    query: str,
+    student_tools: list[str],
+    teacher_tools: list[str],
+    student_tool_calls: int | None = None,
+    teacher_tool_calls: int | None = None,
+) -> TeacherStudentALRolloutOutput:
+    """One rollout row. Tool-call counts default to the listed events."""
+    return {
+        "deployment_id": deployment_id,
+        "query": query,
+        "student_answer": "",
+        "student_tool_events": student_tools,
+        "student_loops": 0,
+        "student_tool_calls": len(student_tools) if student_tool_calls is None else student_tool_calls,
+        "student_tool_errors": 0,
+        "student_input_tokens": 0,
+        "student_output_tokens": 0,
+        "student_latency_ms": None,
+        "teacher_answer": "",
+        "teacher_tool_events": teacher_tools,
+        "teacher_loops": 0,
+        "teacher_tool_calls": len(teacher_tools) if teacher_tool_calls is None else teacher_tool_calls,
+        "teacher_input_tokens": 0,
+        "teacher_output_tokens": 0,
+        "entry_id": entry_id,
+    }
+
+
 @dataclass(frozen=True)
 class _StartedPair:
     al_data_inst: TeacherStudentALDataInst
@@ -644,29 +676,49 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     f"teacher {pair.teacher_eval_id}={teacher_analysis.aggregate:.2f}"
                 )
 
-            for entry_id, tool_match in tool_match_analysis.per_entry.items():
-                student_tools = list(tool_match.student_tools)
-                teacher_tools = list(tool_match.teacher_tools)
-                tool_alignment = float(tool_match.tools_match)
-                output: TeacherStudentALRolloutOutput = {
-                    "deployment_id": deployment_id,
-                    "query": query,
-                    "student_answer": "",
-                    "student_tool_events": student_tools,
-                    "student_loops": 0,
-                    "student_tool_calls": len(student_tools),
-                    "student_tool_errors": 0,
-                    "student_input_tokens": 0,
-                    "student_output_tokens": 0,
-                    "student_latency_ms": None,
-                    "teacher_answer": "",
-                    "teacher_tool_events": teacher_tools,
-                    "teacher_loops": 0,
-                    "teacher_tool_calls": len(teacher_tools),
-                    "teacher_input_tokens": 0,
-                    "teacher_output_tokens": 0,
-                    "entry_id": entry_id,
-                }
+            # A full-validation eval-set item stands for the whole eval run, not for
+            # each of its entries. The engine has one val ID per configured eval set
+            # and zips it against these rows with strict=False, so entry-level rows
+            # let one arbitrary entry's 0/1 outcome be recorded as the eval set's
+            # validation score. Entry-level rows are kept for trace-capturing
+            # training evals, where reflection needs the individual examples.
+            if not is_focused_eval and not capture_traces:
+                scored_rows = [
+                    (
+                        query,
+                        tool_match_analysis.aggregate.tool_match_rate,
+                        _rollout_output(
+                            entry_id=query,
+                            deployment_id=deployment_id,
+                            query=query,
+                            student_tools=[],
+                            teacher_tools=[],
+                            student_tool_calls=sum(
+                                len(m.student_tools) for m in tool_match_analysis.per_entry.values()
+                            ),
+                            teacher_tool_calls=sum(
+                                len(m.teacher_tools) for m in tool_match_analysis.per_entry.values()
+                            ),
+                        ),
+                    )
+                ]
+            else:
+                scored_rows = [
+                    (
+                        entry_id,
+                        float(tool_match.tools_match),
+                        _rollout_output(
+                            entry_id=entry_id,
+                            deployment_id=deployment_id,
+                            query=query,
+                            student_tools=list(tool_match.student_tools),
+                            teacher_tools=list(tool_match.teacher_tools),
+                        ),
+                    )
+                    for entry_id, tool_match in tool_match_analysis.per_entry.items()
+                ]
+
+            for entry_id, tool_alignment, output in scored_rows:
                 all_outputs.append(output)
                 objective_score = {
                     **self.constant_scores,

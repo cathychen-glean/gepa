@@ -294,6 +294,57 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
     assert result.trajectories[0]["score"] == pytest.approx(0.5)
 
 
+def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
+    """Full validation must stay aligned with the caller's batch.
+
+    The engine has one val ID per eval set and zips it against these rows with
+    ``strict=False``, so entry-level rows would record an arbitrary entry's 0/1
+    outcome as the whole eval set's validation score.
+    """
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter._tool_match_cache[("teacher-1", "student-1")] = EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id="student-1",
+            compared_entries=4,
+            matching_entries=3,
+            tool_match_rate=0.75,
+        ),
+        per_entry={
+            # entry-1 matches, so a per-entry row would score 1.0 and hide that
+            # the eval set as a whole only reached 0.75.
+            "entry-1": ToolMatchEntryMetrics(
+                entry_id="entry-1", student_tools=("search",), teacher_tools=("search",), tools_match=True
+            ),
+            "entry-2": ToolMatchEntryMetrics(
+                entry_id="entry-2", student_tools=("search",), teacher_tools=("read",), tools_match=False
+            ),
+        },
+        high_signal_entry_ids=("entry-2",),
+    )
+    for eval_id, aggregate in (("student-1", 1.0), ("teacher-1", 0.9)):
+        adapter._judge_cache[(eval_id, COMPLETENESS_JUDGE_TYPE)] = JudgeAnalysis(
+            eval_id=eval_id, aggregate=aggregate, per_entry={}, judge_type=COMPLETENESS_JUDGE_TYPE
+        )
+    started = [_StartedPair(al_data_inst=EVAL_SET, teacher_eval_id="teacher-1", student_eval_id="student-1")]
+
+    validation = adapter._finish_batch_evals(started, capture_traces=False)
+
+    assert len(validation.scores) == len(started)
+    assert validation.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.75}]
+    assert validation.scores == pytest.approx([0.5 * 1.0 + 0.5 * 0.75])
+    assert validation.outputs[0]["entry_id"] == f"{EVAL_SET['eval_set_name']}:{EVAL_SET['eval_set_version']}"
+
+    # Reflection still needs entry-level rows, so trace capture is unchanged.
+    traced = adapter._finish_batch_evals(started, capture_traces=True)
+    assert len(traced.scores) == 2
+    assert [obj["tool_alignment"] for obj in traced.objective_scores or []] == [1.0, 0.0]
+
+
 def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
