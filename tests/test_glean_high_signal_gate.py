@@ -38,6 +38,26 @@ def test_high_signal_batch_contains_only_parent_failures():
     assert focused[0]["eval_entry_ids"] == ["entry-0", "entry-1"]
 
 
+def test_high_signal_batch_skips_validation_only_eval_sets():
+    """Validation runs on customer deployments whose entries are PII-gated, so
+    reflection and focused screening must stay on the training deployments."""
+    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
+    batch = _batch([0.0, 0.0])
+    trajectories = batch.trajectories or []
+    trajectories[1]["data"] = {
+        **trajectories[1]["data"],
+        "deployment_ids": ["bill"],
+        "eval_set_version": "20260906",
+        "validation_only": True,
+    }
+
+    focused = adapter.high_signal_batch(batch)
+
+    assert len(focused) == 1
+    assert focused[0]["deployment_ids"] == ["prod"]
+    assert focused[0]["eval_entry_ids"] == ["entry-0"]
+
+
 def test_cached_eval_run_id_is_attached_to_matching_eval_set():
     adapter = GleanAdapterBase.__new__(GleanAdapterBase)
     batch = [
