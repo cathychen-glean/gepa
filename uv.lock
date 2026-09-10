@@ -1152,6 +1152,9 @@ http = [
 name = "gepa"
 version = "0.1.4"
 source = { editable = "." }
+dependencies = [
+    { name = "glean-gepa-core" },
+]
 
 [package.optional-dependencies]
 build = [
@@ -1269,6 +1272,7 @@ requires-dist = [
     { name = "gepa", extras = ["full"], marker = "extra == 'gskill'" },
     { name = "gepa", extras = ["full"], marker = "extra == 'test'" },
     { name = "gepa", extras = ["test"], marker = "extra == 'dev'" },
+    { name = "glean-gepa-core", directory = "packages/glean-gepa-core" },
     { name = "google-cloud-bigquery", marker = "extra == 'glean'", specifier = ">=3.43.0,<4" },
     { name = "langchain", marker = "extra == 'langchain'", specifier = ">=1.0" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.0" },
@@ -1330,6 +1334,19 @@ sdist = { url = "https://files.pythonhosted.org/packages/9a/c8/dd58967d119baab74
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/61/d4b89fec821f72385526e1b9d9a3a0385dda4a72b206d28049e2c7cd39b8/gitpython-3.1.45-py3-none-any.whl", hash = "sha256:8908cb2e02fb3b93b7eb0f2827125cb699869470432cc885f019b8fd0fccff77", size = 208168, upload-time = "2025-07-24T03:45:52.517Z" },
 ]
+
+[[package]]
+name = "glean-gepa-core"
+version = "0.1.0"
+source = { directory = "packages/glean-gepa-core" }
+
+[package.metadata]
+requires-dist = [
+    { name = "cloudpickle", marker = "extra == 'checkpoint'", specifier = ">=3.0.0" },
+    { name = "mlflow", marker = "extra == 'mlflow'" },
+    { name = "wandb", marker = "extra == 'wandb'" },
+]
+provides-extras = ["checkpoint", "wandb", "mlflow"]
 
 [[package]]
 name = "google-api-core"
