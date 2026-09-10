@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from gepa.core.adapter import DataInst, invoke_batch_evaluate
+from gepa.core.callbacks import GEPACallback
 from gepa.core.data_loader import DataId, DataLoader, ensure_loader
 from gepa.core.state import GEPAState
 from gepa.logging.experiment_tracker import ExperimentTracker
@@ -280,6 +281,7 @@ class EvolutionaryProposer:
         # Evolutionary hyperparameters
         offspring_count: int = 5,
         reflect_k: int | None = 8,
+        callbacks: list[GEPACallback] | None = None,
         evalset_policy: UnseenEvalSetPolicy | None = None,
         reflection_hamming_distance_k: int | None = None,
         children_cache_file: str | os.PathLike[str] | None = None,
@@ -290,6 +292,7 @@ class EvolutionaryProposer:
         self.al_adapter = al_adapter
         self.reflection_llm = reflection_llm
         self.experiment_tracker = experiment_tracker
+        self.callbacks = callbacks
         self.evalset_policy = evalset_policy
         self.high_signal_screen_threshold = high_signal_screen_threshold
 

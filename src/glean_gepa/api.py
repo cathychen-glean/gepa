@@ -49,6 +49,7 @@ def optimize(
         perfect_score=1.0,
         seed=0,
         reflective_proposer=proposer,  # type: ignore[arg-type]
+        merge_proposer=None,
         frontier_type=frontier_type,
         logger=logger,
         experiment_tracker=experiment_tracker,

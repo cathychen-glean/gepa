@@ -14,8 +14,6 @@ RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
-# glean-gepa-core supplies the `gepa` engine namespace that glean_gepa imports.
-COPY packages/glean-gepa-core ./packages/glean-gepa-core
 COPY src ./src
 RUN uv sync --frozen --no-dev --extra glean
 

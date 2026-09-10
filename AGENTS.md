@@ -1,13 +1,14 @@
-# Glean GEPA
+# GEPA
 
-`glean_gepa` optimizes Glean agent prompts using LLM-based reflection and Pareto-efficient
-evolutionary search. The search engine itself is not in this repository: it is consumed as the
-built **`glean-gepa-core`** distribution, which owns the `gepa` import namespace.
+GEPA (Genetic-Pareto) is a Python framework for optimizing text components (AI prompts, code, instructions) using LLM-based reflection and Pareto-efficient evolutionary search.
+
+## Agent Skill
+
+This repository ships an **Agent Skill** at `.claude/skills/gepa-optimize-anything/`. If you are a coding agent and the user wants to **auto-optimize, tune, or search over any scorable text artifact** (a prompt, program/code, config, regex/SQL, or agent scaffold) with `gepa.optimize_anything`, read `.claude/skills/gepa-optimize-anything/SKILL.md` first and follow it. It is auto-discovered by Claude Code and by other agents that read `.claude/skills/` (Cursor, VS Code/Copilot, Codex, Gemini CLI). To install it standalone in another project: `/plugin marketplace add gepa-ai/gepa` then `/plugin install gepa-optimize-anything@gepa`.
 
 ## Setup
 
-We use **uv** for dependency management. The project uses setuptools as the build backend. All
-python executions must be done through uv.
+We use **uv** for dependency management. The project uses setuptools as the build backend. All python executions must be done through uv.
 
 ```bash
 uv sync --extra dev
@@ -15,24 +16,14 @@ uv sync --extra dev
 
 ## Project Structure
 
-- `src/glean_gepa/` — the package source
-  - `runner.py` — CLI and experiment setup
-  - `api.py` — wiring into the `gepa` engine
-  - `evolutionary_proposer.py` — parent selection, reflection, child screening
-  - `single_model_adapter.py`, `teacher_student_adapter.py` — the two evaluation paths
-  - `configs/` — shipped experiment configs
-- `packages/glean-gepa-core/` — the pinned GEPA engine subset, imported as `gepa`
+- `src/gepa/` — main package source
+  - `core/` — optimization loop, state, evaluation
+  - `proposer/` — candidate proposal and mutation logic
+  - `adapters/` — integration adapters (DSPy, RAG, MCP, etc.)
+  - `strategies/` — batch sampling and candidate selection
+  - `logging/` — experiment tracking and logging
 - `tests/` — pytest test suite
-- `docs/` — `glean_gepa` architecture and deployment guides
-
-## The `gepa` namespace
-
-`from gepa.core.engine import GEPAEngine` resolves to `glean-gepa-core`, a deliberately pruned
-snapshot of GEPA: it has no adapters, no `optimize`/`optimize_anything` entry points, no merge
-proposer, and no callback or acceptance-criterion plumbing. Only the modules under
-`packages/glean-gepa-core/src/gepa/` exist. Never install the public `gepa` package or add a
-second `gepa` source tree alongside it; both claim the same import name and would shadow each
-other.
+- `docs/` — mkdocs documentation site
 
 ## Build & Test
 

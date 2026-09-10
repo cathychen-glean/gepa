@@ -17,9 +17,7 @@ authors = [
 license = { text = "MIT" }
 requires-python = ">=3.10, <3.15"
 
-# The GEPA engine subset consumed by glean_gepa is provided by the built
-# glean-gepa-core distribution, which owns the `gepa` import namespace.
-dependencies = ["glean-gepa-core>=0.1.0"]
+dependencies = []
 
 [project.optional-dependencies]
 full = [
@@ -106,12 +104,8 @@ langchain = [
 where = ["src"]
 
 [tool.setuptools.package-data]
+gepa = ["py.typed"]
 glean_gepa = ["configs/*.yaml", "configs/packs/*.yaml"]
-
-[tool.uv.sources]
-# Built from the in-repo distribution until it is published to glean-pip; the
-# wheels under its dist/ are git-ignored, so the source directory is the source of truth.
-glean-gepa-core = { path = "packages/glean-gepa-core" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
