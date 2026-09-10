@@ -24,14 +24,17 @@ models:
 data:
   eval_set_name: Glean Chat V2 Medium
   deployment_ids: [scio-prod]
+  # Training uses scio-prod versions in the lookback window. Validation uses
+  # the customer-deployment eval set — the same set as the final customer gate.
   # Pin both lists for a reproducible run, or omit them to auto-select.
   # train_eval_versions: [20260813, 20260820]
   # val_eval_versions: [20260827]
   #
-  # lookback_days is the window size; days_back shifts the window's end date back
-  # from today. Automatic selection otherwise follows the calendar, so it picks up
-  # each newly published version and misses the eval-run cache. Setting days_back
-  # holds the window still without hardcoding version numbers.
+  # lookback_days is the window size; days_back shifts the train window's end
+  # date back from today. Automatic training selection otherwise follows the
+  # calendar, so it picks up each newly published version and misses the
+  # eval-run cache. Setting days_back holds the window still without
+  # hardcoding version numbers.
   lookback_days: 14
   days_back: 0
   val_version_count: 2

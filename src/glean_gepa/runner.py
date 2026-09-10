@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import re
 from collections.abc import Callable, Sequence
 from datetime import date, timedelta
@@ -68,6 +69,7 @@ EVAL_RUN_CACHE_FILENAME = "glean_eval_run_cache.json"
 CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
 RUN_LOG_FILENAME = "gepa_run.log"
 EVALSET_SCHEDULE_FILENAME = "glean_evalset_schedule.json"
+CUSTOMER_DEPLOYMENTS_FILENAME = "glean_customer_deployments.json"
 # Same values the config falls back to when `data` omits them.
 GLEAN_CHAT_EVAL_SET_NAME: str = DEFAULT_EVAL_SET_NAME
 SCIO_PROD_DEPLOYMENT_IDS: list[str] = list(DEFAULT_DEPLOYMENT_IDS)
@@ -87,6 +89,9 @@ CUSTOMER_EVAL_DEPLOYMENT_IDS = [
 ]
 CUSTOMER_EVAL_ALPHA = 0.05
 CUSTOMER_CORRECTNESS_MIN = 0.80
+# Cortex rejects an eval run with more than five deployments, so each run samples
+# this many from the customer pool above and keeps that sample for every eval.
+MAX_EVAL_RUN_DEPLOYMENTS = 5
 
 
 def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
@@ -244,7 +249,13 @@ def _make_evalset(
     *,
     eval_set_name: str = GLEAN_CHAT_EVAL_SET_NAME,
     deployment_ids: list[str] | None = None,
+    validation_only: bool = False,
 ) -> list[ALDataInst]:
+    """Build eval-set items for ``versions``.
+
+    ``validation_only`` keeps customer eval sets to eval-run metrics: their
+    entries are PII-gated, so they must never back a focused high-signal set.
+    """
     ids = list(deployment_ids) if deployment_ids is not None else list(SCIO_PROD_DEPLOYMENT_IDS)
     return [
         {
@@ -252,6 +263,7 @@ def _make_evalset(
             "eval_set_version": version,
             "deployment_ids": ids,
             "status": "active",
+            **({"validation_only": True} if validation_only else {}),
         }
         for version in versions
     ]
@@ -271,69 +283,193 @@ def _dated_eval_versions(version_rows: list[dict[str, object]]) -> list[tuple[da
     return sorted(dated)
 
 
-def _latest_dated_eval_version(
-    version_rows: list[dict[str, object]], *, required_deployment_ids: list[str] | None = None
-) -> str:
-    required = set(required_deployment_ids or [])
-    eligible_rows = []
+def _dated_eval_version_rows(version_rows: list[dict[str, object]]) -> list[tuple[date, str, dict[str, object]]]:
+    """Return dated versions newest first, each with the row it came from."""
+    rows_by_version: dict[str, tuple[date, dict[str, object]]] = {}
     for row in version_rows:
-        available = row.get("availableDeploymentIds") or row.get("available_deployment_ids")
-        if required and isinstance(available, list) and available and not required.issubset(map(str, available)):
+        raw_version = row.get("version") or row.get("evalSetVersion")
+        if not isinstance(raw_version, str) or not re.fullmatch(r"\d{8}", raw_version):
             continue
-        eligible_rows.append(row)
-    dated = _dated_eval_versions(eligible_rows)
-    if not dated:
+        try:
+            version_date = date.fromisoformat(f"{raw_version[:4]}-{raw_version[4:6]}-{raw_version[6:]}")
+        except ValueError:
+            continue
+        rows_by_version.setdefault(raw_version, (version_date, row))
+    ordered = sorted(
+        ((version_date, version, row) for version, (version_date, row) in rows_by_version.items()),
+        reverse=True,
+    )
+    return ordered
+
+
+def _deployments_missing_from_version(row: dict[str, object], deployment_ids: list[str]) -> set[str]:
+    """Return the deployments this version was not published to with entries.
+
+    ``evalsets versions`` reports ``availableDeploymentIds`` plus a
+    ``perDeploymentMetadata`` size per deployment. Most dated versions cover
+    only scio-prod; the customer-wide ones land roughly weekly. This is the
+    authoritative signal — the entries endpoint is PII-gated for customer
+    deployments and ``fact.evalset_entries`` keys rows by a different id.
+    """
+    available = _unwrap_additional_properties(
+        row.get("availableDeploymentIds") or row.get("available_deployment_ids") or []
+    )
+    published = {str(item) for item in available} if isinstance(available, list) else set()
+    sizes = _unwrap_additional_properties(row.get("perDeploymentMetadata") or {})
+    missing: set[str] = set()
+    for deployment in deployment_ids:
+        if published and deployment not in published:
+            missing.add(deployment)
+            continue
+        if not isinstance(sizes, dict) or not sizes:
+            continue
+        entry = _unwrap_additional_properties(sizes.get(deployment) or {})
+        size = entry.get("size") if isinstance(entry, dict) else None
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            missing.add(deployment)
+    return missing
+
+
+def _select_covered_dated_versions(
+    version_rows: list[dict[str, object]],
+    *,
+    count: int,
+    eval_set_name: str,
+    deployment_ids: list[str],
+) -> list[str]:
+    """Pick the newest dated versions published to every requested deployment."""
+    selected: list[str] = []
+    skipped: list[str] = []
+    for _version_date, version, row in _dated_eval_version_rows(version_rows):
+        missing = _deployments_missing_from_version(row, deployment_ids)
+        if missing:
+            skipped.append(f"{version} (not published to {','.join(sorted(missing))})")
+            continue
+        selected.append(version)
+        if len(selected) == count:
+            break
+    if skipped:
+        print(f"[Eval set schedule] Skipped {eval_set_name} versions: {'; '.join(skipped)}")
+    if not selected:
         raise SystemExit(
-            f"Need at least one dated {GLEAN_CHAT_EVAL_SET_NAME} version (YYYYMMDD) available for "
-            f"customer deployments {','.join(CUSTOMER_EVAL_DEPLOYMENT_IDS)}."
+            f"No dated {eval_set_name} version is published to every deployment "
+            f"{','.join(deployment_ids)}. Customer-wide versions land roughly weekly; "
+            f"pin --val_eval_versions or lower --val_eval_version_count."
         )
-    return dated[-1][1]
+    return list(reversed(selected))
 
 
-def _select_recent_train_and_val_versions(
-    version_rows: list[dict[str, object]], *, as_of: date, lookback_days: int, valset_size: int
-) -> tuple[list[str], list[str]]:
-    """Reserve the newest one or two versions for validation and schedule older ones for training."""
+def _resolve_customer_deployments(state_file: Path | None, *, seed: int | None = None) -> list[str]:
+    """Sample the customer deployments this run evaluates on.
+
+    The sample is written to the run directory and reused on resume: re-sampling
+    would change the eval-set identity and miss every cached eval run.
+    """
+    if state_file is not None and state_file.is_file():
+        saved = json.loads(state_file.read_text())
+        if not isinstance(saved, list) or not saved:
+            raise SystemExit(f"{state_file} does not hold a list of customer deployments: {saved!r}")
+        if any(item not in CUSTOMER_EVAL_DEPLOYMENT_IDS for item in saved):
+            raise SystemExit(f"{state_file} does not hold a list of customer deployments: {saved!r}")
+        return [str(item) for item in saved]
+
+    sampled = sorted(random.Random(seed).sample(CUSTOMER_EVAL_DEPLOYMENT_IDS, MAX_EVAL_RUN_DEPLOYMENTS))
+    if state_file is not None:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(sampled))
+    return sampled
+
+
+def _select_recent_train_versions(
+    version_rows: list[dict[str, object]], *, as_of: date, lookback_days: int
+) -> list[str]:
+    """Schedule every scio-prod version in the lookback window for training."""
     earliest = as_of - timedelta(days=lookback_days)
     ordered_versions = [
         version for version_date, version in _dated_eval_versions(version_rows) if earliest <= version_date <= as_of
     ]
-    if len(ordered_versions) < 2:
+    if not ordered_versions:
         raise SystemExit(
-            f"Need at least two scio-prod eval versions dated {earliest.isoformat()} through {as_of.isoformat()}; "
-            f"found {len(ordered_versions)}."
+            f"Need at least one scio-prod eval version dated {earliest.isoformat()} through {as_of.isoformat()}."
         )
-    actual_valset_size = min(valset_size, len(ordered_versions) - 1)
-    return ordered_versions[:-actual_valset_size], ordered_versions[-actual_valset_size:]
+    return ordered_versions
 
 
-def _resolve_eval_version_split(args: argparse.Namespace, evalcli: EvalCliClient) -> tuple[list[str], list[str]]:
+def _customer_version_rows(evalcli: EvalCliClient, customer_deployments: list[str]) -> list[dict[str, Any]]:
+    return evalcli.list_eval_set_versions(
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=customer_deployments,
+    )
+
+
+def _require_customer_publication(
+    evalcli: EvalCliClient, val_versions: list[str], customer_deployments: list[str]
+) -> None:
+    """Fail before any eval run when a pinned version misses a sampled deployment."""
+    rows_by_version = {
+        version: row
+        for _version_date, version, row in _dated_eval_version_rows(
+            _customer_version_rows(evalcli, customer_deployments)
+        )
+    }
+    for version in val_versions:
+        row = rows_by_version.get(version)
+        if row is None:
+            print(
+                f"[Eval set schedule] {GLEAN_CHAT_EVAL_SET_NAME} version {version} is not listed for these deployments"
+            )
+            continue
+        missing = _deployments_missing_from_version(row, customer_deployments)
+        if missing:
+            raise SystemExit(
+                f"{GLEAN_CHAT_EVAL_SET_NAME} version {version} is not published to "
+                f"{','.join(sorted(missing))}; pick a version published to every sampled deployment."
+            )
+
+
+def _resolve_customer_val_versions(
+    args: argparse.Namespace,
+    evalcli: EvalCliClient,
+    customer_deployments: list[str],
+) -> list[str]:
+    """Return the customer-deployment versions used for both GEPA val and the final gate."""
+    return _select_covered_dated_versions(
+        _customer_version_rows(evalcli, customer_deployments),
+        count=args.val_eval_version_count,
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=customer_deployments,
+    )
+
+
+def _resolve_eval_version_split(
+    args: argparse.Namespace,
+    evalcli: EvalCliClient,
+    customer_deployments: list[str],
+) -> tuple[list[str], list[str]]:
     eval_set_name, deployment_ids = evalset_identity(args.experiment)
     if bool(args.train_eval_versions) != bool(args.val_eval_versions):
         raise SystemExit("Set both --train_eval_versions and --val_eval_versions, or neither for automatic selection.")
     if args.train_eval_versions:
         train_versions = _parse_eval_versions(args.train_eval_versions, argument_name="--train_eval_versions")
         val_versions = _parse_eval_versions(args.val_eval_versions, argument_name="--val_eval_versions")
+        _require_customer_publication(evalcli, val_versions, customer_deployments)
     else:
         rows = evalcli.list_eval_set_versions(eval_set_name=eval_set_name, deployment_ids=deployment_ids)
         days_back = getattr(args, "eval_version_days_back", 0) or 0
         as_of = date.today() - timedelta(days=days_back)
-        train_versions, val_versions = _select_recent_train_and_val_versions(
+        train_versions = _select_recent_train_versions(
             rows,
             as_of=as_of,
             lookback_days=args.eval_version_lookback_days,
-            valset_size=args.val_eval_version_count,
         )
+        val_versions = _resolve_customer_val_versions(args, evalcli, customer_deployments)
         as_of_note = f" as of {as_of.isoformat()} ({days_back}d back)" if days_back else ""
         print(
             f"[Eval set schedule] Auto-selected{as_of_note} "
-            f"train versions={','.join(train_versions)} and val versions={','.join(val_versions)}"
+            f"train versions={','.join(train_versions)} (scio-prod) and "
+            f"val versions={','.join(val_versions)} on {','.join(customer_deployments)}"
         )
 
-    overlapping_versions = set(train_versions) & set(val_versions)
-    if overlapping_versions:
-        overlap = ", ".join(sorted(overlapping_versions))
-        raise SystemExit(f"Train and validation eval versions must not overlap: {overlap}")
     if not 1 <= len(val_versions) <= 2:
         raise SystemExit("Validation must contain one or two eval versions.")
     return train_versions, val_versions
@@ -459,67 +595,68 @@ def _validate_best_candidate_on_customer_eval(
     baseline_candidate: dict[str, str],
     best_candidate: dict[str, str],
     evalcli: EvalCliClient,
+    valset: list[ALDataInst],
 ) -> None:
-    """Run paired customer evals and enforce correctness and system-metric gates."""
-    rows = evalcli.list_eval_set_versions(
-        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
-        deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
-    )
-    version = _latest_dated_eval_version(rows, required_deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS))
-    customers = ",".join(CUSTOMER_EVAL_DEPLOYMENT_IDS)
-    log_section(
-        "CUSTOMER EVAL",
-        "\n".join(
-            [
-                f"eval_set={GLEAN_CHAT_EVAL_SET_NAME}:{version}",
-                f"deployments={customers}",
-            ]
-        ),
-    )
-    baseline_eval_id, baseline_wait = runner.start(
-        student_model,
-        system_prompt=compile_encoded_prompt(baseline_candidate),
-        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
-        eval_set_version=version,
-        deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
-        run_label="gepa_customer_base",
-    )
-    best_eval_id, best_wait = runner.start(
-        student_model,
-        system_prompt=compile_encoded_prompt(best_candidate),
-        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
-        eval_set_version=version,
-        deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
-        run_label="gepa_customer_best",
-    )
-    if baseline_wait:
-        runner.wait(baseline_eval_id)
-    if best_wait:
-        runner.wait(best_eval_id)
+    """Run paired customer evals on the GEPA valset and enforce metric gates."""
+    if not valset:
+        raise SystemExit("Customer eval requires a non-empty validation set.")
+    for item in valset:
+        version = item["eval_set_version"]
+        deployment_ids = list(item["deployment_ids"])
+        log_section(
+            "CUSTOMER EVAL",
+            "\n".join(
+                [
+                    f"eval_set={item['eval_set_name']}:{version}",
+                    f"deployments={','.join(deployment_ids)}",
+                ]
+            ),
+        )
+        baseline_eval_id, baseline_wait = runner.start(
+            student_model,
+            system_prompt=compile_encoded_prompt(baseline_candidate),
+            eval_set_name=item["eval_set_name"],
+            eval_set_version=version,
+            deployment_ids=deployment_ids,
+            run_label="gepa_customer_base",
+        )
+        best_eval_id, best_wait = runner.start(
+            student_model,
+            system_prompt=compile_encoded_prompt(best_candidate),
+            eval_set_name=item["eval_set_name"],
+            eval_set_version=version,
+            deployment_ids=deployment_ids,
+            run_label="gepa_customer_best",
+        )
+        if baseline_wait:
+            runner.wait(baseline_eval_id)
+        if best_wait:
+            runner.wait(best_eval_id)
 
-    judge_run_id = runner.ensure_judge_run(
-        eval_run_id=best_eval_id,
-        judge_type=CORRECTNESS_JUDGE_TYPE,
-        run_params=CORRECTNESS_RUN_PARAMS,
-        base_eval_run_id=baseline_eval_id,
-        input_mappings=CORRECTNESS_INPUT_MAPPINGS,
-    )
-    evalcli.wait_for_judge_run(judge_run_id, eval_run_id=best_eval_id)
-    metrics = evalcli.compare_eval_metrics(best_eval_id, baseline_eval_id)
-    run_details = [
-        f"baseline_eval_id={baseline_eval_id}",
-        f"best_eval_id={best_eval_id}",
-        f"correctness_judge_run_id={judge_run_id}",
-    ]
-    try:
-        report = _verify_customer_eval_metrics(metrics)
-    except SystemExit as exc:
-        log_section("CUSTOMER EVAL RESULT", "\n".join([*run_details, str(exc)]))
-        raise
-    log_section(
-        "CUSTOMER EVAL RESULT",
-        "\n".join([*run_details, report]),
-    )
+        judge_run_id = runner.ensure_judge_run(
+            eval_run_id=best_eval_id,
+            judge_type=CORRECTNESS_JUDGE_TYPE,
+            run_params=CORRECTNESS_RUN_PARAMS,
+            base_eval_run_id=baseline_eval_id,
+            input_mappings=CORRECTNESS_INPUT_MAPPINGS,
+        )
+        evalcli.wait_for_judge_run(judge_run_id, eval_run_id=best_eval_id)
+        metrics = evalcli.compare_eval_metrics(best_eval_id, baseline_eval_id)
+        run_details = [
+            f"eval_set_version={version}",
+            f"baseline_eval_id={baseline_eval_id}",
+            f"best_eval_id={best_eval_id}",
+            f"correctness_judge_run_id={judge_run_id}",
+        ]
+        try:
+            report = _verify_customer_eval_metrics(metrics)
+        except SystemExit as exc:
+            log_section("CUSTOMER EVAL RESULT", "\n".join([*run_details, str(exc)]))
+            raise
+        log_section(
+            "CUSTOMER EVAL RESULT",
+            "\n".join([*run_details, report]),
+        )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -615,7 +752,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--val_eval_versions",
-        help="Optional comma-separated override for held-out validation versions.",
+        help="Optional comma-separated override for customer-deployment validation versions "
+        "(same eval set as the final customer gate).",
     )
     parser.add_argument(
         "--eval_version_lookback_days",
@@ -636,7 +774,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         choices=[1, 2],
         default=2,
-        help="Number of newest eligible versions reserved for validation (default: 2).",
+        help="Number of newest customer-deployment versions used for GEPA validation "
+        "and the final customer gate (default: 2).",
+    )
+    parser.add_argument(
+        "--customer_deployment_seed",
+        type=int,
+        default=None,
+        help=f"Seed for sampling {MAX_EVAL_RUN_DEPLOYMENTS} customer deployments (Cortex caps an eval run at "
+        f"{MAX_EVAL_RUN_DEPLOYMENTS}). Omit to sample randomly; the sample is saved under --run_dir and reused "
+        "on resume so cached eval runs still hit.",
     )
     parser.add_argument(
         "--judging_mode",
@@ -772,10 +919,24 @@ def _run_from_args(args: argparse.Namespace) -> None:
     seed_candidate = _seed_for_editable_modules(raw_seed, editable_modules)
     log_section("RUN CONFIG", _format_run_config(args, judging_mode, editable_modules, seed_candidate, experiment))
     evalcli = EvalCliClient(binary=args.evalcli)
-    train_versions, val_versions = _resolve_eval_version_split(args, evalcli)
+    bigquery_client = BigQueryClient(project_id=args.bigquery_project)
+    customer_deployments = _resolve_customer_deployments(
+        _default_cache_file(args.run_dir, CUSTOMER_DEPLOYMENTS_FILENAME),
+        seed=args.customer_deployment_seed,
+    )
+    print(
+        f"[Customer eval] Sampled {len(customer_deployments)} of {len(CUSTOMER_EVAL_DEPLOYMENT_IDS)} "
+        f"customer deployments: {','.join(customer_deployments)}"
+    )
+    train_versions, val_versions = _resolve_eval_version_split(args, evalcli, customer_deployments)
     eval_set_name, deployment_ids = evalset_identity(experiment)
     trainset = _make_evalset(train_versions, eval_set_name=eval_set_name, deployment_ids=deployment_ids)
-    valset = _make_evalset(val_versions, eval_set_name=eval_set_name, deployment_ids=deployment_ids)
+    valset = _make_evalset(
+        val_versions,
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=customer_deployments,
+        validation_only=True,
+    )
     cache_file = args.cache_file or _default_cache_file(args.run_dir, ADAPTER_CACHE_FILENAME)
     eval_run_cache_file = args.eval_run_cache_file or _default_cache_file(args.run_dir, EVAL_RUN_CACHE_FILENAME)
     children_cache_file = args.children_cache_file or _default_cache_file(args.run_dir, CHILDREN_CACHE_FILENAME)
@@ -790,7 +951,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         "student_model": args.student_model,
         "cache_file": str(cache_file) if cache_file else None,
-        "bigquery_client": BigQueryClient(project_id=args.bigquery_project),
+        "bigquery_client": bigquery_client,
         "agentspan_lookback_days": args.agentspan_lookback_days,
         "editable_modules": editable_modules,
     }
@@ -853,6 +1014,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         baseline_candidate=seed_candidate,
         best_candidate=best_candidate,
         evalcli=evalcli,
+        valset=valset,
     )
 
 

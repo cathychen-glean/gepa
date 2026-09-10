@@ -1549,12 +1549,16 @@ class GleanAdapterBase:
         return eval_batch.summary.get(self.primary_objective, float("-inf"))
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
-        """Return eval-set configs narrowed to the entries that failed for a parent."""
+        """Return eval-set configs narrowed to the entries that failed for a parent.
+
+        Validation-only eval sets are skipped: they run on customer deployments
+        whose entries cannot be listed, so they cannot back a focused eval set.
+        """
         grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = defaultdict(list)
         for trajectory in eval_batch.trajectories or []:
             data = trajectory["data"]
             output = trajectory["output"]
-            if trajectory["score"] >= 1.0:
+            if trajectory["score"] >= 1.0 or data.get("validation_only"):
                 continue
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
             entry_id = output.get("entry_id")

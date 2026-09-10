@@ -76,7 +76,7 @@ class SingleModelAdapter(GleanAdapterBase):
         """
         prepared: list[ALDataInst] = []
         for data in batch:
-            entry_ids = data.get("eval_entry_ids")
+            entry_ids = None if data.get("validation_only") else data.get("eval_entry_ids")
             if not entry_ids:
                 prepared.append(data)
                 continue

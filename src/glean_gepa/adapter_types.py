@@ -21,12 +21,19 @@ class PointwiseJudge(NamedTuple):
 
 
 class EvalSetALDataInst(TypedDict):
-    """Configuration shared by both Glean evaluation adapters."""
+    """Configuration shared by both Glean evaluation adapters.
+
+    ``validation_only`` marks an eval set that may only be scored from its eval
+    run's metrics. Validation runs on customer deployments, whose eval-set
+    entries are PII-gated and unreadable outside the Cortex UI, so reflection
+    and focused high-signal screening must stay on the training deployments.
+    """
 
     eval_set_name: str
     eval_set_version: str
     deployment_ids: list[str]
     status: str
+    validation_only: NotRequired[bool]
     eval_entry_ids: NotRequired[list[str]]
     focused_eval_set_name: NotRequired[str]
     focused_eval_set_version: NotRequired[str]
