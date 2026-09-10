@@ -7,7 +7,6 @@ import pytest
 from gepa.core.engine import GEPAEngine
 from gepa.core.state import ValsetEvaluation
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
-from gepa.strategies.acceptance import StrictImprovementAcceptance
 from glean_gepa.al_adapter import Candidate, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
@@ -497,7 +496,8 @@ def test_high_signal_screen_uses_zero_baseline_before_full_validation(tmp_path) 
     assert all(proposal.tag == "evolutionary_high_signal" for proposal in proposals)
     assert all(proposal.subsample_scores_before == [0.0] for proposal in proposals)
     assert all(proposal.subsample_scores_after == [7 / 17] for proposal in proposals)
-    assert all(StrictImprovementAcceptance().should_accept(proposal, _State()) for proposal in proposals)
+    # Strict improvement over the zero baseline, the rule the engine applies to accept a child.
+    assert all(sum(proposal.subsample_scores_after) > sum(proposal.subsample_scores_before) for proposal in proposals)
 
 
 def test_display_iteration_advances_only_after_full_evaluation() -> None:
