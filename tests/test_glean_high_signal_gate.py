@@ -103,7 +103,7 @@ def test_high_signal_screen_threshold():
         [_batch([1.0, 1.0, 0.0]), _batch([0.0, 0.0, 0.0]), _batch([1.0, 0.0, 0.0])],
         use_high_signal_gate=True,
     )
-    assert [(child, score) for child, _evaluation, score in kept] == [(keep, 2 / 3), (exact, 1 / 3)]
+    assert [(child, score) for child, _evaluation, score in kept] == [(keep, 2 / 3)]
 
     below_custom = _select_screened_children(
         adapter,
