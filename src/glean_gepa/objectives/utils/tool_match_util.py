@@ -2,27 +2,23 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from glean_gepa.shell_tool_error_util import (
+from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
+    EXECUTE_ACTION_FILTER,
     QueryParameter,
     default_date_range,
-    resolve_eval_run_date_range,
+    run_windowed_per_entry_query,
     wildcard_shard_filter,
 )
 
 TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
-REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT = 20
 SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool"})
-_EXECUTE_ACTION_FILTER = (
-    "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
-)
 
 
 class NoComparedEvalEntriesError(RuntimeError):
@@ -69,7 +65,7 @@ SELECT
 FROM `{agentspan_table}`
 WHERE {wildcard_shard_filter("search_start_date", "search_end_date")}
   AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
-  AND {_EXECUTE_ACTION_FILTER}
+  AND {EXECUTE_ACTION_FILTER}
 """.strip()
 
 
@@ -92,7 +88,7 @@ WITH tool_spans AS (
   FROM `{agentspan_table}`
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
-    AND {_EXECUTE_ACTION_FILTER}
+    AND {EXECUTE_ACTION_FILTER}
     AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN ({skipped})
 ),
 per_role AS (
@@ -142,41 +138,6 @@ def first_tool_mismatch_pair(
     if teacher == student:
         return None
     return (teacher, student)
-
-
-def select_first_tool_mismatch_groups(
-    mismatch_keys: Sequence[tuple[str, str] | None],
-    *,
-    max_entries: int = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
-) -> tuple[list[int], list[tuple[str, str, int]]]:
-    """Select first-tool mismatch indices by descending ``(teacher, student)`` frequency.
-
-    The most frequent group is always included in full, even when it exceeds
-    ``max_entries``. Later whole groups are added while they still fit in the
-    cap; groups that would overflow are skipped so later smaller groups can
-    still be included.
-
-    Returns ``(selected_indices, selected_groups)`` where each group is
-    ``(teacher_tool, student_tool, taken_count)``.
-    """
-    if max_entries < 0:
-        raise ValueError("max_entries must be non-negative")
-    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-    for index, key in enumerate(mismatch_keys):
-        if key is None:
-            continue
-        groups[key].append(index)
-    ranked = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0], item[0][1]))
-    selected: list[int] = []
-    selected_groups: list[tuple[str, str, int]] = []
-    for (teacher_tool, student_tool), indices in ranked:
-        if selected and len(selected) + len(indices) > max_entries:
-            continue
-        selected.extend(indices)
-        selected_groups.append((teacher_tool, student_tool, len(indices)))
-        if len(selected) >= max_entries:
-            break
-    return selected, selected_groups
 
 
 def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics:
@@ -234,21 +195,27 @@ def fetch_eval_run_tool_match_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> EvalRunToolMatchAnalysis:
-    search_start, search_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
-    bounds_rows = client.query(
-        build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
-        params=[
-            QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
+    eval_ids = [teacher_eval_id, student_eval_id]
+    result = run_windowed_per_entry_query(
+        client,
+        bounds_query=build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
+        per_entry_query=build_tool_match_per_entry_query(agentspan_table=agentspan_table),
+        bounds_params=lambda search_start, search_end: [
+            QueryParameter("eval_ids", "STRING", eval_ids),
             QueryParameter("search_start_date", "DATE", search_start.isoformat()),
             QueryParameter("search_end_date", "DATE", search_end.isoformat()),
         ],
-    )
-    date_range = resolve_eval_run_date_range(
-        bounds_rows[0] if bounds_rows else None,
+        per_entry_params=lambda start_date, resolved_end: [
+            QueryParameter("eval_ids", "STRING", eval_ids),
+            QueryParameter("student_eval_id", "STRING", student_eval_id),
+            QueryParameter("teacher_eval_id", "STRING", teacher_eval_id),
+            QueryParameter("start_date", "DATE", start_date.isoformat()),
+            QueryParameter("end_date", "DATE", resolved_end.isoformat()),
+        ],
         lookback_days=lookback_days,
         end_date=end_date,
     )
-    if date_range is None:
+    if result is None:
         return empty_tool_match_analysis(
             teacher_eval_id,
             student_eval_id,
@@ -256,17 +223,7 @@ def fetch_eval_run_tool_match_analysis(
             end_date=end_date,
         )
 
-    start_date, resolved_end = date_range
-    per_entry_rows = client.query(
-        build_tool_match_per_entry_query(agentspan_table=agentspan_table),
-        params=[
-            QueryParameter("eval_ids", "STRING", [teacher_eval_id, student_eval_id]),
-            QueryParameter("student_eval_id", "STRING", student_eval_id),
-            QueryParameter("teacher_eval_id", "STRING", teacher_eval_id),
-            QueryParameter("start_date", "DATE", start_date.isoformat()),
-            QueryParameter("end_date", "DATE", resolved_end.isoformat()),
-        ],
-    )
+    start_date, resolved_end, per_entry_rows = result
     per_entry = {
         metrics.entry_id: metrics
         for row in per_entry_rows

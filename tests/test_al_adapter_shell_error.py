@@ -6,19 +6,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from glean_gepa.al_adapter import (
-    EVAL_ANALYSIS_CACHE_SCHEMA_VERSION,
-    ALRunner,
-    Candidate,
-    ModuleSpec,
-    Thresholds,
-    extract_shell_action_inputs,
-)
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, extract_shell_action_inputs
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
-from glean_gepa.focused_evalset import FocusedEvalSet, SESSION_BUCKET_TYPE
-from glean_gepa.shell_tool_error_util import (
+from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
+from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION
+from glean_gepa.objectives.utils.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
     ShellToolErrorEntryMetrics,
@@ -116,7 +110,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
             },
         ) as get_trace,
         patch(
-            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis",
+            "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
             return_value=analysis,
         ),
     ):
@@ -221,7 +215,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
             return_value=FocusedEvalSet("gepa-high-signal-source", "v1_hs_abc", 1),
         ) as ensure,
         patch.object(adapter, "_get_or_run_student_eval", return_value="focused-run") as run_eval,
-        patch.object(adapter, "_get_or_fetch_shell_error_analysis", return_value=analysis) as get_analysis,
+        patch.object(adapter, "_get_or_fetch_analysis", return_value=analysis) as get_analysis,
     ):
         result = adapter.evaluate(
             [
@@ -265,7 +259,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     ]
     with (
         patch(
-            "glean_gepa.single_model_adapter.fetch_high_signal_evalset_entries",
+            "glean_gepa.objectives.shell.fetch_high_signal_evalset_entries",
             return_value=source_entries,
         ) as resolve_entries,
         patch(
@@ -353,7 +347,7 @@ def test_high_signal_evaluation_reuses_child_cached_eval_id():
 
     with (
         patch.object(adapter, "_get_or_run_student_eval") as run_eval,
-        patch.object(adapter, "_get_or_fetch_shell_error_analysis", return_value=analysis),
+        patch.object(adapter, "_get_or_fetch_analysis", return_value=analysis),
     ):
         result = adapter.evaluate(
             [
@@ -413,7 +407,7 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
     )
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="focused-run"),
-        patch.object(adapter, "_get_or_fetch_shell_error_analysis", return_value=analysis),
+        patch.object(adapter, "_get_or_fetch_analysis", return_value=analysis),
     ):
         result = adapter.evaluate(
             [
@@ -499,7 +493,7 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
         with (
             patch.object(adapter, "_get_or_run_student_eval", return_value="run_123"),
             patch(
-                "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis",
+                "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
                 return_value=analysis,
             ),
         ):
@@ -586,9 +580,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     with (
         patch.object(first_evalcli, "create_eval_run", return_value="run_123") as create_eval_run,
         patch.object(first_evalcli, "wait_for_eval_run"),
-        patch(
-            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
-        ) as fetch,
+        patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=analysis) as fetch,
     ):
         without_traces = first.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=False)
     assert without_traces.trajectories is None
@@ -609,9 +601,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     with (
         patch.object(second_evalcli, "create_eval_run") as create_eval_run,
         patch.object(second_evalcli, "wait_for_eval_run") as wait_for_eval_run,
-        patch(
-            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
-        ) as fetch,
+        patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=analysis) as fetch,
     ):
         with_traces = second.evaluate(batch, {"WRITING_CODE": "prompt"}, capture_traces=True)
 
@@ -672,10 +662,8 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         cache_file=str(cache_file),
     )
 
-    with patch(
-        "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=analysis
-    ) as fetch:
-        assert adapter._get_or_fetch_shell_error_analysis("run_cached") is analysis
+    with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=analysis) as fetch:
+        assert adapter._get_or_fetch_analysis("run_cached") is analysis
         fetch.assert_called_once()
 
     adapter._save_cache()
@@ -688,8 +676,8 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         cache_file=str(cache_file),
     )
-    with patch("glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis") as fetch:
-        cached = reloaded._get_or_fetch_shell_error_analysis("run_cached")
+    with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis") as fetch:
+        cached = reloaded._get_or_fetch_analysis("run_cached")
 
     fetch.assert_not_called()
     assert cached.aggregate.shell_error_rate == 0.3
@@ -723,10 +711,10 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
     )
 
     with patch(
-        "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=provisional
+        "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=provisional
     ) as fetch:
-        assert adapter._get_or_fetch_shell_error_analysis("run_pending_telemetry") is provisional
-        assert adapter._get_or_fetch_shell_error_analysis("run_pending_telemetry") is provisional
+        assert adapter._get_or_fetch_analysis("run_pending_telemetry") is provisional
+        assert adapter._get_or_fetch_analysis("run_pending_telemetry") is provisional
 
     assert fetch.call_count == 2
     assert adapter._eval_analysis_cache == {}
@@ -765,7 +753,7 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
 
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="run_pending_telemetry"),
-        patch.object(adapter, "_get_or_fetch_shell_error_analysis", return_value=provisional),
+        patch.object(adapter, "_get_or_fetch_analysis", return_value=provisional),
         pytest.raises(ShellToolTelemetryPendingError, match="refusing to score 0/0"),
     ):
         adapter.evaluate(batch, {"WRITING_CODE": "prompt"})
@@ -816,7 +804,7 @@ def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="gepa_gpt_5a0754e0543e49fc_1788306729"),
         patch(
-            "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis",
+            "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
             return_value=analysis,
         ) as fetch,
         patch.object(evalcli, "get_analysis_trace") as get_trace,
@@ -892,10 +880,8 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         cache_file=str(cache_file),
     )
 
-    with patch(
-        "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=refreshed
-    ) as fetch:
-        assert adapter._get_or_fetch_shell_error_analysis("run_pending_telemetry") is refreshed
+    with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=refreshed) as fetch:
+        assert adapter._get_or_fetch_analysis("run_pending_telemetry") is refreshed
 
     fetch.assert_called_once()
 
@@ -948,10 +934,8 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         cache_file=str(cache_file),
     )
 
-    with patch(
-        "glean_gepa.single_model_adapter.fetch_eval_run_shell_tool_error_analysis", return_value=refreshed
-    ) as fetch:
-        assert adapter._get_or_fetch_shell_error_analysis("run_legacy") is refreshed
+    with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=refreshed) as fetch:
+        assert adapter._get_or_fetch_analysis("run_legacy") is refreshed
 
     fetch.assert_called_once()
 

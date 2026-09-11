@@ -1,0 +1,21 @@
+# Pack: teacher/student citation-set alignment from paired traces.
+# Scorable only by teacher_student mode, which requires `packs: [citations]`.
+#
+# This replaces the tools pack for a run — build_objective currently constructs
+# one telemetry plugin. Point teacher_student.yaml at this pack and edit
+# FULL_PROMPT (not CORE_TOOLS).
+
+signals:
+  - name: citation_match
+    source: citation_match
+    lookback_days: 7
+
+objective:
+  primary: citation_match
+  composite:
+    citation_match: 1.0
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: citation_set_mismatch

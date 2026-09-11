@@ -84,9 +84,7 @@ def wait_for_judge_metrics(
             print(f"[{judge_type}] Transient metrics error for {eval_id}: {exc}")
             last_payload = None
         if last_payload is not None:
-            rate = judge_pass_rate_from_metrics(
-                last_payload, judge_type=judge_type, judge_run_id=judge_run_id
-            )
+            rate = judge_pass_rate_from_metrics(last_payload, judge_type=judge_type, judge_run_id=judge_run_id)
             if rate is not None:
                 print(f"[{judge_type}] {eval_id}: {rate:.2f}")
                 return JudgeAnalysis(
@@ -101,6 +99,5 @@ def wait_for_judge_metrics(
         time.sleep(poll_interval_sec)
         elapsed += poll_interval_sec
     raise EvalCliError(
-        f"{judge_type} metrics for {eval_id} were not ready after {timeout_sec}s "
-        f"(judge_run_id={judge_run_id})"
+        f"{judge_type} metrics for {eval_id} were not ready after {timeout_sec}s (judge_run_id={judge_run_id})"
     )

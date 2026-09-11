@@ -1,0 +1,40 @@
+# Teacher-student experiment: the student's citation set is scored against the
+# teacher's on paired traces.
+#
+# Sibling of teacher_student.yaml, pointed at the citations pack instead of tools.
+# The pack (configs/packs/citations.yaml) supplies the citation_match signal,
+# objective.primary, its composite, and the screening gate. Edit FULL_PROMPT
+# (not CORE_TOOLS): citations come from the answer, not the first tool call.
+
+schema_version: 1
+mode: teacher_student
+packs: [citations]
+
+run:
+  dir: run_ts_citations
+  max_metric_calls: 10
+  eval_run_timeout_sec: 21600
+  seed_candidate: data/seed_candidate.json
+  editable_modules: [FULL_PROMPT]
+
+models:
+  student: claude_sonnet
+  teacher: claude_opus
+  reflection: OPEN_AI:GPT5_LATEST
+
+data:
+  eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 2
+
+objective:
+  frontier_type: hybrid
+  validation: []
+
+search:
+  offspring_count: 5
+  reflection_samples: 8
+  reflection_hamming_distance_k: null
+  global_token_cap: 4096

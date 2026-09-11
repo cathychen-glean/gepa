@@ -47,6 +47,8 @@ from glean_gepa.experiment_config import (
     screening_threshold,
 )
 from glean_gepa.fake_flow import build_fake_flow_components
+from glean_gepa.objectives import build_objective
+from glean_gepa.objectives.utils.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
 from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt, materialize_system_prompt
 from glean_gepa.prompt_constants import (
@@ -59,7 +61,6 @@ from glean_gepa.prompt_constants import (
     WRITING_CODE_KEY,
 )
 from glean_gepa.run_log import capture_run_log, log_section
-from glean_gepa.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
@@ -682,12 +683,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--student_model",
         default="gpt",
-        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus (default: gpt).",
+        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus.",
     )
     parser.add_argument(
         "--teacher_model",
         default="gpt",
-        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus (default: gpt).",
+        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus.",
     )
     parser.add_argument("--reflection_lm_model", default="OPEN_AI:GPT5_LATEST")
     parser.add_argument("--qe_project", default="dev-sandbox-334901")
@@ -718,7 +719,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--eval_run_timeout_sec",
         type=_nonnegative_int,
         default=21600,
-        help="Maximum time to wait for one Cortex eval run (default: 6 hours).",
+        help="Maximum seconds to wait for one Cortex eval run.",
     )
     parser.add_argument(
         "--cache_file",
@@ -866,9 +867,14 @@ def _build_adapter(
     adapter_kwargs: dict[str, Any],
     experiment: ExperimentConfig | None,
 ) -> TeacherStudentAdapter | SingleModelAdapter:
-    # load_experiment_config pins each mode to the one pack and primary objective
-    # its adapter can score, so no mode/objective compatibility check is needed here.
     kwargs = dict(adapter_kwargs)
+    objective = build_objective(
+        judging_mode,
+        experiment.signals if experiment is not None else None,
+        bigquery_client=kwargs.get("bigquery_client"),
+        lookback_days=int(kwargs.get("agentspan_lookback_days") or 1),
+    )
+    kwargs["objective"] = objective
     if experiment is not None:
         if experiment.primary_objective:
             kwargs["primary_objective"] = experiment.primary_objective
@@ -878,8 +884,6 @@ def _build_adapter(
         kwargs["constant_scores"] = constant_scores(experiment)
     if judging_mode == "teacher_student":
         if experiment is not None:
-            # Only teacher_student runs judges; the loader rejects a weighted judge
-            # signal in single_model mode.
             kwargs["pointwise_judges"] = pointwise_judges(experiment)
         return TeacherStudentAdapter(**kwargs, teacher_model=args.teacher_model)
     return SingleModelAdapter(**kwargs)

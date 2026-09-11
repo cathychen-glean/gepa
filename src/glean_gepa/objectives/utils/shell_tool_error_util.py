@@ -7,24 +7,34 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-DEFAULT_AGENTS_SPAN_TABLE = "scio-apps.scrubbed_agentspan.scrubbed_agentspan_*"
+from glean_gepa.objectives.utils.agentspan_query import (
+    DEFAULT_AGENTS_SPAN_TABLE,
+    DEFAULT_LOOKBACK_DAYS,
+    UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS,
+    QueryParameter,
+    default_date_range,
+    resolve_eval_run_date_range,
+    utc_today,
+    wildcard_shard_filter,
+)
+
+__all__ = [
+    "DEFAULT_AGENTS_SPAN_TABLE",
+    "DEFAULT_LOOKBACK_DAYS",
+    "UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS",
+    "QueryParameter",
+    "default_date_range",
+    "resolve_eval_run_date_range",
+    "utc_today",
+    "wildcard_shard_filter",
+]
+
 DEFAULT_EVALSET_ENTRIES_TABLE = "scio-apps.fact.evalset_entries"
-DEFAULT_LOOKBACK_DAYS = 1
 DEFAULT_EVAL_WORKFLOW_RUNS_TABLE = "scio-apps.fact.eval_workflow_runs"
 SHELL_SUCCESS_OBJECTIVE = "shell_success_rate"
 SHELL_SPAN_NAMES = ("Execute Action: Shell", "Execute Action: Shell Tool")
 SHELL_ACTION_IDS = ("Shell", "Shell Tool")
 FAILED_PROVIDER_STATUSES = frozenset({"failed", "error"})
-# `_TABLE_SUFFIX` is a UTC date. Always scan tomorrow's shard so a PDT "today"
-# or a just-after-midnight UTC eval is not scored as empty 0/0.
-UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS = 1
-
-
-@dataclass(frozen=True)
-class QueryParameter:
-    name: str
-    type_: str
-    value: str | list[str]
 
 
 @dataclass(frozen=True)
@@ -107,17 +117,6 @@ def is_shell_tool_error(
         or output_status_code == "ERROR"
         or provider in FAILED_PROVIDER_STATUSES
     )
-
-
-def wildcard_shard_filter(start_date_param: str, end_date_param: str, *, table_alias: str = "") -> str:
-    """Restrict a ``table_*`` wildcard to UTC date shards.
-
-    Compare ``_TABLE_SUFFIX`` as a string. Wrapping it in ``PARSE_DATE`` can stop
-    BigQuery from eliminating shards, which scans the full Agentspan history.
-    ``FORMAT_DATE`` on query parameters is constant-folded.
-    """
-    suffix = f"{table_alias}._TABLE_SUFFIX" if table_alias else "_TABLE_SUFFIX"
-    return f"{suffix} BETWEEN FORMAT_DATE('%Y%m%d', @{start_date_param}) AND FORMAT_DATE('%Y%m%d', @{end_date_param})"
 
 
 def _shell_execution_id_sql() -> str:
@@ -695,22 +694,6 @@ def _parse_bigquery_date(value: Any) -> date | None:
         return None
 
 
-def utc_today() -> date:
-    """Calendar date of the agentspan `_TABLE_SUFFIX` shards (UTC, not host local)."""
-    return datetime.now(timezone.utc).date()
-
-
-def default_date_range(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS, end_date: date | None = None) -> tuple[date, date]:
-    search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
-    return search_start, search_end
-
-
-def _search_window(*, lookback_days: int, end_date: date | None) -> tuple[date, date]:
-    base_end = end_date or utc_today()
-    search_end = base_end + timedelta(days=UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS)
-    return base_end - timedelta(days=lookback_days), search_end
-
-
 def build_eval_run_search_params(
     *,
     eval_id: str,
@@ -740,32 +723,6 @@ def build_shell_tool_error_query_params(
     if entry_ids:
         params.append(QueryParameter("entry_ids", "STRING", list(entry_ids)))
     return params
-
-
-def resolve_eval_run_date_range(
-    bounds_row: dict[str, Any] | None,
-    *,
-    lookback_days: int,
-    end_date: date | None = None,
-) -> tuple[date, date] | None:
-    if not bounds_row:
-        return None
-    min_ms = bounds_row.get("min_start_ms")
-    max_ms = bounds_row.get("max_start_ms")
-    if min_ms is None or max_ms is None:
-        return None
-
-    # `_TABLE_SUFFIX` is a UTC date. Convert the bounds in UTC too; using the
-    # host timezone can shift a just-after-midnight span into the prior day,
-    # causing the aggregate query to scan a different shard and return 0/0.
-    min_date = datetime.fromtimestamp(int(min_ms) / 1000, tz=timezone.utc).date()
-    max_date = datetime.fromtimestamp(int(max_ms) / 1000, tz=timezone.utc).date()
-    search_start, search_end = _search_window(lookback_days=lookback_days, end_date=end_date)
-    start_date = max(min_date, search_start)
-    end_date_resolved = min(max_date, search_end)
-    if start_date > end_date_resolved:
-        return None
-    return start_date, end_date_resolved
 
 
 def parse_shell_tool_error_example(raw: dict[str, Any]) -> ShellToolErrorExample:

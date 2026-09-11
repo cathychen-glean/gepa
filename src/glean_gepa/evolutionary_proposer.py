@@ -28,7 +28,6 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
-from glean_gepa.prompt import high_signal_core_tool_keys
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS, PROMPT_MODULE_DEFAULTS
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
@@ -59,11 +58,11 @@ def pick_modules_to_edit(
     """
     eligible = list(adapter.editable_modules)
     modules = [module for module in eligible if module not in CORE_TOOL_KEYS]
-    extra = [
-        key
-        for key in high_signal_core_tool_keys(eval_batch.trajectories if eval_batch is not None else None)
-        if key in eligible
-    ]
+    extra_keys: list[str] = []
+    keys_fn = getattr(adapter, "high_signal_core_tool_keys", None)
+    if callable(keys_fn):
+        extra_keys = list(cast(list[str], keys_fn(eval_batch.trajectories if eval_batch is not None else None)))
+    extra = [key for key in extra_keys if key in eligible]
     modules.extend(key for key in extra if key not in modules)
     return modules
 

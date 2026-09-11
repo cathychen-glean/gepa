@@ -1,0 +1,39 @@
+# Single-model experiment: the student's agent-loop count is scored (inverted,
+# gated on correctness) from loop telemetry. No teacher eval runs.
+#
+# Sibling of single_model.yaml, pointed at the loops pack instead of shell.
+# The pack (configs/packs/loops.yaml) supplies the loop_efficiency signal,
+# objective.primary, its composite, and the screening gate. QUERY_CANONICAL
+# focused sets re-ask the same queries; edit WRITING_CODE.
+
+schema_version: 1
+mode: single_model
+packs: [loops]
+
+run:
+  dir: run_sm_loops
+  max_metric_calls: 10
+  eval_run_timeout_sec: 21600
+  seed_candidate: data/seed_candidate.json
+  editable_modules: [WRITING_CODE]
+
+models:
+  student: gpt
+  reflection: OPEN_AI:GPT5_LATEST
+
+data:
+  eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 2
+
+objective:
+  frontier_type: objective
+  validation: []
+
+search:
+  offspring_count: 5
+  reflection_samples: 8
+  reflection_hamming_distance_k: null
+  global_token_cap: 4096

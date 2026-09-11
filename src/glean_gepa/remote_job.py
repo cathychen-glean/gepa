@@ -50,10 +50,7 @@ def build_runner_args(env: Mapping[str, str]) -> tuple[list[str], Path]:
 
     args = list(parsed)
     run_id = _safe_run_id(
-        env.get("GEPA_RUN_ID")
-        or env.get("CLOUD_RUN_EXECUTION")
-        or env.get("CLOUD_RUN_JOB")
-        or "manual"
+        env.get("GEPA_RUN_ID") or env.get("CLOUD_RUN_EXECUTION") or env.get("CLOUD_RUN_JOB") or "manual"
     )
     run_dir = Path(env.get("GEPA_RUN_ROOT", DEFAULT_RUN_ROOT)).expanduser() / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

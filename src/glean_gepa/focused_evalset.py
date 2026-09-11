@@ -15,7 +15,7 @@ from typing import Any
 
 from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.evalcli_client import EvalCliClient, EvalCliError, min_ingested_eval_set_entries
-from glean_gepa.shell_tool_error_util import fetch_evalset_entry_tracking
+from glean_gepa.objectives.utils.shell_tool_error_util import fetch_evalset_entry_tracking
 
 SESSION_BUCKET_TYPE = "SESSION"
 QUERY_CANONICAL_BUCKET_TYPE = "QUERY_CANONICAL"
@@ -171,9 +171,7 @@ def focused_eval_set_retry_version(version: str) -> str:
 def _source_session_token(source_entry: Mapping[str, Any]) -> str | None:
     tracking = source_entry.get("sourceTrackingInfo") or {}
     token = (
-        source_entry.get("stt")
-        or source_entry.get("session_tracking_token")
-        or tracking.get("sessionTrackingToken")
+        source_entry.get("stt") or source_entry.get("session_tracking_token") or tracking.get("sessionTrackingToken")
     )
     return str(token) if token else None
 
@@ -248,9 +246,7 @@ def build_upload_entry(
         ),
         "stt": _source_session_token(source_entry),
         "qtt": (
-            source_entry.get("qtt")
-            or source_entry.get("query_tracking_token")
-            or tracking.get("queryTrackingToken")
+            source_entry.get("qtt") or source_entry.get("query_tracking_token") or tracking.get("queryTrackingToken")
         ),
         "runId": source_entry.get("runId") or source_entry.get("workflow_run_id") or tracking.get("runId"),
         "query": query,
@@ -286,9 +282,7 @@ def _enrich_source_entries_with_tracking(
         entry_ids=missing_ids,
         deployment_ids=deployment_ids or None,
     )
-    print(
-        f"[Focused eval set] Resolved stt for {len(tracking_by_id)}/{len(missing_ids)} entries from BigQuery"
-    )
+    print(f"[Focused eval set] Resolved stt for {len(tracking_by_id)}/{len(missing_ids)} entries from BigQuery")
     for entry in enriched:
         extra = tracking_by_id.get(str(entry.get("id") or ""))
         if extra:
@@ -396,9 +390,7 @@ def ensure_focused_eval_set(
             deployment_ids=deployment_ids,
         )
     upload_entries = [
-        entry
-        for source in selected
-        if (entry := build_upload_entry(source, bucket_type=bucket_type)) is not None
+        entry for source in selected if (entry := build_upload_entry(source, bucket_type=bucket_type)) is not None
     ]
     if not upload_entries:
         missing = "queries" if bucket_type == QUERY_CANONICAL_BUCKET_TYPE else "session tracking tokens"

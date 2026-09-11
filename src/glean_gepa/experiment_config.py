@@ -8,30 +8,24 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from glean_gepa.adapter_types import JudgingMode, PointwiseJudge
-from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
-from glean_gepa.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
+from glean_gepa.objectives import (
+    MODE_DEFAULT_PACK,
+    is_registered_telemetry_source,
+    is_telemetry_source,
+)
 
 CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 PACKS_DIR = CONFIGS_DIR / "packs"
 DEFAULT_EVAL_SET_NAME = "Glean Chat V2 Medium"
 DEFAULT_DEPLOYMENT_IDS = ("scio-prod",)
 
-# Each mode can score exactly one signal: teacher_student compares the student's
-# first tool call against the teacher's, single_model reads shell telemetry. The
-# adapters have no scoring path for the other mode's signal, so attaching the
-# wrong pack would silently weight a dimension that is never computed.
-MODE_PACK: dict[JudgingMode, str] = {
-    "teacher_student": "tools",
-    "single_model": "shell",
-}
-MODE_PRIMARY_OBJECTIVE: dict[JudgingMode, str] = {
-    "teacher_student": TOOL_ALIGNMENT_OBJECTIVE,
-    "single_model": SHELL_SUCCESS_OBJECTIVE,
-}
+# Mode is the eval topology. Telemetry sources are registered per mode in
+# glean_gepa.objectives; a pack is valid when its telemetry sources are.
+SUPPORTED_MODES: tuple[JudgingMode, ...] = ("single_model", "teacher_student")
 
 # Sources whose signal value is read straight from telemetry or the config, as
 # opposed to a judge run that has to be started and awaited.
-_DIRECTLY_SCORED_SOURCES = frozenset({"tool_match", "shell_telemetry", "constant"})
+_CONSTANT_SOURCE = "constant"
 
 # Only teacher_student has the judge plumbing to start, await, and cache a judge run.
 _MODES_WITH_POINTWISE_JUDGES = frozenset({"teacher_student"})
@@ -96,14 +90,13 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     if schema_version != 1:
         raise ExperimentConfigError(f"unsupported schema_version {schema_version}")
     mode = raw.get("mode")
-    if mode not in MODE_PACK:
-        raise ExperimentConfigError(f"mode must be one of {', '.join(sorted(MODE_PACK))}, got {mode!r}")
-    pack_names = _require_mode_pack(raw.get("packs"), mode=mode)
-    pack = _load_pack(pack_names[0], mode_path=source_path)
+    if mode not in SUPPORTED_MODES:
+        raise ExperimentConfigError(f"mode must be one of {', '.join(sorted(SUPPORTED_MODES))}, got {mode!r}")
+    pack_names, pack = _load_mode_packs(raw.get("packs"), mode=mode, mode_path=source_path)
     merged_signals = _merge_signals(pack.get("signals") or [], raw.get("signals") or [])
     merged_objective = _overlay(pack.get("objective") or {}, raw.get("objective") or {})
     merged_screening = _overlay(pack.get("screening") or {}, raw.get("screening") or {})
-    _require_mode_primary_objective(merged_objective.get("primary"), mode=mode)
+    _require_mode_primary_objective(merged_objective.get("primary"), merged_signals, mode=mode)
     _require_scorable_composite_signals(merged_objective, merged_signals, mode=mode)
     _require_normalized_composite_weights(merged_objective.get("composite"))
     _require_unit_valued_weighted_constants(merged_objective, merged_signals)
@@ -193,7 +186,7 @@ def constant_scores(config: ExperimentConfig) -> dict[str, float]:
     return {
         str(signal["name"]): float(signal.get("value", 0.0))
         for signal in config.signals
-        if signal.get("source") == "constant" and signal.get("name")
+        if signal.get("source") == _CONSTANT_SOURCE and signal.get("name")
     }
 
 
@@ -207,7 +200,7 @@ def agentspan_lookback_days(config: ExperimentConfig) -> int | None:
     lookbacks = [
         int(signal["lookback_days"])
         for signal in config.signals
-        if signal.get("source") in {"tool_match", "shell_telemetry"} and signal.get("lookback_days") is not None
+        if is_telemetry_source(str(signal.get("source") or "")) and signal.get("lookback_days") is not None
     ]
     return max(lookbacks) if lookbacks else None
 
@@ -236,24 +229,35 @@ def _require_int(raw: Any, *, field: str, default: int) -> int:
         raise ExperimentConfigError(f"{field} must be an integer, got {raw!r}") from exc
 
 
-def _require_mode_pack(raw_packs: Any, *, mode: JudgingMode) -> tuple[str, ...]:
-    """Pin the mode to its one scorable pack, defaulting when ``packs`` is omitted."""
-    required = MODE_PACK[mode]
+def _load_mode_packs(raw_packs: Any, *, mode: JudgingMode, mode_path: Path) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """Load packs whose telemetry sources are registered for ``mode``."""
     if raw_packs is None:
-        return (required,)
-    if isinstance(raw_packs, str):
-        raise ExperimentConfigError(f"packs must be a list, got {raw_packs!r}")
-    packs = tuple(str(name) for name in raw_packs)
-    if packs == (required,):
-        return packs
-    owning_mode = {pack: owner for owner, pack in MODE_PACK.items()}
-    misplaced = [
-        f"{name} is scorable only in {owning_mode[name]} mode"
-        for name in packs
-        if name in owning_mode and owning_mode[name] != mode
-    ]
-    message = f"mode {mode} supports only packs: [{required}], got {list(packs)}"
-    raise ExperimentConfigError(f"{message} ({'; '.join(misplaced)})" if misplaced else message)
+        names = (MODE_DEFAULT_PACK[mode],)
+    else:
+        if isinstance(raw_packs, str):
+            raise ExperimentConfigError(f"packs must be a list, got {raw_packs!r}")
+        names = tuple(str(name) for name in raw_packs)
+        if not names:
+            raise ExperimentConfigError(f"mode {mode} requires at least one pack")
+    merged_signals: list[Any] = []
+    merged_objective: dict[str, Any] = {}
+    merged_screening: dict[str, Any] = {}
+    for name in names:
+        pack = _load_pack(name, mode_path=mode_path)
+        for signal in pack.get("signals") or []:
+            if not isinstance(signal, dict):
+                continue
+            source = signal.get("source")
+            if source in {_CONSTANT_SOURCE, "cortex_judge", None}:
+                continue
+            if not is_registered_telemetry_source(mode, str(source)):
+                raise ExperimentConfigError(
+                    f"mode {mode} cannot score pack {name!r} (source {source!r} is not registered for this mode)"
+                )
+        merged_signals.extend(pack.get("signals") or [])
+        merged_objective = _overlay(merged_objective, pack.get("objective") or {})
+        merged_screening = _overlay(merged_screening, pack.get("screening") or {})
+    return names, {"signals": merged_signals, "objective": merged_objective, "screening": merged_screening}
 
 
 def _pointwise_judges(signals: list[dict[str, Any]]) -> list[PointwiseJudge]:
@@ -286,7 +290,7 @@ def _scorable_signal_names(signals: list[dict[str, Any]], *, mode: JudgingMode) 
     for signal in signals:
         if signal.get("enabled", True) is False:
             continue
-        if signal.get("source") in _DIRECTLY_SCORED_SOURCES:
+        if signal.get("source") == _CONSTANT_SOURCE or is_registered_telemetry_source(mode, signal.get("source")):
             names.add(str(signal["name"]))
     return names
 
@@ -363,7 +367,7 @@ def _require_unit_valued_weighted_constants(objective: Mapping[str, Any], signal
     values = {
         str(signal["name"]): float(signal.get("value", 0.0))
         for signal in signals
-        if signal.get("source") == "constant" and signal.get("name")
+        if signal.get("source") == _CONSTANT_SOURCE and signal.get("name")
     }
     offenders = sorted(
         f"{name}={values[name]:g}" for name in composite if name in values and abs(values[name] - 1.0) > 1e-6
@@ -375,10 +379,21 @@ def _require_unit_valued_weighted_constants(objective: Mapping[str, Any], signal
         )
 
 
-def _require_mode_primary_objective(primary: Any, *, mode: JudgingMode) -> None:
-    required = MODE_PRIMARY_OBJECTIVE[mode]
-    if primary is not None and str(primary) != required:
-        raise ExperimentConfigError(f"mode {mode} can only score objective.primary={required}, got {str(primary)!r}")
+def _require_mode_primary_objective(primary: Any, signals: list[dict[str, Any]], *, mode: JudgingMode) -> None:
+    telemetry_names = {
+        str(signal["name"])
+        for signal in signals
+        if signal.get("enabled", True) is not False
+        and is_registered_telemetry_source(mode, signal.get("source"))
+        and signal.get("name")
+    }
+    if primary is None:
+        return
+    if str(primary) not in telemetry_names:
+        scorable = ", ".join(sorted(telemetry_names)) or "(none)"
+        raise ExperimentConfigError(
+            f"mode {mode} cannot score objective.primary={str(primary)!r}; scorable telemetry signals are {scorable}"
+        )
 
 
 def _load_pack(name: str, *, mode_path: Path) -> dict[str, Any]:

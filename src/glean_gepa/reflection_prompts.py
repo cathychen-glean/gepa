@@ -23,6 +23,22 @@ FULL_PROMPT_TEACHER_STUDENT_RESPONSIBILITY = (
     "Propose a complete updated prompt with minimal deltas."
 )
 
+FULL_PROMPT_CITATION_MATCH_RESPONSIBILITY = (
+    "You are editing the ENTIRE student system prompt as a single string. Prioritize the "
+    "Citation Contract, [[citation_instructions]], and response-guideline citation rules so "
+    "the student cites the same sources as the teacher. Other sections may change only if they "
+    f"cause missing or extra citations. Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} "
+    "Propose a complete updated prompt with minimal deltas."
+)
+
+RULES_EXT_CITATION_MATCH_RESPONSIBILITY = (
+    "You are writing at most two markdown bullets that will be appended after the existing "
+    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
+    "existing Rules, do not add a heading, and do not exceed two bullets. Target citation "
+    "mismatches (missing teacher sources, extra student sources, or dropped citationId values "
+    "after filtering SDK results). Keep each bullet operational and concise."
+)
+
 RULES_EXT_RESPONSIBILITY = (
     "You are writing at most two markdown bullets that will be appended after the existing "
     "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
@@ -35,6 +51,21 @@ WRITING_CODE_SINGLE_MODEL_RESPONSIBILITY = (
     "Focus ONLY on coding instructions that affect shell tool reliability: SDK call patterns, "
     "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
     f"Use shell error examples as evidence. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
+)
+
+WRITING_CODE_LOOP_EFFICIENCY_RESPONSIBILITY = (
+    "Focus ONLY on coding and execution-discipline instructions that reduce extra agent loops "
+    "without lowering correctness. Batch independent SDK calls, stop once the answer is grounded, "
+    "and never skip the search or citation work the question requires. "
+    f"{CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
+)
+
+FULL_PROMPT_LOOP_EFFICIENCY_RESPONSIBILITY = (
+    "You are editing the ENTIRE student system prompt as a single string. Prioritize execution "
+    "discipline so the student uses as few tool loops as possible while keeping the answer correct. "
+    "Do not remove search-first, citation, or accuracy rules to save loops. "
+    f"Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} "
+    "Propose a complete updated prompt with minimal deltas."
 )
 
 FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the failed examples."
@@ -76,12 +107,30 @@ def teacher_student_reflection_prompt(module_name: str) -> str:
     return DEFAULT_MODULE_RESPONSIBILITY
 
 
+def teacher_student_citation_reflection_prompt(module_name: str) -> str:
+    """Module responsibility text for teacher-student citation-set reflection."""
+    if module_name == FULL_PROMPT_KEY:
+        return FULL_PROMPT_CITATION_MATCH_RESPONSIBILITY
+    if module_name == RULES_EXT_KEY:
+        return RULES_EXT_CITATION_MATCH_RESPONSIBILITY
+    return DEFAULT_MODULE_RESPONSIBILITY
+
+
 def single_model_reflection_prompt(module_name: str) -> str:
     """Module responsibility text for single-model shell-error reflection."""
     if module_name == WRITING_CODE_KEY:
         return WRITING_CODE_SINGLE_MODEL_RESPONSIBILITY
     if module_name in CORE_TOOL_KEYS:
         return core_tool_reflection_prompt(module_name)
+    return DEFAULT_MODULE_RESPONSIBILITY
+
+
+def single_model_loop_reflection_prompt(module_name: str) -> str:
+    """Module responsibility text for single-model loop-efficiency reflection."""
+    if module_name == WRITING_CODE_KEY:
+        return WRITING_CODE_LOOP_EFFICIENCY_RESPONSIBILITY
+    if module_name == FULL_PROMPT_KEY:
+        return FULL_PROMPT_LOOP_EFFICIENCY_RESPONSIBILITY
     return DEFAULT_MODULE_RESPONSIBILITY
 
 

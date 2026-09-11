@@ -21,76 +21,24 @@ from glean_gepa.al_adapter import (
     ALRunner,
     GleanAdapterBase,
     ReflectiveExample,
-    ReflectiveExampleInputs,
-    ReflectiveExampleMetrics,
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
-from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, resolve_eval_run_target
+from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_judge_metrics,
 )
-from glean_gepa.prompt import compile_encoded_prompt, is_core_tool_span, tool_description_override_key
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS, RULES_EXT_KEY, WRITING_CODE_KEY
-from glean_gepa.reflection_prompts import teacher_student_reflection_prompt
-from glean_gepa.run_log import (
-    format_eval_entry_report,
-    format_high_signal_selection_report,
-    log_section,
-    selected_entry_ids_from_examples,
-)
-from glean_gepa.tool_match_util import (
-    TOOL_ALIGNMENT_OBJECTIVE,
-    EvalRunToolMatchAnalysis,
-    empty_tool_match_analysis,
-    fetch_eval_run_tool_match_analysis,
-    first_tool_mismatch_pair,
-    log_tool_match_analysis,
-    require_compared_eval_entries,
-    select_first_tool_mismatch_groups,
-)
+from glean_gepa.objectives import TeacherStudentObjective
+from glean_gepa.objectives.tool_match import FirstToolMatchObjective
+from glean_gepa.prompt import compile_encoded_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
-PRIMARY_OBJECTIVE = TOOL_ALIGNMENT_OBJECTIVE
 COMPLETENESS_DIMENSION = "completeness"
 # Declared but shipped disabled in configs/teacher_student.yaml.
 COMPLETENESS_JUDGE = PointwiseJudge(COMPLETENESS_DIMENSION, COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS)
 POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = ()
-DEFAULT_COMPOSITE_WEIGHTS = {TOOL_ALIGNMENT_OBJECTIVE: 1.0}
-DEFAULT_CONSTANT_SCORES: dict[str, float] = {}
-
-
-def _rollout_output(
-    *,
-    entry_id: str,
-    deployment_id: str,
-    query: str,
-    student_tools: list[str],
-    teacher_tools: list[str],
-    student_tool_calls: int | None = None,
-    teacher_tool_calls: int | None = None,
-) -> TeacherStudentALRolloutOutput:
-    """One rollout row. Tool-call counts default to the listed events."""
-    return {
-        "deployment_id": deployment_id,
-        "query": query,
-        "student_answer": "",
-        "student_tool_events": student_tools,
-        "student_loops": 0,
-        "student_tool_calls": len(student_tools) if student_tool_calls is None else student_tool_calls,
-        "student_tool_errors": 0,
-        "student_input_tokens": 0,
-        "student_output_tokens": 0,
-        "student_latency_ms": None,
-        "teacher_answer": "",
-        "teacher_tool_events": teacher_tools,
-        "teacher_loops": 0,
-        "teacher_tool_calls": len(teacher_tools) if teacher_tool_calls is None else teacher_tool_calls,
-        "teacher_input_tokens": 0,
-        "teacher_output_tokens": 0,
-        "entry_id": entry_id,
-    }
 
 
 @dataclass(frozen=True)
@@ -101,10 +49,9 @@ class _StartedPair:
 
 
 class TeacherStudentAdapter(GleanAdapterBase):
-    """Optimize instructions from teacher-vs-student tool-usage comparisons."""
+    """Optimize instructions from paired teacher-vs-student evaluations."""
 
     supports_high_signal_eval = True
-    telemetry_dimensions = (TOOL_ALIGNMENT_OBJECTIVE,)
 
     def __init__(
         self,
@@ -117,17 +64,22 @@ class TeacherStudentAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
-        primary_objective: str = PRIMARY_OBJECTIVE,
+        primary_objective: str | None = None,
         default_frontier_type: str = "hybrid",
         composite_weights: dict[str, float] | None = None,
         constant_scores: dict[str, float] | None = None,
         pointwise_judges: Sequence[PointwiseJudge] | None = None,
+        objective: TeacherStudentObjective | None = None,
     ):
         self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
-        self._tool_match_cache: dict[tuple[str, str], EvalRunToolMatchAnalysis] = {}
+        self.objective = objective or FirstToolMatchObjective(
+            bigquery_client=bigquery_client,
+            lookback_days=agentspan_lookback_days,
+        )
+        self.telemetry_dimensions = self.objective.telemetry_dimensions
         self._judge_runs: dict[tuple[str, str], str] = {}
         self._judge_cache: dict[tuple[str, str], JudgeAnalysis] = {}
         super().__init__(
@@ -135,38 +87,29 @@ class TeacherStudentAdapter(GleanAdapterBase):
             thresholds=thresholds,
             student_model=student_model,
             evaluate_fn=self._evaluate_teacher_student,
-            failure_pattern_fn=self._create_failure_pattern,
-            reflective_example_fn=self._build_reflective_example,
-            reflection_prompt_fn=teacher_student_reflection_prompt,
-            reflective_metrics_fn=self._format_reflective_metrics,
-            failure_label="HIGH-SIGNAL FAILURES (teacher vs student tool match)",
-            primary_objective=primary_objective,
+            failure_pattern_fn=self.objective.failure_pattern,
+            reflective_example_fn=self.objective.build_reflective_example,
+            reflection_prompt_fn=self.objective.reflection_prompt,
+            reflective_metrics_fn=self.objective.format_reflective_metrics,
+            failure_label=self.objective.failure_label,
+            primary_objective=primary_objective or self.objective.name,
             default_frontier_type=default_frontier_type,
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
-            composite_weights=dict(DEFAULT_COMPOSITE_WEIGHTS if composite_weights is None else composite_weights),
-            constant_scores=dict(DEFAULT_CONSTANT_SCORES if constant_scores is None else constant_scores),
+            composite_weights=dict({self.objective.name: 1.0} if composite_weights is None else composite_weights),
+            constant_scores=dict(constant_scores or {}),
             extra_scorable_dimensions={judge.name for judge in self.pointwise_judges},
             cache_file=cache_file,
         )
 
-    def _get_or_fetch_tool_match_analysis(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunToolMatchAnalysis:
-        cache_key = (teacher_eval_id, student_eval_id)
-        cached = self._tool_match_cache.get(cache_key)
-        if cached is not None:
-            print(f"[Cache HIT] Using cached tool match analysis for {teacher_eval_id} vs {student_eval_id}")
-            return cached
-        if self.bigquery_client is None:
-            analysis = empty_tool_match_analysis(teacher_eval_id, student_eval_id)
-        else:
-            analysis = fetch_eval_run_tool_match_analysis(
-                self.bigquery_client,
-                teacher_eval_id=teacher_eval_id,
-                student_eval_id=student_eval_id,
-                lookback_days=self.agentspan_lookback_days,
-            )
-        self._tool_match_cache[cache_key] = analysis
+    @property
+    def _analysis_cache(self) -> dict[tuple[str, str], Any]:
+        return self.objective.analysis_cache
+
+    def _get_or_fetch_analysis(self, teacher_eval_id: str, student_eval_id: str):
+        self.objective.bigquery_client = self.bigquery_client
+        self.objective.lookback_days = self.agentspan_lookback_days
+        analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()
-        print(f"[Cache MISS] Fetched tool match analysis for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 
     def _evaluate_teacher_student(
@@ -223,7 +166,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 self.runner.evalcli,
                 al_data_inst,
                 bigquery_client=self.bigquery_client,
-                bucket_type=QUERY_CANONICAL_BUCKET_TYPE,
+                bucket_type=self.objective.focused_bucket_type,
             )
             if target is None:
                 print(
@@ -445,7 +388,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         return [self._finish_batch_evals(started, capture_traces) for started in all_started]
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
-        """Keep every parent entry whose first scored tools disagree."""
+        """Keep every parent entry the objective marks as high-signal."""
         grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
         seen: set[str] = set()
         for trajectory in eval_batch.trajectories or []:
@@ -454,13 +397,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             entry_id = output.get("entry_id")
             if not entry_id or entry_id in seen:
                 continue
-            if (
-                first_tool_mismatch_pair(
-                    output.get("teacher_tool_events"),
-                    output.get("student_tool_events"),
-                )
-                is None
-            ):
+            if not self.objective.is_high_signal(output):
                 continue
             seen.add(entry_id)
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
@@ -487,138 +424,22 @@ class TeacherStudentAdapter(GleanAdapterBase):
         k: int | None,
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[ReflectiveExample]]:
-        """Build reflection examples from the most frequent first-tool mismatch groups.
+        """Build reflection examples from the objective's high-signal selection.
 
         ``k`` and ``error_hamming_distance_k`` are ignored: the proposer only sees
         this frequency-capped mismatch set (at most 20 entries, or the full
         most-frequent group if that group is larger).
         """
         del k, error_hamming_distance_k
-        if not eval_batch.trajectories:
-            return {comp: [] for comp in components_to_update}
-
-        trajectories = [cast(TeacherStudentALTrajectory, trajectory) for trajectory in eval_batch.trajectories]
-        mismatch_keys = [
-            first_tool_mismatch_pair(
-                trajectory["output"].get("teacher_tool_events"),
-                trajectory["output"].get("student_tool_events"),
-            )
-            for trajectory in trajectories
-        ]
-        selected_indices, selected_groups = select_first_tool_mismatch_groups(mismatch_keys)
-        selected = [trajectories[index] for index in selected_indices]
-        selected_pairs = [mismatch_keys[index] for index in selected_indices]
-        examples: dict[str, list[ReflectiveExample]] = {}
-        for component_name in components_to_update:
-            chosen = selected
-            if component_name in CORE_TOOL_KEYS:
-                chosen = [
-                    trajectory
-                    for trajectory, pair in zip(selected, selected_pairs, strict=True)
-                    if pair is not None
-                    and any(tool_description_override_key(name) == component_name for name in pair if name)
-                ]
-            elif component_name == RULES_EXT_KEY:
-                chosen = [
-                    trajectory
-                    for trajectory, pair in zip(selected, selected_pairs, strict=True)
-                    if pair is not None and not any(is_core_tool_span(name) for name in pair if name)
-                ]
-            examples[component_name] = [
-                self._build_reflective_example(component_name, trajectory, candidate) for trajectory in chosen
-            ]
-        mismatch_count = sum(pair is not None for pair in mismatch_keys)
-        selected_entry_ids = [
-            str(trajectory["output"].get("entry_id", ""))
-            for trajectory in selected
-            if trajectory["output"].get("entry_id")
-        ]
-        log_section(
-            "REFLECTION: teacher vs student tool sequences",
-            format_eval_entry_report(trajectories),
-        )
-        log_section(
-            "REFLECTION: high-signal dataset",
-            format_high_signal_selection_report(
-                selected_groups=selected_groups,
-                selected_entry_ids=selected_entry_ids,
-                selected_count=len(selected_indices),
-                total_mismatch_count=mismatch_count,
-                module_entry_ids={
-                    module: selected_entry_ids_from_examples(module_examples)
-                    for module, module_examples in examples.items()
-                },
-            ),
-        )
-        return examples
-
-    def _create_failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
-        output = trajectory["output"]
-        tool_alignment = trajectory.get("objective_scores", {}).get("tool_alignment", 1.0)
-        return (
-            int(tool_alignment < 0.7),
-            int(
-                first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-                is not None
-            ),
-            int(output.get("student_tool_errors", 0) > 0),
+        return self.objective.make_reflective_dataset(
+            candidate,
+            eval_batch,
+            components_to_update,
+            self.objective.build_reflective_example,
         )
 
-    def _build_reflective_example(
-        self,
-        component_name: str,
-        trajectory: TeacherStudentALTrajectory,
-        candidate: dict[str, str],
-    ) -> ReflectiveExample:
-        output = trajectory["output"]
-        objective_scores = trajectory.get("objective_scores", {})
-        tool_alignment = objective_scores.get("tool_alignment", trajectory["score"])
-        completeness = objective_scores.get("completeness", 0.0)
-        student_tools = output.get("student_tool_events", [])
-        teacher_tools = output.get("teacher_tool_events", [])
-        mismatch = first_tool_mismatch_pair(teacher_tools, student_tools)
-        feedback_parts = []
-        if mismatch is not None:
-            teacher_first, student_first = mismatch
-            feedback_parts.append(
-                f"First-tool mismatch: teacher used {teacher_first or '(none)'} "
-                f"and student used {student_first or '(none)'}."
-            )
-        if tool_alignment < 1.0:
-            feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
-        if completeness < 0.7:
-            feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
-
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
-                "student_answer": output.get("student_answer", ""),
-                "teacher_answer": output.get("teacher_answer", ""),
-                "student_tools": student_tools,
-                "teacher_tools": teacher_tools,
-            },
-            "Action Inputs": [],
-            "Execution Errors": [],
-            "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
-            "Metrics": {
-                "score": trajectory["score"],
-                "tool_alignment": tool_alignment,
-                "completeness": completeness,
-            },
-        }
-
-    @staticmethod
-    def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str:
-        return (
-            f"score={metrics['score']:.2f}, tool_alignment={metrics.get('tool_alignment', metrics['score']):.2f}, "
-            f"completeness={metrics.get('completeness', 0.0):.2f}"
-        )
+    def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
+        return self.objective.high_signal_core_tool_keys(trajectories)
 
     def _finish_batch_evals(
         self,
@@ -642,17 +463,13 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     "teacher_eval_run_id": pair.teacher_eval_id,
                 }
             )
-            tool_match_analysis = self._get_or_fetch_tool_match_analysis(pair.teacher_eval_id, pair.student_eval_id)
+            analysis = self._get_or_fetch_analysis(pair.teacher_eval_id, pair.student_eval_id)
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             if is_focused_eval:
-                matching = sum(1 for metrics in tool_match_analysis.per_entry.values() if metrics.tools_match)
-                focused_alignment_rates.append(matching / len(requested_entry_ids))
-                if not tool_match_analysis.per_entry:
-                    continue
+                focused_alignment_rates.append(self.objective.focused_pass_rate(analysis, requested_entry_ids))
             else:
-                require_compared_eval_entries(tool_match_analysis)
-                log_tool_match_analysis(tool_match_analysis)
+                self.objective.validate_full_eval(analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
             query = f"{al_data_inst.get('eval_set_name', '')}:{al_data_inst.get('eval_set_version', '')}"
             student_judges = {
@@ -667,69 +484,36 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     f"teacher {pair.teacher_eval_id}={teacher_analysis.aggregate:.2f}"
                 )
 
-            # A full-validation eval-set item stands for the whole eval run, not for
-            # each of its entries. The engine has one val ID per configured eval set
-            # and zips it against these rows with strict=False, so entry-level rows
-            # let one arbitrary entry's 0/1 outcome be recorded as the eval set's
-            # validation score. Entry-level rows are kept for trace-capturing
-            # training evals, where reflection needs the individual examples.
-            if not is_focused_eval and not capture_traces:
-                # entry_id None marks a run-level row, selecting the judge aggregate
-                # below. Tool lists stay empty so first_tool_mismatch_pair sees no
-                # first tool to compare; the counts are run totals.
-                scored_rows = [
-                    (
-                        None,
-                        tool_match_analysis.aggregate.tool_match_rate,
-                        _rollout_output(
-                            entry_id=query,
-                            deployment_id=deployment_id,
-                            query=query,
-                            student_tools=[],
-                            teacher_tools=[],
-                            student_tool_calls=sum(
-                                len(m.student_tools) for m in tool_match_analysis.per_entry.values()
-                            ),
-                            teacher_tool_calls=sum(
-                                len(m.teacher_tools) for m in tool_match_analysis.per_entry.values()
-                            ),
-                        ),
-                    )
-                ]
-            else:
-                scored_rows = [
-                    (
-                        entry_id,
-                        float(tool_match.tools_match),
-                        _rollout_output(
-                            entry_id=entry_id,
-                            deployment_id=deployment_id,
-                            query=query,
-                            student_tools=list(tool_match.student_tools),
-                            teacher_tools=list(tool_match.teacher_tools),
-                        ),
-                    )
-                    for entry_id, tool_match in tool_match_analysis.per_entry.items()
-                ]
+            scored_rows = self.objective.scored_rows(
+                analysis,
+                focused=is_focused_eval,
+                capture_traces=capture_traces,
+                query=query,
+                deployment_id=deployment_id,
+            )
+            if not scored_rows:
+                continue
 
-            for entry_id, tool_alignment, output in scored_rows:
+            for row in scored_rows:
+                output = cast(TeacherStudentALRolloutOutput, dict(row.output))
                 all_outputs.append(output)
                 objective_score = {
                     **self.constant_scores,
-                    TOOL_ALIGNMENT_OBJECTIVE: tool_alignment,
+                    **row.dimension_scores,
                     **{
-                        name: analysis.aggregate
-                        if entry_id is None
-                        else analysis.per_entry.get(entry_id, analysis.aggregate)
-                        for name, analysis in student_judges.items()
+                        name: judge_analysis.aggregate
+                        if row.entry_id is None
+                        else judge_analysis.per_entry.get(row.entry_id, judge_analysis.aggregate)
+                        for name, judge_analysis in student_judges.items()
                     },
                 }
                 score = self.composite_score(objective_score)
                 all_scores.append(score)
                 all_objective_scores.append(objective_score)
                 if capture_traces and all_trajectories is not None:
+                    trajectory_data = {**al_data_inst, **row.data_overrides}
                     trajectory: TeacherStudentALTrajectory = {
-                        "data": al_data_inst,
+                        "data": cast(TeacherStudentALDataInst, trajectory_data),
                         "output": output,
                         "score": score,
                         "objective_scores": objective_score,
@@ -749,7 +533,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             if summary is None:
                 summary = {judge.name: 0.0 for judge in self.pointwise_judges}
                 summary.update(self.constant_scores)
-            summary[TOOL_ALIGNMENT_OBJECTIVE] = sum(focused_alignment_rates) / len(focused_alignment_rates)
+            summary[self.objective.name] = sum(focused_alignment_rates) / len(focused_alignment_rates)
         if summary is not None and started:
             for judge in self.pointwise_judges:
                 teacher_scores = [

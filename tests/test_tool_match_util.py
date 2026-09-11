@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.tool_match_util import (
+from glean_gepa.objectives.utils.tool_match_util import (
     SKIPPED_TOOL_NAMES,
     NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
@@ -19,8 +19,8 @@ from glean_gepa.tool_match_util import (
     parse_tool_match_entry_metrics,
     require_compared_eval_entries,
     scored_tool_sequence,
-    select_first_tool_mismatch_groups,
 )
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
@@ -108,19 +108,19 @@ def test_aggregate_and_empty_analysis():
         require_compared_eval_entries(analysis)
 
 
-def test_select_first_tool_mismatch_groups():
-    capped, groups = select_first_tool_mismatch_groups(
+def test_select_mismatch_groups():
+    capped, groups = select_mismatch_groups(
         [("x", "y")] * 12 + [("y", "x")] * 8 + [("a", "b")] * 6 + [("c", "d")] * 5 + [None]
     )
     assert len(capped) == 20
     assert groups == [("x", "y", 12), ("y", "x", 8)]
 
-    skipped, skipped_groups = select_first_tool_mismatch_groups(
+    skipped, skipped_groups = select_mismatch_groups(
         [("x", "y")] * 10 + [("y", "x")] * 8 + [("a", "b")] * 7 + [("e", "f")] * 2
     )
     assert len(skipped) == 20
     assert skipped_groups == [("x", "y", 10), ("y", "x", 8), ("e", "f", 2)]
 
-    oversized, oversized_groups = select_first_tool_mismatch_groups([("x", "y")] * 35 + [("a", "b")] * 3)
+    oversized, oversized_groups = select_mismatch_groups([("x", "y")] * 35 + [("a", "b")] * 3)
     assert oversized == list(range(35))
     assert oversized_groups == [("x", "y", 35)]

@@ -8,10 +8,10 @@ import pytest
 
 from glean_gepa.adapter_types import PointwiseJudge
 from glean_gepa.al_adapter import ALRunner, Thresholds
-from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
-from glean_gepa.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
+from glean_gepa.objectives.utils.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
 
 THRESHOLDS = Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000)
 

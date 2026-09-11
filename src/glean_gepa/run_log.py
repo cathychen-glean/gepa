@@ -12,8 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TextIO
 
-from glean_gepa.tool_match_util import (
-    REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
+from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
+from glean_gepa.objectives.utils.tool_match_util import (
     first_tool_mismatch_pair,
     first_tool_name,
     scored_tool_sequence,
@@ -89,13 +89,8 @@ def format_eval_entry_report(trajectories: Sequence[Mapping[str, Any]] | None) -
         if len(query) > QUERY_PREVIEW_CHARS:
             query = query[: QUERY_PREVIEW_CHARS - 3] + "..."
         score = trajectory.get("score")
-        tool_alignment = metrics.get("tool_alignment", score)
         metric_parts = [f"score={_fmt_metric(score)}"]
-        if tool_alignment is not None:
-            metric_parts.append(f"tool_alignment={_fmt_metric(tool_alignment)}")
-        metric_parts.extend(
-            f"{name}={_fmt_metric(value)}" for name, value in sorted(metrics.items()) if name != "tool_alignment"
-        )
+        metric_parts.extend(f"{name}={_fmt_metric(value)}" for name, value in sorted(metrics.items()))
         teacher_seq = " > ".join(scored_tool_sequence(teacher_tools)) or "(none)"
         student_seq = " > ".join(scored_tool_sequence(student_tools)) or "(none)"
         blocks.append(

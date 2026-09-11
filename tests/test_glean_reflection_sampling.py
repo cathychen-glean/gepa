@@ -9,7 +9,7 @@ from glean_gepa.reflection_sampling import (
     is_within_hamming_distance,
     strip_stdout_sections,
 )
-from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.single_model_adapter import SingleModelAdapter
 
 
