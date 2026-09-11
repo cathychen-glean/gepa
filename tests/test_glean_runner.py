@@ -19,17 +19,21 @@ from glean_gepa.prompt_constants import (
 from glean_gepa.runner import (
     ADAPTER_CACHE_FILENAME,
     CACHE_DIRECTORY_NAME,
+    CUSTOMER_DEPLOYMENTS_FILENAME,
     CUSTOMER_EVAL_DEPLOYMENT_IDS,
     GLEAN_CHAT_EVAL_SET_NAME,
+    MAX_EVAL_RUN_DEPLOYMENTS,
+    SCIO_PROD_DEPLOYMENT_IDS,
     _default_cache_file,
-    _latest_dated_eval_version,
     _load_seed_candidate,
     _make_evalset,
     _parse_args,
     _parse_editable_modules,
+    _resolve_customer_deployments,
     _resolve_eval_version_split,
     _seed_for_editable_modules,
-    _select_recent_train_and_val_versions,
+    _select_covered_dated_versions,
+    _select_recent_train_versions,
     _validate_best_candidate_on_customer_eval,
     _verify_customer_eval_metrics,
 )
@@ -245,28 +249,42 @@ def frozen_today(monkeypatch):
     monkeypatch.setattr("glean_gepa.runner.date", _FixedDate)
 
 
+_SAMPLED_DEPLOYMENTS = sorted(CUSTOMER_EVAL_DEPLOYMENT_IDS[:MAX_EVAL_RUN_DEPLOYMENTS])
+
+
+def _version_row(version: str, deployment_ids=None, size: int = 200):
+    """A row as `evalsets versions` returns it, with per-deployment sizes."""
+    ids = list(deployment_ids if deployment_ids is not None else _SAMPLED_DEPLOYMENTS)
+    return {
+        "name": GLEAN_CHAT_EVAL_SET_NAME,
+        "version": version,
+        "availableDeploymentIds": ids,
+        "perDeploymentMetadata": {deployment: {"size": size} for deployment in ids},
+    }
+
+
 def _auto_selected_split(days_back: int | None) -> tuple[list[str], list[str]]:
     """Resolve the automatic split against six consecutive daily versions."""
     argv = ["--seed_candidate", "seed.json"]
     if days_back is not None:
         argv += ["--eval_version_days_back", str(days_back)]
     evalcli = MagicMock()
-    evalcli.list_eval_set_versions.return_value = [{"version": _version(n)} for n in range(6)]
-    return _resolve_eval_version_split(_parse_args(argv), evalcli)
+    evalcli.list_eval_set_versions.return_value = [_version_row(_version(n)) for n in range(6)]
+    return _resolve_eval_version_split(_parse_args(argv), evalcli, _SAMPLED_DEPLOYMENTS)
 
 
-def test_eval_version_days_back_holds_the_auto_selection_window_still(frozen_today):
-    """Without this the window tracks the calendar, so a new daily version lands in
-    the valset and misses the eval-run cache."""
+def test_eval_version_days_back_holds_the_train_window_still(frozen_today):
+    """Without this the train window tracks the calendar, so a new daily version
+    misses the eval-run cache. Customer val always uses the latest available versions."""
     train_today, val_today = _auto_selected_split(0)
     train_shifted, val_shifted = _auto_selected_split(2)
 
+    assert train_today == [_version(n) for n in range(5, -1, -1)]
     assert val_today == [_version(1), _version(0)]
-    assert val_shifted == [_version(3), _version(2)]
-    assert train_today[-1] == _version(2)
-    assert train_shifted[-1] == _version(4)
-    # The shifted window excludes everything newer than the as-of date.
-    assert _version(0) not in train_shifted and _version(0) not in val_shifted
+    assert train_shifted == [_version(n) for n in range(5, 1, -1)]
+    assert val_shifted == [_version(1), _version(0)]
+    # The shifted train window excludes everything newer than the as-of date.
+    assert _version(0) not in train_shifted and _version(1) not in train_shifted
 
 
 def test_eval_version_days_back_defaults_to_today(frozen_today):
@@ -279,48 +297,170 @@ def test_eval_version_days_back_rejects_negative_values():
         _parse_args(["--seed_candidate", "seed.json", "--eval_version_days_back", "-1"])
 
 
-def test_recent_versions_are_split_into_incremental_train_and_held_out_val():
-    train_versions, val_versions = _select_recent_train_and_val_versions(
+def test_customer_deployments_sample_within_the_eval_run_limit(tmp_path):
+    """Cortex rejects an eval run with more than five deployments."""
+    sampled = _resolve_customer_deployments(tmp_path / CUSTOMER_DEPLOYMENTS_FILENAME, seed=7)
+
+    assert len(sampled) == MAX_EVAL_RUN_DEPLOYMENTS
+    assert len(set(sampled)) == MAX_EVAL_RUN_DEPLOYMENTS
+    assert set(sampled) <= set(CUSTOMER_EVAL_DEPLOYMENT_IDS)
+
+
+def test_customer_deployment_sample_is_reused_on_resume(tmp_path):
+    """Re-sampling would change the valset identity and miss every cached eval run."""
+    state_file = tmp_path / CUSTOMER_DEPLOYMENTS_FILENAME
+    first = _resolve_customer_deployments(state_file, seed=1)
+    resumed = _resolve_customer_deployments(state_file, seed=2)
+
+    assert resumed == first
+    assert json.loads(state_file.read_text()) == first
+
+
+def test_customer_deployment_sample_varies_without_a_seed(tmp_path):
+    samples = {tuple(_resolve_customer_deployments(tmp_path / f"sample_{index}.json")) for index in range(25)}
+
+    assert len(samples) > 1
+
+
+@pytest.mark.parametrize("saved", [["bill", "not-a-customer"], [], {"bill": True}, "bill"])
+def test_customer_deployment_state_file_rejects_invalid_content(tmp_path, saved):
+    state_file = tmp_path / CUSTOMER_DEPLOYMENTS_FILENAME
+    state_file.write_text(json.dumps(saved))
+
+    with pytest.raises(SystemExit, match="does not hold a list of customer deployments"):
+        _resolve_customer_deployments(state_file)
+
+
+def test_recent_train_versions_include_the_full_lookback_window():
+    train_versions = _select_recent_train_versions(
         [{"version": "20260813"}, {"version": "20260820"}, {"version": "20260827"}],
         as_of=date(2026, 8, 27),
         lookback_days=14,
-        valset_size=2,
     )
 
-    assert train_versions == ["20260813"]
-    assert val_versions == ["20260820", "20260827"]
+    assert train_versions == ["20260813", "20260820", "20260827"]
 
 
-def test_recent_versions_fall_back_to_one_val_version_when_only_two_are_available():
-    train_versions, val_versions = _select_recent_train_and_val_versions(
-        [{"version": "20260820"}, {"version": "20260827"}],
-        as_of=date(2026, 8, 27),
-        lookback_days=14,
-        valset_size=2,
-    )
-
-    assert train_versions == ["20260820"]
-    assert val_versions == ["20260827"]
-
-
-def test_latest_dated_eval_version_picks_newest_customer_version():
-    assert (
-        _latest_dated_eval_version(
-            [
-                {"version": "20260908", "availableDeploymentIds": ["bill"]},
-                {"evalSetVersion": "20260905", "availableDeploymentIds": list(CUSTOMER_EVAL_DEPLOYMENT_IDS)},
-                {"version": "latest"},
-                {"version": "20260827"},
-            ],
-            required_deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
+def test_recent_train_versions_fail_when_the_window_is_empty():
+    with pytest.raises(SystemExit, match="at least one scio-prod"):
+        _select_recent_train_versions(
+            [{"version": "20260820"}],
+            as_of=date(2026, 8, 27),
+            lookback_days=1,
         )
-        == "20260905"
+
+
+def test_auto_val_versions_come_from_customer_deployments(frozen_today):
+    evalcli = MagicMock()
+
+    def list_versions(*, eval_set_name, deployment_ids):
+        if deployment_ids == _SAMPLED_DEPLOYMENTS:
+            return [
+                _version_row("20260820"),
+                _version_row("20260827"),
+                _version_row("20260813", deployment_ids=["bill"]),
+            ]
+        return [_version_row(_version(n), deployment_ids=["scio-prod"]) for n in range(6)]
+
+    evalcli.list_eval_set_versions.side_effect = lambda **kwargs: list_versions(**kwargs)
+    train_versions, val_versions = _resolve_eval_version_split(
+        _parse_args(["--seed_candidate", "seed.json"]), evalcli, _SAMPLED_DEPLOYMENTS
+    )
+
+    assert val_versions == ["20260820", "20260827"]
+    assert train_versions[-1] == _version(0)
+    evalcli.list_eval_set_versions.assert_any_call(
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=_SAMPLED_DEPLOYMENTS,
     )
 
 
-def test_latest_dated_eval_version_fails_without_dated_versions():
-    with pytest.raises(SystemExit, match="dated"):
-        _latest_dated_eval_version([{"version": "latest"}])
+def test_val_version_selection_never_lists_pii_gated_entries():
+    """`evalsets versions` already reports per-deployment coverage, so selection
+    never touches the entries endpoint, which rejects customer deployments."""
+    evalcli = MagicMock()
+    evalcli.list_eval_set_versions.return_value = [_version_row("20260820"), _version_row("20260827")]
+    args = _parse_args(["--seed_candidate", "seed.json", "--val_eval_version_count", "1"])
+
+    _, val_versions = _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS)
+
+    assert val_versions == ["20260827"]
+    evalcli.list_eval_set_entries.assert_not_called()
+
+
+def test_val_version_selection_takes_the_newest_dated_versions():
+    selected = _select_covered_dated_versions(
+        [_version_row("20260813"), _version_row("20260827"), _version_row("20260820")],
+        count=2,
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=_SAMPLED_DEPLOYMENTS,
+    )
+
+    assert selected == ["20260820", "20260827"]
+
+
+def test_val_version_selection_ignores_undated_versions():
+    with pytest.raises(SystemExit, match="is published to every deployment"):
+        _select_covered_dated_versions(
+            [_version_row("latest")],
+            count=1,
+            eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+            deployment_ids=_SAMPLED_DEPLOYMENTS,
+        )
+
+
+def test_val_version_selection_skips_versions_missing_a_sampled_deployment():
+    """Most dated versions ship to scio-prod only; customer-wide ones land
+    roughly weekly, so selection must walk back to a fully published one."""
+    partial = _version_row("20260830")
+    partial["availableDeploymentIds"] = [_SAMPLED_DEPLOYMENTS[0]]
+    partial["perDeploymentMetadata"] = {_SAMPLED_DEPLOYMENTS[0]: {"size": 200}}
+
+    selected = _select_covered_dated_versions(
+        [_version_row("20260823"), partial],
+        count=1,
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=_SAMPLED_DEPLOYMENTS,
+    )
+
+    assert selected == ["20260823"]
+
+
+def test_val_version_selection_skips_deployments_with_zero_entries():
+    """A published deployment with size 0 has no entries, so the eval run would
+    fail exactly the way it did for version 20260812."""
+    empty = _version_row("20260830")
+    empty["perDeploymentMetadata"][_SAMPLED_DEPLOYMENTS[1]] = {"size": 0}
+
+    selected = _select_covered_dated_versions(
+        [_version_row("20260823"), empty],
+        count=1,
+        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
+        deployment_ids=_SAMPLED_DEPLOYMENTS,
+    )
+
+    assert selected == ["20260823"]
+
+
+def test_pinned_val_versions_must_be_published_to_every_sampled_deployment():
+    partial = _version_row("20260830")
+    partial["availableDeploymentIds"] = [_SAMPLED_DEPLOYMENTS[0]]
+    partial["perDeploymentMetadata"] = {_SAMPLED_DEPLOYMENTS[0]: {"size": 200}}
+    evalcli = MagicMock()
+    evalcli.list_eval_set_versions.return_value = [partial]
+    args = _parse_args(
+        [
+            "--seed_candidate",
+            "seed.json",
+            "--train_eval_versions",
+            "20260901",
+            "--val_eval_versions",
+            "20260830",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="not published to"):
+        _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS)
 
 
 def _passing_customer_metrics():
@@ -352,15 +492,15 @@ def _passing_customer_metrics():
     }
 
 
-def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
+def test_customer_eval_reuses_the_gepa_valset_for_paired_validation():
     evalcli = MagicMock()
-    evalcli.list_eval_set_versions.return_value = [{"version": "20260820"}, {"version": "20260908"}]
     evalcli.compare_eval_metrics.return_value = _passing_customer_metrics()
     runner = MagicMock()
     runner.start.side_effect = [("eval-base", True), ("eval-best", True)]
     runner.ensure_judge_run.return_value = "judge-1"
     baseline = {"WRITING_CODE": "baseline"}
     best = {"WRITING_CODE": "updated"}
+    valset = _make_evalset(["20260908"], deployment_ids=_SAMPLED_DEPLOYMENTS)
 
     _validate_best_candidate_on_customer_eval(
         runner=runner,
@@ -368,12 +508,10 @@ def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
         baseline_candidate=baseline,
         best_candidate=best,
         evalcli=evalcli,
+        valset=valset,
     )
 
-    evalcli.list_eval_set_versions.assert_called_once_with(
-        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
-        deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
-    )
+    evalcli.list_eval_set_versions.assert_not_called()
     assert runner.start.call_count == 2
     runner.wait.assert_any_call("eval-base")
     runner.wait.assert_any_call("eval-best")
@@ -385,6 +523,10 @@ def test_customer_eval_looks_up_latest_version_and_runs_paired_validation():
     assert judge_kwargs["base_eval_run_id"] == "eval-base"
     evalcli.wait_for_judge_run.assert_called_once_with("judge-1", eval_run_id="eval-best")
     evalcli.compare_eval_metrics.assert_called_once_with("eval-best", "eval-base")
+    start_kwargs = runner.start.call_args_list[0].kwargs
+    assert start_kwargs["eval_set_version"] == "20260908"
+    assert start_kwargs["deployment_ids"] == _SAMPLED_DEPLOYMENTS
+    assert len(start_kwargs["deployment_ids"]) <= MAX_EVAL_RUN_DEPLOYMENTS
 
 
 def test_customer_metric_validation_rejects_significant_system_change():
@@ -403,12 +545,23 @@ def test_customer_metric_validation_requires_correctness_above_80_percent():
         _verify_customer_eval_metrics(metrics)
 
 
-def test_make_customer_evalset_uses_all_customer_deployments():
-    assert _make_evalset(["20260908"], deployment_ids=list(CUSTOMER_EVAL_DEPLOYMENT_IDS)) == [
+def test_make_customer_evalset_uses_the_sampled_customer_deployments():
+    assert _make_evalset(["20260908"], deployment_ids=_SAMPLED_DEPLOYMENTS) == [
         {
             "eval_set_name": GLEAN_CHAT_EVAL_SET_NAME,
             "eval_set_version": "20260908",
-            "deployment_ids": list(CUSTOMER_EVAL_DEPLOYMENT_IDS),
+            "deployment_ids": _SAMPLED_DEPLOYMENTS,
             "status": "active",
         }
     ]
+
+
+def test_validation_evalset_is_marked_metrics_only():
+    """Customer eval-set entries are PII-gated, so validation items must never
+    reach the focused high-signal path that lists them."""
+    valset = _make_evalset(["20260908"], deployment_ids=_SAMPLED_DEPLOYMENTS, validation_only=True)
+    trainset = _make_evalset(["20260901"])
+
+    assert valset[0]["validation_only"] is True
+    assert "validation_only" not in trainset[0]
+    assert trainset[0]["deployment_ids"] == list(SCIO_PROD_DEPLOYMENT_IDS)

@@ -58,7 +58,7 @@ def prepare_high_signal_eval_batch(
     """
     prepared: list[ALDataInst] = []
     for data in batch:
-        entry_ids = data.get("eval_entry_ids") or []
+        entry_ids = [] if data.get("validation_only") else data.get("eval_entry_ids") or []
         if not entry_ids:
             prepared.append(data)
             continue
@@ -92,8 +92,12 @@ def resolve_eval_run_target(
     bigquery_client: Any | None = None,
     bucket_type: str = QUERY_CANONICAL_BUCKET_TYPE,
 ) -> EvalRunTarget | None:
-    """Return where to run this data inst. None if focused setup failed."""
-    entry_ids = data.get("eval_entry_ids") or []
+    """Return where to run this data inst. None if focused setup failed.
+
+    A ``validation_only`` eval set always runs as-is: its entries cannot be
+    listed, so it can never back a focused eval set.
+    """
+    entry_ids = [] if data.get("validation_only") else data.get("eval_entry_ids") or []
     eval_set_name = str(data.get("eval_set_name", ""))
     eval_set_version = str(data.get("eval_set_version", ""))
     if not entry_ids:

@@ -378,6 +378,22 @@ def test_resolve_eval_run_target(data, ensure_return, expected, ensure_called):
         assert ensure.call_args.kwargs["bucket_type"] == QUERY_CANONICAL_BUCKET_TYPE
 
 
+def test_validation_only_eval_sets_never_build_a_focused_set():
+    """Customer validation eval sets are PII-gated: listing their entries fails, so
+    they must run as-is instead of backing a focused high-signal set."""
+    validation_data = {**SOURCE, "eval_entry_ids": ["keep"], "validation_only": True}
+    evalcli = MagicMock()
+
+    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set") as ensure:
+        target = resolve_eval_run_target(evalcli, validation_data)
+        prepared = prepare_high_signal_eval_batch(evalcli, [validation_data])
+
+    assert target == EvalRunTarget("Example", "v1", DEFAULT_RUN_LABEL, is_focused=False)
+    assert prepared == [validation_data]
+    ensure.assert_not_called()
+    evalcli.list_eval_set_entries.assert_not_called()
+
+
 def test_resolve_eval_run_target_forwards_session_bucket():
     with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=FOCUSED) as ensure:
         resolve_eval_run_target(MagicMock(), {**SOURCE, "eval_entry_ids": ["keep"]}, bucket_type=SESSION_BUCKET_TYPE)
