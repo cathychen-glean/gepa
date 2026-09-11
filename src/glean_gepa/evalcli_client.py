@@ -50,6 +50,10 @@ TERMINAL_TASK_STATUSES = {
     "TASK_ABORTED",
 }
 
+FINISHED_TASK_STATUSES = frozenset({"TASK_SUCCEEDED", "TASK_FAILED"})
+# Succeeded+failed must strictly exceed 9x the unfinished remainder (~90% done).
+MIN_FINISHED_TO_UNFINISHED_RATIO = 9
+
 TRANSIENT_EVALCLI_PATTERNS = (
     "API request failed: 502",
     "API request failed: 503",
@@ -125,19 +129,38 @@ def _is_transient_evalcli_error(exc: EvalCliError) -> bool:
     return OPAQUE_EVALCLI_ERROR_MARKER in message
 
 
+def _task_count(entry: dict[str, Any]) -> int:
+    count = entry.get("count") or 0
+    return count if isinstance(count, int) else 0
+
+
 def classify_eval_run_status(status: Any) -> str:
-    """Classify a Cortex run-status payload as ongoing, usable, or missing."""
+    """Classify a Cortex run-status payload as ongoing, usable, or missing.
+
+    A run is usable when every counted task is terminal, or when succeeded+failed
+    is more than 9x the unfinished remainder. The last 10% of entries can sit in
+    queue or grind through execution for a long time without moving the score.
+    """
     if not isinstance(status, dict):
         return "missing"
     task_counts = status.get("taskCountsByStatus") or []
     if not isinstance(task_counts, list):
         return "missing"
-    active_counts = [entry for entry in task_counts if isinstance(entry, dict) and (entry.get("count") or 0) > 0]
+    active_counts = [entry for entry in task_counts if isinstance(entry, dict) and _task_count(entry) > 0]
     if not active_counts:
         return "missing"
-    if any(entry.get("status") not in TERMINAL_TASK_STATUSES for entry in active_counts):
-        return "ongoing"
-    return "usable"
+    finished = 0
+    unfinished = 0
+    for entry in active_counts:
+        task_status = entry.get("status")
+        count = _task_count(entry)
+        if task_status in FINISHED_TASK_STATUSES:
+            finished += count
+        elif task_status not in TERMINAL_TASK_STATUSES:
+            unfinished += count
+    if unfinished == 0:
+        return "usable"
+    return "usable" if finished > MIN_FINISHED_TO_UNFINISHED_RATIO * unfinished else "ongoing"
 
 
 def judge_run_base_eval_id(row: dict[str, Any]) -> str | None:

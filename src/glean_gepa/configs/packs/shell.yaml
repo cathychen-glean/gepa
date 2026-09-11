@@ -13,5 +13,5 @@ objective:
 
 screening:
   kind: high_signal_fix_rate
-  threshold: 0.333
+  threshold: 0.5
   high_signal: shell_error_entries

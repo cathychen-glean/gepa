@@ -84,7 +84,7 @@ class _HighSignalProposerAdapter(_ProposerAdapter):
 
     @staticmethod
     def high_signal_fix_rate(_parent_eval: object, _child_eval: object) -> float:
-        return 7 / 17
+        return 9 / 17
 
 
 class _OneSliceLoader:
@@ -325,9 +325,9 @@ def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None
         ],
     )
     first_proposer._record_screening_result((0,), children[0], 0.75, True)
-    # Simulate a result persisted under the old 50% gate. The score must be
-    # reconsidered when the threshold changes.
-    first_proposer._record_screening_result((0,), children[1], 1 / 3, False)
+    # Simulate a result persisted as a pass under the old 1/3 gate. The score
+    # must be reconsidered when the threshold changes.
+    first_proposer._record_screening_result((0,), children[1], 1 / 3, True)
     first_proposer._save_children_cache()
 
     second_proposer = _proposer(_ReflectionAdapter(), cache_file)
@@ -337,7 +337,7 @@ def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None
         use_high_signal_gate=True,
     )
 
-    assert cached == [(0.75, True), (1 / 3, True)]
+    assert cached == [(0.75, True), (1 / 3, False)]
 
 
 def test_same_root_and_training_slice_reuses_children_and_screen(tmp_path) -> None:
@@ -472,6 +472,53 @@ def test_resume_skips_slices_whose_passing_children_are_already_in_the_pool(tmp_
     assert second_proposals[0].candidate["WRITING_CODE"] == "slice-1 rewrite"
 
 
+def test_over_budget_child_does_not_pin_its_training_slice(tmp_path) -> None:
+    """A child dropped by the budget check is never screened, so it must not read as unfinished."""
+    cache_file = str(tmp_path / "children.json")
+    root = _candidate("root")
+    over_budget_rewrite = "x" * 500
+
+    class _FreshState:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 1
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    first_adapter = _ProposerAdapter()
+    first_adapter.variants = ["slice-0 rewrite", over_budget_rewrite]
+    first_proposer = _proposer(first_adapter, cache_file)
+    first_proposer.trainset = _TwoSliceLoader()
+    first_proposals = first_proposer.propose(_FreshState())
+    assert [proposal.candidate["WRITING_CODE"] for proposal in first_proposals] == ["slice-0 rewrite"]
+
+    class _ResumedState:
+        """The accepted child scored below its parent, so the frontier is still the root alone."""
+
+        i = 0
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules, first_proposals[0].candidate]
+        total_num_evals = 0
+        num_full_ds_evals = 2
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0, 0.9]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    second_adapter = _ProposerAdapter()
+    second_adapter.variants = ["slice-1 rewrite"]
+    second_proposer = _proposer(second_adapter, cache_file)
+    second_proposer.trainset = _TwoSliceLoader()
+    second_proposals = second_proposer.propose(_ResumedState())
+
+    assert [proposal.candidate["WRITING_CODE"] for proposal in second_proposals] == ["slice-1 rewrite"]
+    assert all(proposal.subsample_indices == [1] for proposal in second_proposals)
+
+
 def test_high_signal_screen_uses_zero_baseline_before_full_validation(tmp_path) -> None:
     """A high-signal fix rate must not be compared to the parent's full score."""
     root = _candidate("root")
@@ -495,7 +542,7 @@ def test_high_signal_screen_uses_zero_baseline_before_full_validation(tmp_path) 
     assert proposals
     assert all(proposal.tag == "evolutionary_high_signal" for proposal in proposals)
     assert all(proposal.subsample_scores_before == [0.0] for proposal in proposals)
-    assert all(proposal.subsample_scores_after == [7 / 17] for proposal in proposals)
+    assert all(proposal.subsample_scores_after == [9 / 17] for proposal in proposals)
     # Strict improvement over the zero baseline, the rule the engine applies to accept a child.
     assert all(sum(proposal.subsample_scores_after) > sum(proposal.subsample_scores_before) for proposal in proposals)
 

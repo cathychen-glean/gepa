@@ -33,7 +33,7 @@ from glean_gepa.prompt_constants import CORE_TOOL_KEYS, PROMPT_MODULE_DEFAULTS
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
 
-HIGH_SIGNAL_FIX_RATE_THRESHOLD = 1 / 3
+HIGH_SIGNAL_FIX_RATE_THRESHOLD = 0.5
 
 
 @dataclass
@@ -534,6 +534,10 @@ class EvolutionaryProposer:
         """True when this child still needs screening or has not yet entered the pool."""
         if self._program_key(child.prompt_modules) in existing_keys:
             return False
+        # An over-budget child is never screened, so its cache record keeps a null
+        # score. Reading that as unfinished work would pin the slice forever.
+        if not within_prompt_budget(child):
+            return False
         record = self._child_cache_record(train_ids, child)
         if record.screening_score is None:
             return True
@@ -743,14 +747,22 @@ class EvolutionaryProposer:
             self.logger.log(f"Iteration {i}: Evolutionary proposer generated no children")
             return []
 
-        # 6. Filter children by prompt budget
-        valid_children = [c for c in children if within_prompt_budget(c)]
+        # 6. Filter children by prompt budget. Rejected children are recorded as
+        # failed screens so the cache does not describe them as awaiting one.
+        valid_children = []
+        for child in children:
+            if within_prompt_budget(child):
+                valid_children.append(child)
+            else:
+                self._record_screening_result(train_slice_key, child, 0.0, False)
+        if self.evalset_policy is not None and len(valid_children) != len(children):
+            self._save_children_cache()
         if not valid_children:
             self.logger.log(f"Iteration {i}: No children passed budget check")
             return []
 
         # 6. Screen children on the parent's high-signal failures first.
-        # Keep a child whose fix rate is at least one-third
+        # Keep a child whose fix rate is at least half
         # (or high_signal_screen_threshold).
         best_parent_idx = max(frontier_idxs_sorted, key=lambda idx: state.program_full_scores_val_set[idx])
         best_parent_cand_id = prog_idx_to_cand_id[best_parent_idx]

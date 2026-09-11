@@ -627,8 +627,57 @@ def test_invoke_raises_on_nonzero_exit():
         (
             {
                 "taskCountsByStatus": [
-                    {"status": "TASK_SUCCEEDED", "count": 10},
+                    {"status": "TASK_SUCCEEDED", "count": 9},
                     {"status": "TASK_EXECUTING", "count": 1},
+                ]
+            },
+            "ongoing",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 193},
+                    {"status": "TASK_EXECUTING", "count": 2},
+                    {"status": "TASK_FAILED", "count": 5},
+                ]
+            },
+            "usable",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 90},
+                    {"status": "TASK_FAILED", "count": 1},
+                    {"status": "TASK_IN_QUEUE", "count": 9},
+                    {"status": "TASK_SUBMITTED", "count": 1},
+                ]
+            },
+            "usable",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 90},
+                    {"status": "TASK_IN_QUEUE", "count": 10},
+                ]
+            },
+            "ongoing",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 85},
+                    {"status": "TASK_IN_QUEUE", "count": 5},
+                    {"status": "TASK_EXECUTING", "count": 5},
+                ]
+            },
+            "ongoing",
+        ),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 80},
+                    {"status": "TASK_EXECUTING", "count": 20},
                 ]
             },
             "ongoing",
