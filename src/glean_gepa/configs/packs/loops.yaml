@@ -1,0 +1,21 @@
+# Pack: fewer agent loops on a student-only eval, gated so an incorrect
+# answer scores 0. Scorable only by single_model mode (`packs: [loops]`).
+#
+# This replaces the shell pack for a run — build_objective currently constructs
+# one telemetry plugin. Point single_model.yaml at this pack. QUERY_CANONICAL
+# focused sets re-ask the same queries; edit WRITING_CODE or FULL_PROMPT.
+
+signals:
+  - name: loop_efficiency
+    source: loop_telemetry
+    lookback_days: 1
+
+objective:
+  primary: loop_efficiency
+  composite:
+    loop_efficiency: 1.0
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.333
+  high_signal: extra_loops_or_incorrect

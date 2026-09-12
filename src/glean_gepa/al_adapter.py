@@ -10,9 +10,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
-from datetime import time as datetime_time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, NotRequired, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
@@ -22,7 +20,6 @@ from glean_gepa.adapter_types import (
     ALTrajectory,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.debug import debug_print
 from glean_gepa.evalcli_client import (
     CORRECTNESS_INPUT_MAPPINGS,
     CORRECTNESS_JUDGE_TYPE,
@@ -32,7 +29,7 @@ from glean_gepa.evalcli_client import (
     classify_eval_run_status,
     is_missing_eval_job,
 )
-from glean_gepa.focused_evalset import prepare_high_signal_eval_batch
+from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, prepare_high_signal_eval_batch
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import (
     CONSOLIDATE_LENGTH_EMPTY,
@@ -45,13 +42,6 @@ from glean_gepa.reflection_prompts import (
 )
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
-from glean_gepa.shell_tool_error_util import (
-    EvalRunShellToolErrorAnalysis,
-    parse_shell_tool_error_entry_metrics,
-    parse_shell_tool_error_metrics,
-)
-
-EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
 
 
 def _write_json_atomically(path: str, data: Any) -> None:
@@ -216,21 +206,6 @@ CODING_HARNESS_SC_PARAMS = (
 )
 
 
-def log_shell_tool_error_analysis(analysis: EvalRunShellToolErrorAnalysis) -> None:
-    """Log the fetched shell-tool error rate and recent error details."""
-    aggregate = analysis.aggregate
-    print(
-        f"[Shell Tool] Fetched error rate for eval {analysis.eval_id}: "
-        f"{aggregate.shell_error_pct:.2f}% "
-        f"({aggregate.shell_errors}/{aggregate.shell_executions})"
-    )
-    for example in aggregate.recent_error_examples:
-        if example.action_input:
-            debug_print(f"[Shell Tool] Action input for eval {analysis.eval_id}: {example.action_input}")
-        if example.error_str:
-            debug_print(f"[Shell Tool] Error for eval {analysis.eval_id}: {example.error_str}")
-
-
 # ---------------------------
 # 1) Prompt modules + candidate
 # ---------------------------
@@ -342,6 +317,8 @@ class ReflectiveExampleOutputs(TypedDict):
     teacher_answer: str
     student_tools: list[str]
     teacher_tools: list[str]
+    student_citations: NotRequired[list[str]]
+    teacher_citations: NotRequired[list[str]]
 
 
 class ReflectiveExampleMetrics(TypedDict):
@@ -352,6 +329,8 @@ class ReflectiveExampleMetrics(TypedDict):
     correctness: NotRequired[float]
     completeness: NotRequired[float]
     tool_alignment: NotRequired[float]
+    citation_match: NotRequired[float]
+    loop_efficiency: NotRequired[float]
 
 
 # TypedDict with keys containing spaces must use functional form
@@ -1170,90 +1149,6 @@ def extract_shell_action_inputs(detailed_trace: dict[str, Any]) -> dict[str, str
     return action_inputs
 
 
-def _timestamp_millis(value: str | None) -> int | None:
-    if not value:
-        return None
-    normalized = value.replace(" UTC", "+00:00")
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp() * 1000)
-
-
-def enrich_shell_error_action_inputs(
-    evalcli: EvalCliClient,
-    analysis: EvalRunShellToolErrorAnalysis,
-) -> EvalRunShellToolErrorAnalysis:
-    """Fetch detailed traces and attach serialized Shell inputs to failed actions."""
-    examples = list(analysis.aggregate.recent_error_examples)
-    for metrics in analysis.per_entry.values():
-        examples.extend(metrics.recent_error_examples)
-
-    grouped: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
-    for example in examples:
-        if example.project_id and example.trace_id and example.action_run_id and not example.action_input:
-            grouped[(example.project_id, example.trace_id)].append(example)
-    if not grouped:
-        return analysis
-
-    print(f"[Shell Tool] Fetching action inputs for {len(grouped)} traces on eval {analysis.eval_id}")
-    resolved: dict[tuple[str, str, str], str] = {}
-    for (deployment_id, trace_id), trace_examples in grouped.items():
-        timestamps = [
-            timestamp
-            for example in trace_examples
-            for timestamp in [_timestamp_millis(example.started_at)]
-            if timestamp is not None
-        ]
-        if timestamps:
-            start_time_millis = min(timestamps) - int(timedelta(hours=1).total_seconds() * 1000)
-            end_time_millis = max(timestamps) + 1000
-        else:
-            start_dt = datetime.combine(analysis.start_date, datetime_time.min, tzinfo=timezone.utc)
-            end_dt = datetime.combine(analysis.end_date + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc)
-            start_time_millis = int(start_dt.timestamp() * 1000)
-            end_time_millis = int(end_dt.timestamp() * 1000)
-        try:
-            detailed_trace = evalcli.get_analysis_trace(
-                deployment_id=deployment_id,
-                trace_id=trace_id,
-                start_time_millis=start_time_millis,
-                end_time_millis=end_time_millis,
-            )
-        except Exception as exc:
-            print(f"[Shell Tool] Failed to fetch action inputs for trace {trace_id}: {exc}")
-            continue
-        for action_run_id, action_input in extract_shell_action_inputs(detailed_trace).items():
-            resolved[(deployment_id, trace_id, action_run_id)] = action_input
-
-    def enrich_example(example: Any) -> Any:
-        if example.action_input or not (example.project_id and example.trace_id and example.action_run_id):
-            return example
-        action_input = resolved.get((example.project_id, example.trace_id, example.action_run_id))
-        return replace(example, action_input=action_input) if action_input else example
-
-    if not resolved:
-        return analysis
-
-    aggregate = replace(
-        analysis.aggregate,
-        recent_error_examples=tuple(enrich_example(example) for example in analysis.aggregate.recent_error_examples),
-    )
-    per_entry = {
-        entry_id: replace(
-            metrics,
-            recent_error_examples=tuple(enrich_example(example) for example in metrics.recent_error_examples),
-        )
-        for entry_id, metrics in analysis.per_entry.items()
-    }
-    return replace(analysis, aggregate=aggregate, per_entry=per_entry)
-
-
 # ---------------------------
 # 4) Shared adapter internals
 # ---------------------------
@@ -1321,10 +1216,6 @@ class GleanAdapterBase:
         # TODO(Cathy) populate the good_module_options
         self.good_module_options: dict[str, list[str]] = defaultdict(list)
 
-        # These caches are keyed by the immutable eval run ID so they remain useful
-        # when the adapter cache is loaded in a later process.
-        self._eval_analysis_cache: dict[str, EvalRunShellToolErrorAnalysis] = {}
-
         # Judge triggered cache: (teacher_eval_id, student_eval_id) -> triggered
         self._judge_triggered: set[tuple[str, str]] = set()
 
@@ -1369,7 +1260,7 @@ class GleanAdapterBase:
             )
 
     def _load_cache(self) -> None:
-        """Load analysis and judge-trigger state from the adapter cache."""
+        """Load adapter cache state from disk."""
         if not self.cache_file:
             return
 
@@ -1382,20 +1273,17 @@ class GleanAdapterBase:
 
                 judge_triggered_data = data.get("judge_triggered", [])
                 self._judge_triggered = {tuple(item) for item in judge_triggered_data}
-
-                self._load_eval_analysis_cache(data.get("eval_analysis_cache", {}))
                 self._load_extra_cache(data)
                 print(
-                    f"[GleanAdapter] Loaded {len(self._eval_analysis_cache)} error analyses and "
-                    f"{len(self._judge_triggered)} judge triggers from cache: {self.cache_file}"
+                    f"[GleanAdapter] Loaded {len(self._judge_triggered)} judge triggers from cache: {self.cache_file}"
                 )
         except Exception as e:
             print(f"[GleanAdapter] Failed to load cache from {self.cache_file}: {e}")
             self._judge_triggered = set()
-            self._eval_analysis_cache = {}
+            self._load_extra_cache({})
 
     def _save_cache(self) -> None:
-        """Save analysis and judge-trigger state to the adapter cache."""
+        """Save adapter cache state to disk."""
         if not self.cache_file:
             return
 
@@ -1403,17 +1291,10 @@ class GleanAdapterBase:
             with self._cache_lock:
                 data = {
                     "judge_triggered": [list(pair) for pair in self._judge_triggered],
-                    "eval_analysis_cache": {
-                        eval_id: self._serialize_eval_analysis(analysis)
-                        for eval_id, analysis in self._eval_analysis_cache.items()
-                    },
                 }
                 data.update(self._extra_cache_payload())
                 _write_json_atomically(self.cache_file, data)
-                print(
-                    f"[GleanAdapter] Saved {len(self._eval_analysis_cache)} error analyses and "
-                    f"{len(self._judge_triggered)} judge triggers to cache: {self.cache_file}"
-                )
+                print(f"[GleanAdapter] Saved {len(self._judge_triggered)} judge triggers to cache: {self.cache_file}")
         except Exception as e:
             print(f"[GleanAdapter] Failed to save cache to {self.cache_file}: {e}")
 
@@ -1422,62 +1303,6 @@ class GleanAdapterBase:
 
     def _load_extra_cache(self, data: dict[str, Any]) -> None:
         return None
-
-    @staticmethod
-    def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
-        def metrics_dict(metrics: Any) -> dict[str, Any]:
-            return {
-                "eval_id": getattr(metrics, "eval_id", None),
-                "entry_id": getattr(metrics, "entry_id", None),
-                "shell_executions": metrics.shell_executions,
-                "shell_errors": metrics.shell_errors,
-                "shell_error_rate": metrics.shell_error_rate,
-                "shell_error_pct": metrics.shell_error_pct,
-                "trace_ids": list(getattr(metrics, "trace_ids", ())),
-                "session_tracking_tokens": list(getattr(metrics, "session_tracking_tokens", ())),
-                # Preserve the trace error details because they are diagnostic
-                # input for the reflection model, not merely logging metadata.
-                "recent_error_examples": [asdict(example) for example in metrics.recent_error_examples],
-            }
-
-        return {
-            "schema_version": EVAL_ANALYSIS_CACHE_SCHEMA_VERSION,
-            "eval_id": analysis.eval_id,
-            "start_date": analysis.start_date.isoformat(),
-            "end_date": analysis.end_date.isoformat(),
-            "aggregate": metrics_dict(analysis.aggregate),
-            "per_entry": {entry_id: metrics_dict(metrics) for entry_id, metrics in analysis.per_entry.items()},
-            "high_signal_entry_ids": list(analysis.high_signal_entry_ids),
-        }
-
-    def _load_eval_analysis_cache(self, raw_cache: Any) -> None:
-        if not isinstance(raw_cache, dict):
-            return
-        for eval_id, raw in raw_cache.items():
-            try:
-                if not isinstance(raw, dict):
-                    continue
-                if raw.get("schema_version") != EVAL_ANALYSIS_CACHE_SCHEMA_VERSION:
-                    print(f"[Cache] Refreshing legacy shell error analysis for eval_id: {eval_id}")
-                    continue
-                aggregate = parse_shell_tool_error_metrics(raw["aggregate"])
-                if aggregate.shell_executions == 0:
-                    print(f"[Cache] Refreshing provisional 0/0 shell analysis for eval_id: {eval_id}")
-                    continue
-                per_entry = {
-                    entry_id: parse_shell_tool_error_entry_metrics(metrics)
-                    for entry_id, metrics in (raw.get("per_entry") or {}).items()
-                }
-                self._eval_analysis_cache[str(eval_id)] = EvalRunShellToolErrorAnalysis(
-                    eval_id=str(raw.get("eval_id") or eval_id),
-                    start_date=date.fromisoformat(raw["start_date"]),
-                    end_date=date.fromisoformat(raw["end_date"]),
-                    aggregate=aggregate,
-                    per_entry=per_entry,
-                    high_signal_entry_ids=tuple(raw.get("high_signal_entry_ids") or ()),
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
 
     def evaluate(
         self,
@@ -1520,10 +1345,13 @@ class GleanAdapterBase:
         evalcli = getattr(getattr(self, "runner", None), "evalcli", None)
         if evalcli is None:
             return batch
+        objective = getattr(self, "objective", None)
+        bucket_type = getattr(objective, "focused_bucket_type", QUERY_CANONICAL_BUCKET_TYPE)
         return prepare_high_signal_eval_batch(
             evalcli,
             batch,
             bigquery_client=getattr(self, "bigquery_client", None),
+            bucket_type=bucket_type,
         )
 
     def attach_cached_eval_run_ids(self, batch: list[ALDataInst], eval_run_ids: list[EvalRunIds]) -> list[ALDataInst]:

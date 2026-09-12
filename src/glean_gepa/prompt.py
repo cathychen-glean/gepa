@@ -8,6 +8,8 @@ from base64 import b64encode, urlsafe_b64encode
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.objectives.utils.tool_match_util import first_tool_mismatch_pair
 from glean_gepa.prompt_constants import (
     CORE_TOOL_DESCRIPTIONS,
     CORE_TOOL_KEYS,
@@ -20,7 +22,6 @@ from glean_gepa.prompt_constants import (
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     WRITING_CODE_KEY,
 )
-from glean_gepa.tool_match_util import first_tool_mismatch_pair, select_first_tool_mismatch_groups
 
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")
@@ -113,7 +114,7 @@ def high_signal_core_tool_keys(trajectories: Sequence[Any] | None) -> list[str]:
         mismatch_keys.append(
             first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
         )
-    _indices, groups = select_first_tool_mismatch_groups(mismatch_keys)
+    _indices, groups = select_mismatch_groups(mismatch_keys)
     found: list[str] = []
     for teacher_tool, student_tool, _count in groups:
         for name in (teacher_tool, student_tool):

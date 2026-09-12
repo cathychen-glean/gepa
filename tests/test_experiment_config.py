@@ -16,10 +16,14 @@ from glean_gepa.experiment_config import (
     runner_arg_defaults,
 )
 from glean_gepa.runner import _parse_args
-from glean_gepa.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
-from glean_gepa.single_model_adapter import DEFAULT_COMPOSITE_WEIGHTS as SINGLE_MODEL_DEFAULT_WEIGHTS
-from glean_gepa.teacher_student_adapter import DEFAULT_COMPOSITE_WEIGHTS as TEACHER_STUDENT_DEFAULT_WEIGHTS
+from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.utils.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
 from glean_gepa.teacher_student_adapter import POINTWISE_JUDGES as TEACHER_STUDENT_POINTWISE_JUDGES
+
+# Adapters default the composite to a unit weight on their primary objective;
+# these mirror that default to guard against drift from the packaged configs.
+SINGLE_MODEL_DEFAULT_WEIGHTS = {SHELL_SUCCESS_OBJECTIVE: 1.0}
+TEACHER_STUDENT_DEFAULT_WEIGHTS = {TOOL_ALIGNMENT_OBJECTIVE: 1.0}
 
 _POINTWISE_COMPLETENESS = (
     "  - name: completeness\n    source: cortex_judge\n    type: COMPLETENESS\n    kind: pointwise\n"
@@ -131,18 +135,19 @@ def test_resolve_config_path_accepts_packaged_stem_and_file(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("mode", "packs"),
+    ("mode", "packs", "match"),
     [
-        ("teacher_student", "[shell]"),
-        ("teacher_student", "[tools, shell]"),
-        ("single_model", "[tools]"),
-        ("single_model", "[shell, tools]"),
-        ("teacher_student", "[nope]"),
-        ("teacher_student", "[]"),
+        ("teacher_student", "[shell]", "cannot score pack"),
+        ("teacher_student", "[tools, shell]", "cannot score pack"),
+        ("teacher_student", "[loops]", "cannot score pack"),
+        ("single_model", "[tools]", "cannot score pack"),
+        ("single_model", "[shell, tools]", "cannot score pack"),
+        ("teacher_student", "[nope]", "unknown pack"),
+        ("teacher_student", "[]", "at least one pack"),
     ],
 )
-def test_pack_not_scorable_by_mode_raises(tmp_path, mode, packs):
-    with pytest.raises(ExperimentConfigError, match="supports only packs"):
+def test_pack_not_scorable_by_mode_raises(tmp_path, mode, packs, match):
+    with pytest.raises(ExperimentConfigError, match=match):
         _load_mode(tmp_path, _mode_yaml(mode=mode, packs=packs))
 
 
@@ -163,7 +168,7 @@ def test_omitted_packs_defaults_to_the_modes_pack(tmp_path, mode, pack, primary)
 def test_primary_objective_override_must_match_mode(tmp_path):
     body = _mode_yaml() + f"objective:\n  primary: {SHELL_SUCCESS_OBJECTIVE}\n"
 
-    with pytest.raises(ExperimentConfigError, match="can only score objective.primary=tool_alignment"):
+    with pytest.raises(ExperimentConfigError, match="cannot score objective.primary"):
         _load_mode(tmp_path, body)
 
 

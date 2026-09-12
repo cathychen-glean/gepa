@@ -76,6 +76,8 @@ class SingleModelALRolloutOutput(BaseALRolloutOutput):
     student_eval_run_id: str
     shell_action_inputs: NotRequired[list[str]]
     eval_trace_id: NotRequired[str]
+    student_loops: NotRequired[int]
+    correctness: NotRequired[float]
 
 
 class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
@@ -97,6 +99,8 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_output_tokens: int
     student_eval_run_id: NotRequired[str]
     teacher_eval_run_id: NotRequired[str]
+    student_citations: NotRequired[list[str]]
+    teacher_citations: NotRequired[list[str]]
 
 
 class SingleModelALTrajectory(TypedDict):

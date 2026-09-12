@@ -13,39 +13,20 @@ from glean_gepa.adapter_types import (
 from glean_gepa.al_adapter import (
     ALRunner,
     GleanAdapterBase,
-    ReflectiveExample,
-    ReflectiveExampleInputs,
-    ReflectiveExampleMetrics,
     Thresholds,
-    enrich_shell_error_action_inputs,
-    log_shell_tool_error_analysis,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
+from glean_gepa.objectives import SingleModelObjective
+from glean_gepa.objectives.shell import ShellSuccessObjective, ShellToolTelemetryPendingError
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
-from glean_gepa.reflection_prompts import single_model_reflection_prompt
-from glean_gepa.reflection_sampling import strip_stdout_sections
-from glean_gepa.shell_tool_error_util import (
-    SHELL_SUCCESS_OBJECTIVE,
-    EvalRunShellToolErrorAnalysis,
-    fetch_eval_run_shell_tool_error_analysis,
-    fetch_high_signal_evalset_entries,
-)
-
-
-class ShellToolTelemetryPendingError(RuntimeError):
-    """Raised when an eval has not yet emitted shell telemetry."""
-
-
-DEFAULT_COMPOSITE_WEIGHTS = {SHELL_SUCCESS_OBJECTIVE: 1.0}
 
 
 class SingleModelAdapter(GleanAdapterBase):
-    """Optimize prompts for a single student model using shell-tool error evidence."""
+    """Optimize prompts for a single student model using an injected telemetry objective."""
 
     supports_high_signal_eval = True
-    telemetry_dimensions = (SHELL_SUCCESS_OBJECTIVE,)
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
         """Keep the parent eval ID required to map trace-side UUIDs to source entries."""
@@ -69,11 +50,9 @@ class SingleModelAdapter(GleanAdapterBase):
         return enriched
 
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
-        """Upload/reuse focused eval sets once, before concurrent child screening.
-
-        Uses ``SESSION`` so child screens restore the parent ``stt`` and can
-        reproduce the same shell errors. Teacher-student uses ``QUERY_CANONICAL``.
-        """
+        """Upload/reuse focused eval sets once, before concurrent child screening."""
+        if self.objective.focused_bucket_type != SESSION_BUCKET_TYPE:
+            return super().prepare_high_signal_batch(batch)
         prepared: list[ALDataInst] = []
         for data in batch:
             entry_ids = None if data.get("validation_only") else data.get("eval_entry_ids")
@@ -85,14 +64,15 @@ class SingleModelAdapter(GleanAdapterBase):
             if not source_eval_run_id:
                 print("[Focused eval set] Missing the parent eval run ID needed to resolve source entries")
                 return None
-            source_entries = fetch_high_signal_evalset_entries(
-                self.bigquery_client,
+            source_entries = self.objective.prepare_focused_source_entries(
                 eval_set_name=data["eval_set_name"],
                 eval_set_version=data["eval_set_version"],
                 eval_run_id=source_eval_run_id,
                 entry_ids=entry_ids,
                 deployment_ids=data["deployment_ids"],
             )
+            if source_entries is None:
+                return None
             resolved_entry_ids = sorted({str(entry["id"]) for entry in source_entries})
             missing_entry_ids = sorted(set(entry_ids) - set(resolved_entry_ids))
             if missing_entry_ids:
@@ -110,7 +90,7 @@ class SingleModelAdapter(GleanAdapterBase):
                 deployment_ids=data["deployment_ids"],
                 entry_ids=resolved_entry_ids,
                 source_entries=source_entries,
-                bucket_type=SESSION_BUCKET_TYPE,
+                bucket_type=self.objective.focused_bucket_type,
             )
             if focused is None:
                 return None
@@ -136,68 +116,64 @@ class SingleModelAdapter(GleanAdapterBase):
         agentspan_lookback_days: int = 1,
         editable_modules: list[str] | None = None,
         cache_file: str | None = None,
-        primary_objective: str = SHELL_SUCCESS_OBJECTIVE,
+        primary_objective: str | None = None,
         default_frontier_type: str = "objective",
         composite_weights: dict[str, float] | None = None,
         constant_scores: dict[str, float] | None = None,
+        objective: SingleModelObjective | None = None,
     ):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
         self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
+        self.objective = objective or ShellSuccessObjective(
+            bigquery_client=bigquery_client,
+            lookback_days=agentspan_lookback_days,
+        )
+        self.telemetry_dimensions = self.objective.telemetry_dimensions
         super().__init__(
             runner=runner,
             thresholds=thresholds,
             student_model=student_model,
             evaluate_fn=self._evaluate_single_model,
-            failure_pattern_fn=self._create_failure_pattern,
-            reflective_example_fn=self._build_reflective_example,
-            reflection_prompt_fn=single_model_reflection_prompt,
-            reflective_metrics_fn=self._format_reflective_metrics,
-            failure_label="HIGH-SIGNAL FAILURES",
-            primary_objective=primary_objective,
+            failure_pattern_fn=self.objective.failure_pattern,
+            reflective_example_fn=self.objective.build_reflective_example,
+            reflection_prompt_fn=self.objective.reflection_prompt,
+            reflective_metrics_fn=self.objective.format_reflective_metrics,
+            failure_label=self.objective.failure_label,
+            primary_objective=primary_objective or self.objective.name,
             default_frontier_type=default_frontier_type,
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
-            composite_weights=dict(DEFAULT_COMPOSITE_WEIGHTS if composite_weights is None else composite_weights),
+            composite_weights=dict({self.objective.name: 1.0} if composite_weights is None else composite_weights),
             constant_scores=dict(constant_scores or {}),
             cache_file=cache_file,
         )
 
-    def _get_or_fetch_shell_error_analysis(
+    @property
+    def _eval_analysis_cache(self) -> dict[str, Any]:
+        return getattr(self.objective, "_eval_analysis_cache", {})
+
+    def _extra_cache_payload(self) -> dict[str, Any]:
+        return {"eval_analysis_cache": self.objective.cache_payload()}
+
+    def _load_extra_cache(self, data: dict[str, Any]) -> None:
+        self.objective.load_cache(data.get("eval_analysis_cache", {}))
+
+    def _get_or_fetch_analysis(
         self,
         eval_id: str,
         *,
         include_error_examples: bool = True,
         include_per_entry: bool = True,
-    ) -> EvalRunShellToolErrorAnalysis:
-        cached = self._eval_analysis_cache.get(eval_id)
-        if cached is not None:
-            missing_entry_breakdown = (
-                include_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0
-            )
-            if not missing_entry_breakdown:
-                print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
-                return cached
-            print(f"[Cache] Refetching shell error analysis with per-entry metrics for eval_id: {eval_id}")
-        analysis = fetch_eval_run_shell_tool_error_analysis(
-            self.bigquery_client,
-            eval_id=eval_id,
-            lookback_days=self.agentspan_lookback_days,
+    ):
+        analysis = self.objective.analyze(
+            eval_id,
             include_error_examples=include_error_examples,
             include_per_entry=include_per_entry,
+            evalcli=self.runner.evalcli,
         )
-        if include_error_examples:
-            analysis = enrich_shell_error_action_inputs(self.runner.evalcli, analysis)
-            # BigQuery telemetry can arrive after the eval run reports
-            # completion (and even in the next UTC shard). A 0/0 result is
-            # therefore provisional; persisting it prevents the later, real
-            # shell metrics from ever being fetched.
-            if analysis.aggregate.shell_executions == 0:
-                print(f"[Cache] Not caching provisional 0/0 shell analysis for eval_id: {eval_id}")
-                return analysis
-            with self._cache_lock:
-                self._eval_analysis_cache[eval_id] = analysis
-                self._save_cache()
+        if eval_id in self._eval_analysis_cache:
+            self._save_cache()
         return analysis
 
     def _evaluate_single_model(
@@ -206,9 +182,7 @@ class SingleModelAdapter(GleanAdapterBase):
         candidate: dict[str, str],
         capture_traces: bool,
     ) -> GleanEvaluationBatch:
-        # Always build the same minimal error trajectories so a later trace
-        # request can reuse the cached eval run and shell-error analysis.
-        result = self._evaluate_with_shell_error_rate(
+        result = self._evaluate_student_objective(
             cast(list[SingleModelALDataInst], batch), candidate, capture_traces=capture_traces
         )
         if capture_traces:
@@ -222,65 +196,7 @@ class SingleModelAdapter(GleanAdapterBase):
             eval_run_ids=result.eval_run_ids,
         )
 
-    def _create_failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
-        output = trajectory["output"]
-        shell_success_rate = trajectory.get("objective_scores", {}).get(SHELL_SUCCESS_OBJECTIVE, 1.0)
-        return (
-            int(shell_success_rate < 0.9),
-            int(output.get("student_tool_errors", 0) > 0),
-            len(output.get("shell_error_messages", [])),
-        )
-
-    def _build_reflective_example(
-        self,
-        component_name: str,
-        trajectory: SingleModelALTrajectory,
-        candidate: dict[str, str],
-    ) -> ReflectiveExample:
-        output = trajectory["output"]
-        shell_success_rate = trajectory.get("objective_scores", {}).get(SHELL_SUCCESS_OBJECTIVE, 1.0)
-        shell_error_messages = [
-            sanitized for error in output.get("shell_error_messages", []) if (sanitized := strip_stdout_sections(error))
-        ]
-        if shell_error_messages:
-            # Keep the concrete text solely in ``Execution Errors``. Repeating
-            # it in feedback wastes reflection context without adding signal.
-            feedback = "Resolve the shell execution failures shown above."
-        elif output.get("student_tool_errors", 0) > 0:
-            feedback = f"Tool errors: Student encountered {output.get('student_tool_errors', 0)} shell tool errors."
-        else:
-            feedback = "General shell tool reliability issue."
-
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        if eval_run_id := trajectory["data"].get("eval_run_id"):
-            inputs["eval_run_id"] = eval_run_id
-        if eval_trace_id := trajectory["data"].get("eval_trace_id"):
-            inputs["eval_trace_id"] = eval_trace_id
-
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
-                "student_answer": "",
-                "teacher_answer": "",
-                "student_tools": [],
-                "teacher_tools": [],
-            },
-            "Action Inputs": output.get("shell_action_inputs", [])[:5],
-            "Execution Errors": shell_error_messages[:5],
-            "Feedback": feedback,
-            "Metrics": {"score": trajectory["score"], "shell_success_rate": shell_success_rate},
-        }
-
-    @staticmethod
-    def _format_reflective_metrics(metrics: ReflectiveExampleMetrics) -> str | None:
-        return None
-
-    def _evaluate_with_shell_error_rate(
+    def _evaluate_student_objective(
         self,
         batch: list[SingleModelALDataInst],
         candidate: dict[str, str],
@@ -302,7 +218,7 @@ class SingleModelAdapter(GleanAdapterBase):
         all_trajectories: list[SingleModelALTrajectory] = []
         all_objective_scores: list[dict[str, float]] = []
         all_eval_run_ids: list[EvalRunIds] = []
-        summary_shell_rates: list[float] = []
+        summary_rates: list[float] = []
         total_high_signal_entries = 0
 
         for al_data_inst in batch:
@@ -312,12 +228,10 @@ class SingleModelAdapter(GleanAdapterBase):
                 self.runner.evalcli,
                 al_data_inst,
                 bigquery_client=self.bigquery_client,
-                bucket_type=SESSION_BUCKET_TYPE,
+                bucket_type=self.objective.focused_bucket_type,
             )
             if target is None:
-                # Do not fall back to the full eval set: a failed focused
-                # setup must not let a candidate bypass the gate.
-                summary_shell_rates.append(0.0)
+                summary_rates.append(0.0)
                 continue
             eval_set_name = target.eval_set_name
             eval_set_version = target.eval_set_version
@@ -344,174 +258,68 @@ class SingleModelAdapter(GleanAdapterBase):
             )
             if not is_focused_eval:
                 evaluation_kind = "Trace evaluation" if capture_traces else "Validation"
+                label = self.objective.pending_telemetry_label or self.objective.name
                 print(
                     f"[{evaluation_kind}] Reading "
-                    f"{'eval-set' if capture_traces else 'full-validation'} shell results for "
+                    f"{'eval-set' if capture_traces else 'full-validation'} {label} results for "
                     f"{eval_set_name} {eval_set_version}: {student_eval_id}"
                 )
-            analysis = self._get_or_fetch_shell_error_analysis(
+            analysis = self._get_or_fetch_analysis(
                 student_eval_id,
-                # Full validation only needs the aggregate score. Per-entry
-                # ARRAY_AGG + evalcli trace hydration can stall for minutes on
-                # a Medium eval with no further logs.
                 include_error_examples=capture_traces and not is_focused_eval,
                 include_per_entry=is_focused_eval or capture_traces,
             )
-            if analysis.aggregate.shell_executions == 0:
-                raise ShellToolTelemetryPendingError(
-                    f"No shell telemetry is available yet for eval {student_eval_id}; refusing to score 0/0 as success"
+            if self.objective.is_pending(analysis):
+                label = self.objective.pending_telemetry_label or self.objective.name
+                raise self.objective.pending_error_type(
+                    f"No {label} telemetry is available yet for eval {student_eval_id}; "
+                    "refusing to score 0/0 as success"
                 )
             if not is_focused_eval:
-                log_shell_tool_error_analysis(analysis)
-            # Focused eval sets get fresh entry IDs on upload, so trajectories
-            # must use the IDs returned by the focused run. The requested source
-            # IDs still provide the denominator for the screening rate.
-            high_signal_entry_ids = (
-                tuple(analysis.per_entry) or tuple(requested_entry_ids)
-                if requested_entry_ids
-                else analysis.high_signal_entry_ids
-            )
+                self.objective.log_analysis(analysis)
 
+            high_signal_entry_ids = self.objective.entry_ids_to_score(analysis, requested_entry_ids)
             if is_focused_eval:
-                passed_entries = sum(
-                    1 for entry_metrics in analysis.per_entry.values() if entry_metrics.shell_errors == 0
-                )
-                summary_shell_rates.append(passed_entries / len(requested_entry_ids))
+                assert requested_entry_ids is not None
+                summary_rates.append(self.objective.focused_pass_rate(analysis, requested_entry_ids))
+                total_high_signal_entries += len(requested_entry_ids)
             else:
-                summary_shell_rates.append(analysis.aggregate.shell_success_rate)
-            total_high_signal_entries += len(requested_entry_ids) if is_focused_eval else len(high_signal_entry_ids)
+                summary_rates.append(self.objective.aggregate_score(analysis))
+                total_high_signal_entries += len(high_signal_entry_ids)
 
-            # A full validation eval-set item represents the whole eval run,
-            # not each of its high-signal entries. The engine has one val ID
-            # per configured eval set, so returning entry-level scores here
-            # would let its zip() persist an arbitrary entry as the full-val
-            # result. Entry-level results are retained only for trace-capturing
-            # training evaluations, where reflection needs those examples.
-            if not is_focused_eval and not capture_traces:
-                output: SingleModelALRolloutOutput = {
-                    "deployment_id": deployment_ids[0] if deployment_ids else "",
-                    "query": f"{eval_set_name}:{eval_set_version}",
-                    "student_tool_calls": analysis.aggregate.shell_executions,
-                    "student_tool_errors": analysis.aggregate.shell_errors,
-                    "entry_id": f"{eval_set_name}:{eval_set_version}",
-                    "shell_error_messages": [
-                        example.error_str for example in analysis.aggregate.recent_error_examples if example.error_str
-                    ],
-                    "student_eval_run_id": student_eval_id,
-                }
-                shell_action_inputs = [
-                    example.action_input for example in analysis.aggregate.recent_error_examples if example.action_input
-                ]
-                if shell_action_inputs:
-                    output["shell_action_inputs"] = shell_action_inputs
-                objective_score = {
-                    **self.constant_scores,
-                    SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
-                }
-                all_outputs.append(output)
-                all_scores.append(self.composite_score(objective_score))
-                all_objective_scores.append(objective_score)
-                continue
-
-            if not high_signal_entry_ids:
-                shell_error_messages = [
-                    example.error_str for example in analysis.aggregate.recent_error_examples if example.error_str
-                ]
-                shell_action_inputs = [
-                    example.action_input for example in analysis.aggregate.recent_error_examples if example.action_input
-                ]
-                output: SingleModelALRolloutOutput = {
-                    "deployment_id": deployment_ids[0] if deployment_ids else "",
-                    "query": f"{eval_set_name}:{eval_set_version}",
-                    "student_tool_calls": analysis.aggregate.shell_executions,
-                    "student_tool_errors": analysis.aggregate.shell_errors,
-                    "entry_id": f"{eval_set_name}:{eval_set_version}",
-                    "shell_error_messages": shell_error_messages,
-                    "student_eval_run_id": student_eval_id,
-                }
-                if shell_action_inputs:
-                    output["shell_action_inputs"] = shell_action_inputs
-                objective_score = {
-                    **self.constant_scores,
-                    SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate,
-                }
+            scored_rows = self.objective.scored_rows(
+                analysis,
+                al_data_inst=al_data_inst,
+                student_eval_id=student_eval_id,
+                eval_set_name=eval_set_name,
+                eval_set_version=eval_set_version,
+                deployment_ids=deployment_ids,
+                requested_entry_ids=requested_entry_ids,
+                is_focused_eval=is_focused_eval,
+                capture_traces=capture_traces,
+            )
+            for row in scored_rows:
+                output = cast(SingleModelALRolloutOutput, dict(row.output))
+                objective_score = {**self.constant_scores, **row.dimension_scores}
                 score = self.composite_score(objective_score)
                 all_outputs.append(output)
                 all_scores.append(score)
                 all_objective_scores.append(objective_score)
-                all_trajectories.append(
-                    {
-                        "data": al_data_inst,
-                        "output": output,
-                        "score": score,
-                        "objective_scores": objective_score,
-                    }
-                )
-                continue
-
-            for entry_id in high_signal_entry_ids:
-                entry_metrics = analysis.per_entry.get(entry_id, analysis.aggregate)
-                failed_eval_example = next(
-                    (example for example in entry_metrics.recent_error_examples if example.trace_id),
-                    None,
-                )
-                eval_trace_id = failed_eval_example.trace_id if failed_eval_example else None
-                eval_trace_examples = [
-                    example
-                    for example in entry_metrics.recent_error_examples
-                    if eval_trace_id is None or example.trace_id == eval_trace_id
-                ]
-                shell_error_messages = [example.error_str for example in eval_trace_examples if example.error_str]
-                shell_action_inputs = [example.action_input for example in eval_trace_examples if example.action_input]
-                entry_output: SingleModelALRolloutOutput = {
-                    "deployment_id": deployment_ids[0] if deployment_ids else "",
-                    "query": f"{eval_set_name}:{eval_set_version} entry={entry_id}",
-                    "student_tool_calls": entry_metrics.shell_executions,
-                    "student_tool_errors": entry_metrics.shell_errors,
-                    "entry_id": entry_id,
-                    "shell_error_messages": shell_error_messages,
-                    "student_eval_run_id": student_eval_id,
-                }
-                if shell_action_inputs:
-                    entry_output["shell_action_inputs"] = shell_action_inputs
-                if eval_trace_id:
-                    entry_output["eval_trace_id"] = eval_trace_id
-                entry_data: SingleModelALDataInst = {
-                    **al_data_inst,
-                    "eval_entry_id": entry_id,
-                    "eval_run_id": student_eval_id,
-                }
-                if eval_trace_id:
-                    entry_data["eval_trace_id"] = eval_trace_id
-                all_outputs.append(entry_output)
-                # Focused screening is entry-level: an entry passes only when it
-                # has no tool errors. This keeps the 50% gate independent of the
-                # number of shell calls each entry happens to make.
-                shell_success = (
-                    float(entry_id in analysis.per_entry and entry_metrics.shell_errors == 0)
-                    if is_focused_eval
-                    else entry_metrics.shell_success_rate
-                )
-                entry_objective_score = {
-                    **self.constant_scores,
-                    SHELL_SUCCESS_OBJECTIVE: shell_success,
-                }
-                entry_score = self.composite_score(entry_objective_score)
-                all_scores.append(entry_score)
-                all_objective_scores.append(entry_objective_score)
-                all_trajectories.append(
-                    {
-                        "data": entry_data,
-                        "output": entry_output,
-                        "score": entry_score,
-                        "objective_scores": entry_objective_score,
-                    }
-                )
+                if is_focused_eval or capture_traces:
+                    entry_data = {**al_data_inst, **row.data_overrides}
+                    all_trajectories.append(
+                        {
+                            "data": cast(SingleModelALDataInst, entry_data),
+                            "output": output,
+                            "score": score,
+                            "objective_scores": objective_score,
+                        }
+                    )
 
         summary = None
-        if summary_shell_rates:
+        if summary_rates:
             summary = {
-                SHELL_SUCCESS_OBJECTIVE: sum(summary_shell_rates) / len(summary_shell_rates),
+                self.objective.name: sum(summary_rates) / len(summary_rates),
                 "high_signal_entry_count": float(total_high_signal_entries),
             }
 
@@ -530,4 +338,5 @@ __all__ = [
     "SingleModelALRolloutOutput",
     "SingleModelALTrajectory",
     "SingleModelAdapter",
+    "ShellToolTelemetryPendingError",
 ]

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from glean_gepa.bigquery_client import BigQueryClient, BigQueryError
-from glean_gepa.shell_tool_error_util import (
+from glean_gepa.objectives.utils.shell_tool_error_util import (
     SHELL_ACTION_IDS,
     SHELL_SPAN_NAMES,
     ShellToolErrorEntryMetrics,
@@ -180,18 +180,18 @@ def test_build_eval_run_search_params_uses_lookback_window():
 
 
 def test_default_date_range_uses_utc_today_not_host_local():
-    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 3)):
+    with patch("glean_gepa.objectives.utils.agentspan_query.utc_today", return_value=date(2026, 9, 3)):
         assert default_date_range(lookback_days=7) == (date(2026, 8, 27), date(2026, 9, 4))
 
 
 def test_default_date_range_always_includes_next_utc_shard():
-    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 2)):
+    with patch("glean_gepa.objectives.utils.agentspan_query.utc_today", return_value=date(2026, 9, 2)):
         assert default_date_range(lookback_days=7) == (date(2026, 8, 26), date(2026, 9, 3))
 
 
 def test_resolve_eval_run_date_range_includes_next_utc_shard_when_today_is_local():
     eval_start_utc = int(datetime(2026, 9, 3, 2, 8, tzinfo=timezone.utc).timestamp() * 1000)
-    with patch("glean_gepa.shell_tool_error_util.utc_today", return_value=date(2026, 9, 2)):
+    with patch("glean_gepa.objectives.utils.agentspan_query.utc_today", return_value=date(2026, 9, 2)):
         resolved = resolve_eval_run_date_range(
             {"min_start_ms": eval_start_utc, "max_start_ms": eval_start_utc},
             lookback_days=7,
@@ -319,7 +319,7 @@ def test_parse_shell_tool_error_metrics_from_bigquery_row():
 
 
 def test_parse_shell_tool_error_entry_metrics_includes_trace_ids():
-    from glean_gepa.shell_tool_error_util import parse_shell_tool_error_entry_metrics
+    from glean_gepa.objectives.utils.shell_tool_error_util import parse_shell_tool_error_entry_metrics
 
     metrics = parse_shell_tool_error_entry_metrics(
         {
