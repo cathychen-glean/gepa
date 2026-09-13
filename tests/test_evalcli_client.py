@@ -23,6 +23,13 @@ from glean_gepa.judge_metrics_util import (
     wait_for_judge_metrics,
 )
 
+OPAQUE_EVALCLI_ERROR = EvalCliError(
+    "evalcli failed (exit 1): /bin/evalcli judge create --eval-run-id student-run "
+    '--judge-type COMPLETENESS --run-params {"Llm model": "default", "Use Cache": "true"} --json\n'
+    "stderr: Error:\n"
+    "stdout: "
+)
+
 
 def test_coding_harness_sc_params_selects_coding_agent_loop():
     runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
@@ -82,10 +89,68 @@ def test_create_eval_run_invokes_evalcli_with_expected_args():
     mock_invoke.assert_called_once()
     args = mock_invoke.call_args[0]
     assert args[0:4] == ("run", "create", "--eval-set", "AI Answers Small:20260403")
-    preset_idx = args.index("--preset")
-    assert args[preset_idx + 1] == "Coding Harness"
+    runner_idx = args.index("--runner-type")
+    assert args[runner_idx + 1] == "GLEAN_CHAT"
+    assert "--preset" not in args
     assert "--sc-params" in args
     assert "--eval-params" in args
+
+
+@pytest.mark.parametrize(
+    "cmd_prefix, success, expected, call",
+    [
+        (
+            ("run", "create"),
+            {"id": "run_ok"},
+            "run_ok",
+            lambda client: client.create_eval_run(
+                eval_run_id="run_ok",
+                eval_set_name="AI Answers Small",
+                eval_set_version="20260403",
+                deployment_ids=["scio-prod"],
+                description="GEPA eval run for AI Answers Small:20260403",
+            ),
+        ),
+        (
+            ("evalsets", "entries"),
+            {"evalSetEntries": [{"id": "e1"}], "pageInfo": {"totalPages": 1}},
+            [{"id": "e1"}],
+            lambda client: client.list_eval_set_entries(
+                eval_set_name="Glean Chat V2 Medium",
+                eval_set_version="20260907",
+                deployment_ids=["scio-prod"],
+            ),
+        ),
+    ],
+    ids=["create_eval_run", "list_eval_set_entries"],
+)
+def test_evalcli_retries_opaque_errors(cmd_prefix, success, expected, call):
+    client = EvalCliClient(binary="/fake/evalcli")
+    attempts = {"n": 0}
+
+    def invoke(*args):
+        if args[:2] == cmd_prefix:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise OPAQUE_EVALCLI_ERROR
+            return success
+        raise AssertionError(args)
+
+    with (
+        patch.object(client, "_invoke_json", side_effect=invoke),
+        patch("glean_gepa.evalcli_client.time.sleep") as sleep,
+    ):
+        assert call(client) == expected
+
+    assert attempts["n"] == 2
+    sleep.assert_called_once()
+
+
+def test_evalcli_retrying_raises_on_non_transient_errors():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with patch.object(client, "_invoke_json", side_effect=EvalCliError("stderr: auth failed\nstdout: ")):
+        with pytest.raises(EvalCliError, match="auth failed"):
+            client._invoke_json_retrying("run", "create", label="run create")
 
 
 def test_al_runner_invokes_on_created_before_waiting(tmp_path):
@@ -196,14 +261,6 @@ def test_completeness_evalcli_create_list_and_metrics():
     metrics_args = mock_invoke.call_args[0]
     assert metrics_args[0:2] == ("metrics", "summary")
     assert metrics_args[metrics_args.index("--test-eval-id") + 1] == "student-run"
-
-
-OPAQUE_EVALCLI_ERROR = EvalCliError(
-    "evalcli failed (exit 1): /bin/evalcli judge create --eval-run-id student-run "
-    '--judge-type COMPLETENESS --run-params {"Llm model": "default", "Use Cache": "true"} --json\n'
-    "stderr: Error:\n"
-    "stdout: "
-)
 
 
 def test_create_judge_run_retries_opaque_error():

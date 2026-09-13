@@ -99,6 +99,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         write_agent_state: bool = False,
         # Budget and Stop Condition
         stop_callback: StopperProtocol | None = None,
+        max_stalled_proposals: int | None = None,
         val_evaluation_policy: EvaluationPolicy[DataId, DataInst] | None = None,
         # Evaluation caching (stored in state, passed here for initialization)
         evaluation_cache: EvaluationCache[RolloutOutput, DataId] | None = None,
@@ -111,6 +112,9 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Set up stopping mechanism
         self.stop_callback = stop_callback
+        # Guard against a degenerate no-progress spin: some proposers legitimately
+        # return no candidates for an iteration so we stop gracefully.
+        self.max_stalled_proposals = max_stalled_proposals
         self.adapter = adapter
 
         # Store cache reference for state initialization (actual cache lives in GEPAState)
@@ -734,6 +738,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Main loop
         last_pbar_val = 0
+        consecutive_stalled_proposals = 0
         if self._should_stop(state):
             remaining = self._get_remaining_budget(state)
             budget = f', remaining budget={remaining}' if remaining is not None else ''
@@ -768,11 +773,20 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
                 proposals = self.reflective_proposer.propose(state)
                 if not proposals:
+                    consecutive_stalled_proposals += 1
                     self.logger.log(
                         f'Iteration {self._display_iteration(state)}: Reflective mutation did not propose a new candidate'
                     )
+                    if self._stall_limit_reached(consecutive_stalled_proposals):
+                        self.logger.log(
+                            f'Iteration {self._display_iteration(state)}: No candidate proposed for '
+                            f'{consecutive_stalled_proposals} consecutive iterations (nothing left to optimize)'
+                        )
+                        self._stop_requested = True
+                        break
                     continue
 
+                consecutive_stalled_proposals = 0
                 self._run_reflective_batch(proposals, state)
 
             except Exception as e:
@@ -893,6 +907,16 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                 'proposed_text',
             ],
             data=rows,
+        )
+
+    def _stall_limit_reached(self, consecutive_stalled_proposals: int) -> bool:
+        """True when too many consecutive iterations proposed no candidate.
+
+        Disabled (always ``False``) when ``max_stalled_proposals`` is ``None``.
+        """
+        return (
+            self.max_stalled_proposals is not None
+            and consecutive_stalled_proposals >= self.max_stalled_proposals
         )
 
     def _should_stop(self, state: GEPAState[RolloutOutput, DataId]) -> bool:
