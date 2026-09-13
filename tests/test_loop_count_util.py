@@ -8,6 +8,8 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.experiment_config import load_experiment_config
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
+from glean_gepa.objectives import build_objective
+from glean_gepa.objectives.loop import LoopEfficiencyObjective
 from glean_gepa.objectives.utils.loop_count_util import (
     LOOP_EFFICIENCY_OBJECTIVE,
     EvalRunLoopCountAnalysis,
@@ -19,8 +21,6 @@ from glean_gepa.objectives.utils.loop_count_util import (
     overlay_evalcli_loop_and_correctness,
     parse_loop_count_entry_metrics,
 )
-from glean_gepa.objectives import build_objective
-from glean_gepa.objectives.loop import LoopEfficiencyObjective
 from glean_gepa.single_model_adapter import SingleModelAdapter
 
 

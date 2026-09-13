@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from glean_gepa.objectives.tool_match import FirstToolMatchObjective
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
     SKIPPED_TOOL_NAMES,
     NoComparedEvalEntriesError,
@@ -21,8 +23,6 @@ from glean_gepa.objectives.utils.tool_match_util import (
     require_compared_eval_entries,
     scored_tool_sequence,
 )
-from glean_gepa.objectives.tool_match import FirstToolMatchObjective
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():

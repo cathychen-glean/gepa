@@ -6,6 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from glean_gepa.experiment_config import load_experiment_config
+from glean_gepa.objectives import build_objective
+from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.citation_match_util import (
     CitationMatchEntryMetrics,
     NoComparedCitationEntriesError,
@@ -19,9 +22,6 @@ from glean_gepa.objectives.utils.citation_match_util import (
     require_compared_citation_entries,
     scored_citation_ids,
 )
-from glean_gepa.experiment_config import load_experiment_config
-from glean_gepa.objectives import build_objective
-from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
