@@ -107,6 +107,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
 
     def _get_or_fetch_analysis(self, teacher_eval_id: str, student_eval_id: str):
         self.objective.bigquery_client = self.bigquery_client
+        self.objective.evalcli = self.runner.evalcli
         self.objective.lookback_days = self.agentspan_lookback_days
         analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()

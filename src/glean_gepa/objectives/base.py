@@ -51,6 +51,9 @@ class TeacherStudentObjective(ABC):
     failure_label: str = "HIGH-SIGNAL FAILURES"
     reflection_report_title: str = "REFLECTION: teacher vs student traces"
     bigquery_client: Any | None = None
+    # evalcli client used to resolve per-entry tool payloads from detailed traces
+    # (the scrubbed table cannot serve them). The adapter injects it before analyze.
+    evalcli: Any | None = None
     lookback_days: int = 1
     # Per-pair analysis cache, keyed by (teacher_eval_id, student_eval_id).
     # Concrete objectives populate this in ``__init__``.
@@ -92,6 +95,7 @@ class TeacherStudentObjective(ABC):
                 teacher_eval_id=teacher_eval_id,
                 student_eval_id=student_eval_id,
                 lookback_days=self.lookback_days,
+                evalcli=self.evalcli,
             )
         cache[cache_key] = analysis
         print(f"[Cache MISS] Fetched {label} for {teacher_eval_id} vs {student_eval_id}")

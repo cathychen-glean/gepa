@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 
+from glean_gepa.objectives.utils.action_input_trace import (
+    build_trace_locator,
+    fetch_action_inputs_by_entry,
+)
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
@@ -15,6 +19,9 @@ from glean_gepa.objectives.utils.agentspan_query import (
     run_windowed_per_entry_query,
     wildcard_shard_filter,
 )
+
+# Reflection surfaces at most this many tool payloads per entry.
+ACTION_INPUT_SURFACE_LIMIT = 5
 
 LOOP_EFFICIENCY_OBJECTIVE = "loop_efficiency"
 # 1.0 when the student finishes in this many loops or fewer. Extra loops decay
@@ -30,6 +37,7 @@ class LoopCountEntryMetrics:
     loop_count: int
     correctness: float
     has_error: bool
+    action_inputs: tuple[str, ...] = ()
 
     @property
     def loop_efficiency(self) -> float:
@@ -160,7 +168,10 @@ WITH eval_spans AS (
     (
       jsonPayload.action.execution_status = 'ERROR'
       OR jsonPayload.span_info.execution_status.code = 'ERROR'
-    ) AS is_error
+    ) AS is_error,
+    jsonPayload.context.agent_trace.trace_id AS trace_id,
+    resource.labels.project_id AS deployment_id,
+    SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
   FROM `{agentspan_table}`
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id = @eval_id
@@ -168,7 +179,11 @@ WITH eval_spans AS (
 SELECT
   entry_id,
   COUNTIF(is_loop) AS loop_count,
-  COUNTIF(is_error) > 0 AS has_error
+  COUNTIF(is_error) > 0 AS has_error,
+  ANY_VALUE(trace_id) AS trace_id,
+  ANY_VALUE(deployment_id) AS deployment_id,
+  MIN(start_ms) AS min_start_ms,
+  MAX(start_ms) AS max_start_ms
 FROM eval_spans
 WHERE entry_id IS NOT NULL
 GROUP BY entry_id
@@ -214,16 +229,63 @@ def fetch_eval_run_loop_count_analysis(
     }
     if evalcli is not None:
         per_entry = overlay_evalcli_loop_and_correctness(evalcli, eval_id, per_entry)
+    high_signal_entry_ids = tuple(
+        sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
+    )
+    if evalcli is not None:
+        per_entry = _enrich_action_inputs(evalcli, per_entry, per_entry_rows, high_signal_entry_ids)
     return EvalRunLoopCountAnalysis(
         eval_id=eval_id,
         start_date=start_date,
         end_date=resolved_end,
         aggregate=aggregate_loop_count_metrics(eval_id, per_entry),
         per_entry=per_entry,
-        high_signal_entry_ids=tuple(
-            sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
-        ),
+        high_signal_entry_ids=high_signal_entry_ids,
     )
+
+
+def _enrich_action_inputs(
+    evalcli: Any,
+    per_entry: dict[str, LoopCountEntryMetrics],
+    per_entry_rows: list[dict[str, Any]],
+    high_signal_entry_ids: tuple[str, ...],
+) -> dict[str, LoopCountEntryMetrics]:
+    """Attach the student's tool payloads to high-signal entries from their traces.
+
+    The scrubbed table cannot serve tool payloads, so resolve them from the detailed
+    trace located by the scrub-safe ids returned alongside the loop counts.
+    """
+    high_signal = set(high_signal_entry_ids)
+    locators = [
+        locator
+        for row in per_entry_rows
+        if str(row.get("entry_id") or "") in high_signal
+        for locator in [
+            build_trace_locator(
+                entry_id=str(row.get("entry_id") or ""),
+                deployment_id=row.get("deployment_id"),
+                trace_id=row.get("trace_id"),
+                min_start_ms=row.get("min_start_ms"),
+                max_start_ms=row.get("max_start_ms"),
+            )
+        ]
+        if locator is not None
+    ]
+    if not locators:
+        return per_entry
+    action_inputs_by_entry = fetch_action_inputs_by_entry(
+        evalcli, locators, limit=ACTION_INPUT_SURFACE_LIMIT, role_label="student"
+    )
+    if not action_inputs_by_entry:
+        return per_entry
+    return {
+        entry_id: (
+            replace(metrics, action_inputs=action_inputs_by_entry[entry_id])
+            if entry_id in action_inputs_by_entry
+            else metrics
+        )
+        for entry_id, metrics in per_entry.items()
+    }
 
 
 def overlay_evalcli_loop_and_correctness(
@@ -261,6 +323,7 @@ def overlay_evalcli_loop_and_correctness(
             loop_count=int(loop_count),
             correctness=float(correctness),
             has_error=has_error,
+            action_inputs=current.action_inputs if current else (),
         )
     return updated
 

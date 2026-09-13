@@ -253,6 +253,7 @@ def test_get_or_fetch_analysis_caches_fetch():
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
+        evalcli=adapter.objective.evalcli,
     )
     assert first is fetched
     assert second is fetched

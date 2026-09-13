@@ -8,7 +8,7 @@ primitives so each objective only has to describe its own SQL body and params.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -22,6 +22,25 @@ UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS = 1
 EXECUTE_ACTION_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
 )
+# Note: the scrubber strips ``span_info.inputs`` from this table, so tool-call
+# payloads are not queryable here. Objectives instead carry the scrub-safe
+# ``trace_id``/``project_id``/timestamps out of BigQuery and resolve the payloads
+# from the detailed trace (see ``action_input_trace``).
+
+
+def action_input_tuple(values: Sequence[Any] | None, *, limit: int | None = None) -> tuple[str, ...]:
+    """Non-empty, de-duplicated agentspan ``action_input`` payloads in first-seen order."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in values or []:
+        text = str(raw).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+        if limit is not None and len(ordered) >= limit:
+            break
+    return tuple(ordered)
 
 
 @dataclass(frozen=True)
