@@ -9,19 +9,19 @@ from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
-from glean_gepa.prompt_constants import RULES_EXT_KEY
-from glean_gepa.teacher_student_adapter import (
-    COMPLETENESS_DIMENSION,
-    COMPLETENESS_JUDGE,
-    TeacherStudentAdapter,
-    _StartedPair,
-)
 from glean_gepa.objectives.utils.tool_match_util import (
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
     NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
     ToolMatchMetrics,
+)
+from glean_gepa.prompt_constants import RULES_EXT_KEY
+from glean_gepa.teacher_student_adapter import (
+    COMPLETENESS_DIMENSION,
+    COMPLETENESS_JUDGE,
+    TeacherStudentAdapter,
+    _StartedPair,
 )
 
 EVAL_SET = {
@@ -253,9 +253,53 @@ def test_get_or_fetch_analysis_caches_fetch():
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
+        evalcli=adapter.objective.evalcli,
     )
     assert first is fetched
     assert second is fetched
+
+
+def test_validation_only_skips_action_input_evalcli():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.bigquery_client = MagicMock()
+    fetched = EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id="student-1",
+            compared_entries=1,
+            matching_entries=1,
+            tool_match_rate=1.0,
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        return_value=fetched,
+    ) as fetch:
+        adapter._finish_batch_evals(
+            [
+                _StartedPair(
+                    al_data_inst={**EVAL_SET, "validation_only": True},
+                    teacher_eval_id="teacher-1",
+                    student_eval_id="student-1",
+                )
+            ],
+            capture_traces=False,
+        )
+
+    fetch.assert_called_once_with(
+        adapter.bigquery_client,
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        lookback_days=adapter.agentspan_lookback_days,
+        evalcli=None,
+    )
 
 
 def test_finish_batch_evals_uses_tool_match_and_completeness():

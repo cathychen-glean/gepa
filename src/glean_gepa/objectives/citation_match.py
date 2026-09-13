@@ -31,9 +31,11 @@ def _rollout_output(
     query: str,
     student_citations: list[str],
     teacher_citations: list[str],
+    student_action_inputs: list[str] | None = None,
+    teacher_action_inputs: list[str] | None = None,
 ) -> TeacherStudentALRolloutOutput:
     """One rollout row. Citation IDs ride on optional output fields plus answers."""
-    return {
+    output: TeacherStudentALRolloutOutput = {
         "deployment_id": deployment_id,
         "query": query,
         "student_answer": _cited_blob(student_citations),
@@ -54,6 +56,11 @@ def _rollout_output(
         "student_citations": student_citations,
         "teacher_citations": teacher_citations,
     }
+    if student_action_inputs:
+        output["student_action_inputs"] = list(student_action_inputs)
+    if teacher_action_inputs:
+        output["teacher_action_inputs"] = list(teacher_action_inputs)
+    return output
 
 
 def _cited_blob(citations: Sequence[str]) -> str:
@@ -127,6 +134,8 @@ class CitationMatchObjective(TeacherStudentObjective):
                     query=query,
                     student_citations=list(citation_match.student_citations),
                     teacher_citations=list(citation_match.teacher_citations),
+                    student_action_inputs=list(citation_match.student_action_inputs),
+                    teacher_action_inputs=list(citation_match.teacher_action_inputs),
                 ),
             )
             for entry_id, citation_match in analysis.per_entry.items()
@@ -176,6 +185,9 @@ class CitationMatchObjective(TeacherStudentObjective):
             "deployment_id": output["deployment_id"],
             "query": output["query"],
         }
+        # The raw user query is scrubbed, so surface the teacher's tool payloads
+        # (the searches it ran) as the intent signal behind the cited sources.
+        teacher_action_inputs = output.get("teacher_action_inputs") or []
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -186,7 +198,7 @@ class CitationMatchObjective(TeacherStudentObjective):
                 "student_citations": student_citations,
                 "teacher_citations": teacher_citations,
             },
-            "Action Inputs": [],
+            "Action Inputs": list(teacher_action_inputs[:5]),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student citation divergence.",
             "Metrics": {

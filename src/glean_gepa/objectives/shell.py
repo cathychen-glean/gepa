@@ -218,7 +218,9 @@ class ShellSuccessObjective(SingleModelObjective):
         include_error_examples: bool = True,
         include_per_entry: bool = True,
         evalcli: Any | None = None,
+        include_action_inputs: bool = True,
     ) -> EvalRunShellToolErrorAnalysis:
+        del include_action_inputs
         cached = self._eval_analysis_cache.get(eval_id)
         if cached is not None:
             missing_entry_breakdown = (

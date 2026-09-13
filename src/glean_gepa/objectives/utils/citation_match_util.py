@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 
+from glean_gepa.objectives.utils.action_input_trace import (
+    build_trace_locator,
+    fetch_action_inputs_by_entry,
+)
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
@@ -17,6 +21,8 @@ from glean_gepa.objectives.utils.agentspan_query import (
 )
 
 CITATION_MATCH_OBJECTIVE = "citation_match"
+# Reflection surfaces at most this many tool payloads per entry.
+ACTION_INPUT_SURFACE_LIMIT = 5
 # Pull citation IDs out of whatever JSON path the span uses. Confirm against a
 # real agentspan row if this over- or under-matches.
 _CITATION_ID_JSON_REGEX = r'"(?:citationId|citation_id)"\\s*:\\s*"([^"]+)"'
@@ -32,6 +38,8 @@ class CitationMatchEntryMetrics:
     student_citations: tuple[str, ...]
     teacher_citations: tuple[str, ...]
     citations_match: bool
+    student_action_inputs: tuple[str, ...] = ()
+    teacher_action_inputs: tuple[str, ...] = ()
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -169,10 +177,26 @@ WITH citation_spans AS (
       jsonPayload.context.eval.entry_uuid,
       CAST(jsonPayload.context.eval.entry_id AS STRING)
     ) AS entry_id,
+    jsonPayload.context.agent_trace.trace_id AS trace_id,
+    resource.labels.project_id AS deployment_id,
+    SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms,
     REGEXP_EXTRACT_ALL(TO_JSON_STRING(jsonPayload), r'{_CITATION_ID_JSON_REGEX}') AS citation_ids
   FROM `{agentspan_table}`
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
+),
+per_role_agg AS (
+  SELECT
+    entry_id,
+    eval_id,
+    ARRAY_CONCAT_AGG(citation_ids) AS citation_ids,
+    ANY_VALUE(trace_id) AS trace_id,
+    ANY_VALUE(deployment_id) AS deployment_id,
+    MIN(start_ms) AS min_start_ms,
+    MAX(start_ms) AS max_start_ms
+  FROM citation_spans
+  WHERE entry_id IS NOT NULL
+  GROUP BY entry_id, eval_id
 ),
 per_role AS (
   SELECT
@@ -180,24 +204,36 @@ per_role AS (
     eval_id,
     ARRAY(
       SELECT DISTINCT citation_id
-      FROM UNNEST(ARRAY_CONCAT_AGG(citation_ids)) AS citation_id
+      FROM UNNEST(citation_ids) AS citation_id
       WHERE citation_id IS NOT NULL AND citation_id != ''
       ORDER BY citation_id
-    ) AS citations
-  FROM citation_spans
-  WHERE entry_id IS NOT NULL
-  GROUP BY entry_id, eval_id
+    ) AS citations,
+    trace_id,
+    deployment_id,
+    min_start_ms,
+    max_start_ms
+  FROM per_role_agg
 ),
 student AS (
-  SELECT entry_id, citations FROM per_role WHERE eval_id = @student_eval_id
+  SELECT entry_id, citations, trace_id, deployment_id, min_start_ms, max_start_ms
+  FROM per_role WHERE eval_id = @student_eval_id
 ),
 teacher AS (
-  SELECT entry_id, citations FROM per_role WHERE eval_id = @teacher_eval_id
+  SELECT entry_id, citations, trace_id, deployment_id, min_start_ms, max_start_ms
+  FROM per_role WHERE eval_id = @teacher_eval_id
 )
 SELECT
   COALESCE(student.entry_id, teacher.entry_id) AS entry_id,
   IFNULL(student.citations, ARRAY<STRING>[]) AS student_citations,
-  IFNULL(teacher.citations, ARRAY<STRING>[]) AS teacher_citations
+  IFNULL(teacher.citations, ARRAY<STRING>[]) AS teacher_citations,
+  student.trace_id AS student_trace_id,
+  student.deployment_id AS student_deployment_id,
+  student.min_start_ms AS student_min_start_ms,
+  student.max_start_ms AS student_max_start_ms,
+  teacher.trace_id AS teacher_trace_id,
+  teacher.deployment_id AS teacher_deployment_id,
+  teacher.min_start_ms AS teacher_min_start_ms,
+  teacher.max_start_ms AS teacher_max_start_ms
 FROM student
 FULL OUTER JOIN teacher
   ON student.entry_id = teacher.entry_id
@@ -213,6 +249,7 @@ def fetch_eval_run_citation_match_analysis(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+    evalcli: Any | None = None,
 ) -> EvalRunCitationMatchAnalysis:
     eval_ids = [teacher_eval_id, student_eval_id]
     result = run_windowed_per_entry_query(
@@ -249,6 +286,11 @@ def fetch_eval_run_citation_match_analysis(
         for metrics in [parse_citation_match_entry_metrics(row)]
         if metrics.entry_id
     }
+    high_signal_entry_ids = tuple(
+        sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.citations_match)
+    )
+    if evalcli is not None:
+        per_entry = _enrich_action_inputs(evalcli, per_entry, per_entry_rows, high_signal_entry_ids)
     return EvalRunCitationMatchAnalysis(
         teacher_eval_id=teacher_eval_id,
         student_eval_id=student_eval_id,
@@ -256,10 +298,56 @@ def fetch_eval_run_citation_match_analysis(
         end_date=resolved_end,
         aggregate=aggregate_citation_match_metrics(teacher_eval_id, student_eval_id, per_entry),
         per_entry=per_entry,
-        high_signal_entry_ids=tuple(
-            sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.citations_match)
-        ),
+        high_signal_entry_ids=high_signal_entry_ids,
     )
+
+
+def _enrich_action_inputs(
+    evalcli: Any,
+    per_entry: dict[str, CitationMatchEntryMetrics],
+    per_entry_rows: list[dict[str, Any]],
+    high_signal_entry_ids: tuple[str, ...],
+) -> dict[str, CitationMatchEntryMetrics]:
+    """Attach teacher and student tool payloads to high-signal entries from traces.
+
+    The scrubbed table cannot serve tool payloads, so resolve them from each role's
+    detailed trace located by the scrub-safe ids returned alongside the citations.
+    """
+    high_signal = set(high_signal_entry_ids)
+    rows = [row for row in per_entry_rows if str(row.get("entry_id") or "") in high_signal]
+    if not rows:
+        return per_entry
+
+    def _locators(role: str) -> list[Any]:
+        collected = []
+        for row in rows:
+            locator = build_trace_locator(
+                entry_id=str(row.get("entry_id") or ""),
+                deployment_id=row.get(f"{role}_deployment_id"),
+                trace_id=row.get(f"{role}_trace_id"),
+                min_start_ms=row.get(f"{role}_min_start_ms"),
+                max_start_ms=row.get(f"{role}_max_start_ms"),
+            )
+            if locator is not None:
+                collected.append(locator)
+        return collected
+
+    student_inputs = fetch_action_inputs_by_entry(
+        evalcli, _locators("student"), limit=ACTION_INPUT_SURFACE_LIMIT, role_label="student"
+    )
+    teacher_inputs = fetch_action_inputs_by_entry(
+        evalcli, _locators("teacher"), limit=ACTION_INPUT_SURFACE_LIMIT, role_label="teacher"
+    )
+    if not student_inputs and not teacher_inputs:
+        return per_entry
+    return {
+        entry_id: replace(
+            metrics,
+            student_action_inputs=student_inputs.get(entry_id, metrics.student_action_inputs),
+            teacher_action_inputs=teacher_inputs.get(entry_id, metrics.teacher_action_inputs),
+        )
+        for entry_id, metrics in per_entry.items()
+    }
 
 
 def require_compared_citation_entries(analysis: EvalRunCitationMatchAnalysis) -> None:

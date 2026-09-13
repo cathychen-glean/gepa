@@ -22,7 +22,7 @@ from glean_gepa.objectives.utils.loop_count_util import (
 )
 from glean_gepa.reflection_prompts import single_model_loop_reflection_prompt
 
-EVAL_LOOP_CACHE_SCHEMA_VERSION = 1
+EVAL_LOOP_CACHE_SCHEMA_VERSION = 2
 CORRECTNESS_PASS_FOR_FEEDBACK = 0.5
 
 
@@ -56,6 +56,7 @@ def _parse_eval_analysis_cache(raw_cache: Any) -> dict[str, EvalRunLoopCountAnal
                     loop_count=int(metrics.get("loop_count") or 0),
                     correctness=float(metrics.get("correctness") or 0.0),
                     has_error=bool(metrics.get("has_error")),
+                    action_inputs=tuple(metrics.get("action_inputs") or ()),
                 )
                 for entry_id, metrics in (raw.get("per_entry") or {}).items()
                 if isinstance(metrics, dict)
@@ -89,8 +90,9 @@ def _rollout_output(
     student_eval_id: str,
     loop_count: int,
     correctness: float,
+    action_inputs: list[str] | None = None,
 ) -> SingleModelALRolloutOutput:
-    return {
+    output: SingleModelALRolloutOutput = {
         "deployment_id": deployment_id,
         "query": query,
         "student_tool_calls": loop_count,
@@ -101,6 +103,9 @@ def _rollout_output(
         "student_loops": loop_count,
         "correctness": correctness,
     }
+    if action_inputs:
+        output["action_inputs"] = list(action_inputs)
+    return output
 
 
 class LoopEfficiencyObjective(SingleModelObjective):
@@ -127,6 +132,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
         include_error_examples: bool = True,
         include_per_entry: bool = True,
         evalcli: Any | None = None,
+        include_action_inputs: bool = True,
     ) -> EvalRunLoopCountAnalysis:
         del include_error_examples
         cached = self._eval_analysis_cache.get(eval_id)
@@ -143,6 +149,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
             eval_id=eval_id,
             lookback_days=self.lookback_days,
             evalcli=evalcli,
+            include_action_inputs=include_action_inputs,
         )
         if analysis.aggregate.compared_entries == 0:
             print(f"[Cache] Not caching provisional empty loop analysis for eval_id: {eval_id}")
@@ -244,6 +251,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
                         student_eval_id=student_eval_id,
                         loop_count=loop_count,
                         correctness=correctness,
+                        action_inputs=list(metrics.action_inputs) if metrics else None,
                     ),
                     data_overrides={"eval_entry_id": entry_id, "eval_run_id": student_eval_id},
                 )
@@ -307,6 +315,9 @@ class LoopEfficiencyObjective(SingleModelObjective):
         }
         if eval_run_id := trajectory["data"].get("eval_run_id"):
             inputs["eval_run_id"] = eval_run_id
+        # The student's own tool payloads across loops show what work it did,
+        # which is the per-entry context the scrubbed query field cannot give.
+        action_inputs = output.get("action_inputs") or []
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -315,7 +326,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
                 "student_tools": [],
                 "teacher_tools": [],
             },
-            "Action Inputs": [],
+            "Action Inputs": list(action_inputs[:5]),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts),
             "Metrics": {

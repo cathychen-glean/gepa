@@ -35,9 +35,11 @@ def _rollout_output(
     teacher_tools: list[str],
     student_tool_calls: int | None = None,
     teacher_tool_calls: int | None = None,
+    student_action_inputs: list[str] | None = None,
+    teacher_action_inputs: list[str] | None = None,
 ) -> TeacherStudentALRolloutOutput:
     """One rollout row. Tool-call counts default to the listed events."""
-    return {
+    output: TeacherStudentALRolloutOutput = {
         "deployment_id": deployment_id,
         "query": query,
         "student_answer": "",
@@ -56,6 +58,11 @@ def _rollout_output(
         "teacher_output_tokens": 0,
         "entry_id": entry_id,
     }
+    if student_action_inputs:
+        output["student_action_inputs"] = list(student_action_inputs)
+    if teacher_action_inputs:
+        output["teacher_action_inputs"] = list(teacher_action_inputs)
+    return output
 
 
 class FirstToolMatchObjective(TeacherStudentObjective):
@@ -127,6 +134,8 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                     query=query,
                     student_tools=list(tool_match.student_tools),
                     teacher_tools=list(tool_match.teacher_tools),
+                    student_action_inputs=list(tool_match.student_action_inputs),
+                    teacher_action_inputs=list(tool_match.teacher_action_inputs),
                 ),
             )
             for entry_id, tool_match in analysis.per_entry.items()
@@ -205,6 +214,9 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             "deployment_id": output["deployment_id"],
             "query": output["query"],
         }
+        # The raw user query is scrubbed from telemetry, so the teacher's tool
+        # payloads are the only surviving signal for what the task actually was.
+        teacher_action_inputs = output.get("teacher_action_inputs") or []
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -213,7 +225,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                 "student_tools": student_tools,
                 "teacher_tools": teacher_tools,
             },
-            "Action Inputs": [],
+            "Action Inputs": list(teacher_action_inputs[:5]),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
             "Metrics": {

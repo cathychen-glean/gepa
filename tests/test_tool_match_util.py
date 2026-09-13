@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
 
+from glean_gepa.objectives.tool_match import FirstToolMatchObjective
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
     SKIPPED_TOOL_NAMES,
     NoComparedEvalEntriesError,
@@ -20,7 +23,6 @@ from glean_gepa.objectives.utils.tool_match_util import (
     require_compared_eval_entries,
     scored_tool_sequence,
 )
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
@@ -48,6 +50,21 @@ def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
     assert not mismatch.tools_match
 
 
+def _trace_with_action_inputs(*action_inputs: str) -> dict:
+    """A detailed-trace payload whose Execute Action spans carry ``action_input``."""
+    return {
+        "trace": {
+            "spans": [
+                {
+                    "name": "Execute Action: Search",
+                    "attributes": {"input": {"strValue": json.dumps({"action_input": action_input})}},
+                }
+                for action_input in action_inputs
+            ]
+        }
+    }
+
+
 def test_tool_match_queries_and_fetch():
     bounds_sql = build_tool_match_time_bounds_query()
     sql = build_tool_match_per_entry_query()
@@ -57,8 +74,13 @@ def test_tool_match_queries_and_fetch():
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
     assert "Execute Action:" in sql
-    assert "student_trace_id" not in sql
     assert "FULL OUTER JOIN" in sql
+    # Tool payloads are scrubbed from this table, so the query must NOT read them here
+    # and must instead carry the scrub-safe locators used to fetch the detailed trace.
+    assert "span_info.inputs" not in sql
+    assert "agent_trace.trace_id" in sql
+    assert "student_trace_id" in sql and "teacher_trace_id" in sql
+    assert "student_deployment_id" in sql and "teacher_deployment_id" in sql
     for skipped in SKIPPED_TOOL_NAMES:
         assert skipped in sql
 
@@ -66,16 +88,54 @@ def test_tool_match_queries_and_fetch():
     client.query.side_effect = [
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
-            {"entry_id": "entry-1", "student_tools": ["search"], "teacher_tools": ["read"]},
+            {
+                "entry_id": "entry-1",
+                "student_tools": ["search"],
+                "teacher_tools": ["read"],
+                "student_trace_id": "s-trace-1",
+                "student_deployment_id": "scio-prod",
+                "student_min_start_ms": 1_786_400_000_000,
+                "student_max_start_ms": 1_786_400_050_000,
+                "teacher_trace_id": "t-trace-1",
+                "teacher_deployment_id": "scio-prod",
+                "teacher_min_start_ms": 1_786_400_000_000,
+                "teacher_max_start_ms": 1_786_400_050_000,
+            },
             {"entry_id": "entry-2", "student_tools": [], "teacher_tools": ["search"]},
+            {
+                "entry_id": "entry-3",
+                "student_tools": ["search"],
+                "teacher_tools": ["read"],
+                "student_trace_id": "s-trace-cust",
+                "student_deployment_id": "glean-televox",
+                "student_min_start_ms": 1_786_400_000_000,
+                "student_max_start_ms": 1_786_400_050_000,
+                "teacher_trace_id": "t-trace-cust",
+                "teacher_deployment_id": "glean-televox",
+                "teacher_min_start_ms": 1_786_400_000_000,
+                "teacher_max_start_ms": 1_786_400_050_000,
+            },
         ],
     ]
+
+    def _get_trace(*, deployment_id, trace_id, start_time_millis, end_time_millis):
+        if trace_id == "t-trace-1":
+            # Duplicate payloads collapse; only Execute Action inputs survive.
+            return _trace_with_action_inputs('{"query":"case 007"}', '{"query":"case 007"}')
+        if trace_id == "s-trace-1":
+            return _trace_with_action_inputs('{"query":"stu"}')
+        return _trace_with_action_inputs()
+
+    evalcli = MagicMock()
+    evalcli.get_analysis_trace.side_effect = _get_trace
+
     analysis = fetch_eval_run_tool_match_analysis(
         client,
         teacher_eval_id="teacher",
         student_eval_id="student",
         lookback_days=7,
         end_date=date(2026, 8, 11),
+        evalcli=evalcli,
     )
     search_params = {param.name: param.value for param in client.query.call_args_list[0].kwargs["params"]}
     entry_params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
@@ -87,8 +147,47 @@ def test_tool_match_queries_and_fetch():
     assert entry_params["teacher_eval_id"] == "teacher"
     assert analysis.per_entry["entry-1"].tools_match is False
     assert analysis.per_entry["entry-2"].student_tools == ()
-    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2")
+    # Payloads come from the detailed trace (the scrubbed table serves none), and are
+    # de-duplicated in span order.
+    assert analysis.per_entry["entry-1"].teacher_action_inputs == ('{"query":"case 007"}',)
+    assert analysis.per_entry["entry-1"].student_action_inputs == ('{"query":"stu"}',)
+    # entry-2 exposes no trace locator, so it is never fetched and stays empty.
+    assert analysis.per_entry["entry-2"].teacher_action_inputs == ()
+    # Customer deployments 403 on analyze-trace; skip them and still score the mismatch.
+    assert analysis.per_entry["entry-3"].tools_match is False
+    assert analysis.per_entry["entry-3"].teacher_action_inputs == ()
+    assert {call.kwargs["trace_id"] for call in evalcli.get_analysis_trace.call_args_list} == {
+        "t-trace-1",
+        "s-trace-1",
+    }
+    # The trace window pads the entry's span bounds by the configured lead/trail.
+    teacher_call = next(
+        call for call in evalcli.get_analysis_trace.call_args_list if call.kwargs["trace_id"] == "t-trace-1"
+    )
+    assert teacher_call.kwargs["start_time_millis"] == 1_786_400_000_000 - 3_600_000
+    assert teacher_call.kwargs["end_time_millis"] == 1_786_400_050_000 + 60_000
+    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2", "entry-3")
     assert client.query.call_count == 2
+
+    objective = FirstToolMatchObjective()
+    output = next(
+        row.output
+        for row in objective.scored_rows(
+            analysis, focused=True, capture_traces=True, query="q", deployment_id="scio-prod"
+        )
+        if row.entry_id == "entry-1"
+    )
+    example = objective.build_reflective_example(
+        "MODULE",
+        {
+            "data": {"eval_set_name": "set"},
+            "score": 0.0,
+            "objective_scores": {"tool_alignment": 0.0, "completeness": 0.5},
+            "output": output,
+        },
+        {},
+    )
+    assert example["Action Inputs"] == ['{"query":"case 007"}']
 
 
 def test_aggregate_and_empty_analysis():

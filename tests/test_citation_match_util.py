@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
 
+from glean_gepa.experiment_config import load_experiment_config
+from glean_gepa.objectives import build_objective
+from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.citation_match_util import (
     CitationMatchEntryMetrics,
     NoComparedCitationEntriesError,
@@ -18,9 +22,6 @@ from glean_gepa.objectives.utils.citation_match_util import (
     require_compared_citation_entries,
     scored_citation_ids,
 )
-from glean_gepa.experiment_config import load_experiment_config
-from glean_gepa.objectives import build_objective
-from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
@@ -46,6 +47,21 @@ def test_citation_set_scoring_dedupes_and_ignores_order():
     assert mismatch.extra == ()
 
 
+def _trace_with_action_inputs(*action_inputs: str) -> dict:
+    """A detailed-trace payload whose Execute Action spans carry ``action_input``."""
+    return {
+        "trace": {
+            "spans": [
+                {
+                    "name": "Execute Action: Search",
+                    "attributes": {"input": {"strValue": json.dumps({"action_input": action_input})}},
+                }
+                for action_input in action_inputs
+            ]
+        }
+    }
+
+
 def test_citation_match_queries_and_fetch():
     bounds_sql = build_citation_match_time_bounds_query()
     sql = build_citation_match_per_entry_query()
@@ -56,23 +72,43 @@ def test_citation_match_queries_and_fetch():
     assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
     assert "citationId" in sql
     assert "FULL OUTER JOIN" in sql
+    # Tool payloads are scrubbed from this table, so the query must NOT read them here
+    # and must instead carry the scrub-safe locators used to fetch the detailed trace.
+    assert "span_info.inputs" not in sql
+    assert "agent_trace.trace_id" in sql
+    assert "student_trace_id" in sql and "teacher_trace_id" in sql
 
     client = MagicMock()
     client.query.side_effect = [
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
-            {"entry_id": "entry-1", "student_citations": ["a"], "teacher_citations": ["b"]},
+            {
+                "entry_id": "entry-1",
+                "student_citations": ["a"],
+                "teacher_citations": ["b"],
+                "teacher_trace_id": "t-trace-1",
+                "teacher_deployment_id": "scio-prod",
+                "teacher_min_start_ms": 1_786_400_000_000,
+                "teacher_max_start_ms": 1_786_400_050_000,
+            },
             {"entry_id": "entry-2", "student_citations": ["a"], "teacher_citations": ["a"]},
         ],
     ]
+
+    evalcli = MagicMock()
+    evalcli.get_analysis_trace.return_value = _trace_with_action_inputs('{"query":"does BILL help"}')
+
     analysis = fetch_eval_run_citation_match_analysis(
         client,
         teacher_eval_id="teacher",
         student_eval_id="student",
         lookback_days=7,
         end_date=date(2026, 8, 11),
+        evalcli=evalcli,
     )
     assert analysis.per_entry["entry-1"].citations_match is False
+    # The teacher's tool payload is resolved from the detailed trace, not the scrubbed table.
+    assert analysis.per_entry["entry-1"].teacher_action_inputs == ('{"query":"does BILL help"}',)
     assert analysis.per_entry["entry-2"].citations_match is True
     assert analysis.high_signal_entry_ids == ("entry-1",)
     assert analysis.aggregate.citation_match_rate == 0.5
@@ -113,7 +149,9 @@ def test_citations_pack_constructs_the_citation_match_objective(tmp_path):
 def test_citation_match_objective_scores_and_flags_mismatches():
     objective = CitationMatchObjective()
     analysis = empty_citation_match_analysis("teacher", "student")
-    analysis.per_entry["e1"] = CitationMatchEntryMetrics("e1", ("a",), ("a", "b"), False)
+    analysis.per_entry["e1"] = CitationMatchEntryMetrics(
+        "e1", ("a",), ("a", "b"), False, teacher_action_inputs=tuple(f"q{i}" for i in range(6))
+    )
     analysis.per_entry["e2"] = CitationMatchEntryMetrics("e2", ("a",), ("a",), True)
     rows = objective.scored_rows(
         analysis,
@@ -127,3 +165,14 @@ def test_citation_match_objective_scores_and_flags_mismatches():
     assert by_entry["e2"].dimension_scores["citation_match"] == 1.0
     assert objective.is_high_signal(by_entry["e1"].output)
     assert not objective.is_high_signal(by_entry["e2"].output)
+    example = objective.build_reflective_example(
+        "MODULE",
+        {
+            "data": {"eval_set_name": "set"},
+            "score": 0.0,
+            "objective_scores": {"citation_match": 0.0, "completeness": 0.5},
+            "output": by_entry["e1"].output,
+        },
+        {},
+    )
+    assert example["Action Inputs"] == [f"q{i}" for i in range(5)]
