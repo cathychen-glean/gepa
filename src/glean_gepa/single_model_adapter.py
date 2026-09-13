@@ -165,12 +165,14 @@ class SingleModelAdapter(GleanAdapterBase):
         *,
         include_error_examples: bool = True,
         include_per_entry: bool = True,
+        include_action_inputs: bool = True,
     ):
         analysis = self.objective.analyze(
             eval_id,
             include_error_examples=include_error_examples,
             include_per_entry=include_per_entry,
             evalcli=self.runner.evalcli,
+            include_action_inputs=include_action_inputs,
         )
         if eval_id in self._eval_analysis_cache:
             self._save_cache()
@@ -268,6 +270,7 @@ class SingleModelAdapter(GleanAdapterBase):
                 student_eval_id,
                 include_error_examples=capture_traces and not is_focused_eval,
                 include_per_entry=is_focused_eval or capture_traces,
+                include_action_inputs=not bool(al_data_inst.get("validation_only")),
             )
             if self.objective.is_pending(analysis):
                 label = self.objective.pending_telemetry_label or self.objective.name
