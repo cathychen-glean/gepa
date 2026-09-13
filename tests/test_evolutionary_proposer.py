@@ -2,8 +2,6 @@ import json
 from typing import ClassVar
 from unittest.mock import MagicMock
 
-import pytest
-
 from gepa.core.engine import GEPAEngine
 from gepa.core.state import ValsetEvaluation
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
@@ -612,3 +610,28 @@ def test_new_program_metrics_log_display_iteration_not_proposal_attempts() -> No
     metrics, kwargs = experiment_tracker.log_metrics.call_args
     assert metrics[0]["iteration"] == 5
     assert kwargs["step"] == 5
+
+
+def _engine_with_stall_limit(*, max_stalled_proposals: int | None) -> GEPAEngine:
+    return GEPAEngine(
+        adapter=MagicMock(),
+        run_dir=None,
+        valset=None,
+        seed_candidate={},
+        perfect_score=1.0,
+        seed=0,
+        reflective_proposer=MagicMock(),
+        frontier_type="instance",
+        logger=MagicMock(),
+        experiment_tracker=MagicMock(),
+        max_stalled_proposals=max_stalled_proposals,
+    )
+
+
+def test_stall_limit_reached_only_when_configured() -> None:
+    limited = _engine_with_stall_limit(max_stalled_proposals=3)
+    assert not limited._stall_limit_reached(2)
+    assert limited._stall_limit_reached(3)
+    unset = _engine_with_stall_limit(max_stalled_proposals=None)
+    assert not unset._stall_limit_reached(1_000_000)
+

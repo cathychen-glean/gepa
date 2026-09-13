@@ -13,8 +13,10 @@ from typing import Any
 
 from glean_gepa.debug import debug_print
 
-CODING_HARNESS_PRESET = "Coding Harness"
-DEFAULT_PRESET = CODING_HARNESS_PRESET
+# The Coding Harness execution preset still records runnerType=NEXT_STEP, which
+# current evalcli rejects. Coding-agent-loop behavior is carried by sc-params;
+# GLEAN_CHAT is the accepted runner that executes them.
+CODING_HARNESS_RUNNER_TYPE = "GLEAN_CHAT"
 
 CORRECTNESS_INPUT_MAPPINGS = json.dumps(
     [
@@ -61,6 +63,10 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "Connection refused",
     "Connection reset",
     "__Host-GCP_IAP_AUTH_TOKEN_",
+    "Lost connection to MySQL server",
+    "MySQL server has gone away",
+    "(2013,",
+    "(2006,",
 )
 # evalcli sometimes exits 1 with a bare "Error:" and empty stdout.
 OPAQUE_EVALCLI_ERROR_MARKER = "stderr: Error:\nstdout:"
@@ -206,6 +212,25 @@ class EvalCliClient:
             args = (*args, "--json")
         return self._invoke(*args, expect_json=True)
 
+    def _invoke_json_retrying(self, *args: str, label: str) -> Any:
+        """Call ``_invoke_json``, retrying opaque/transient Cortex failures."""
+        last_exc: EvalCliError | None = None
+        for attempt in range(JUDGE_CREATE_ATTEMPTS):
+            try:
+                return self._invoke_json(*args)
+            except EvalCliError as exc:
+                last_exc = exc
+                if not _is_transient_evalcli_error(exc):
+                    raise
+                if attempt + 1 >= JUDGE_CREATE_ATTEMPTS:
+                    break
+                print(
+                    f"Transient evalcli error during {label}; retrying in {JUDGE_CREATE_RETRY_SEC}s..."
+                )
+                time.sleep(JUDGE_CREATE_RETRY_SEC)
+        assert last_exc is not None
+        raise last_exc
+
     def create_eval_run(
         self,
         *,
@@ -216,7 +241,7 @@ class EvalCliClient:
         description: str,
         sc_params: str | None = None,
         eval_params: str | None = None,
-        preset: str = DEFAULT_PRESET,
+        runner_type: str = CODING_HARNESS_RUNNER_TYPE,
     ) -> str:
         eval_set = f"{eval_set_name}:{eval_set_version}"
         cmd = [
@@ -224,8 +249,8 @@ class EvalCliClient:
             "create",
             "--eval-set",
             eval_set,
-            "--preset",
-            preset,
+            "--runner-type",
+            runner_type,
             "--deployment-ids",
             *deployment_ids,
             "--id",
@@ -238,7 +263,7 @@ class EvalCliClient:
         if eval_params:
             cmd.extend(["--eval-params", eval_params])
 
-        result = self._invoke_json(*cmd)
+        result = self._invoke_json_retrying(*cmd, label=f"run create {eval_run_id}")
         if not isinstance(result, dict):
             raise EvalCliError(f"Unexpected eval run create response: {result!r}")
         return str(result.get("id") or eval_run_id)
@@ -380,7 +405,7 @@ class EvalCliClient:
         entries: list[dict[str, Any]] = []
         page = 1
         while True:
-            result = self._invoke_json(
+            result = self._invoke_json_retrying(
                 "evalsets",
                 "entries",
                 "--name",
@@ -393,6 +418,7 @@ class EvalCliClient:
                 str(page),
                 "--page-size",
                 str(page_size),
+                label=f"evalsets entries {eval_set_name}:{eval_set_version} page {page}",
             )
             if not isinstance(result, dict):
                 raise EvalCliError(f"Unexpected evalsets entries response: {result!r}")
@@ -624,7 +650,17 @@ class EvalCliClient:
         print(f"Waiting for judge run {judge_run_id} to complete...")
         elapsed = 0
         while elapsed < timeout_sec:
-            run = self.get_judge_run(judge_run_id, eval_run_id=eval_run_id)
+            try:
+                run = self.get_judge_run(judge_run_id, eval_run_id=eval_run_id)
+            except EvalCliError as exc:
+                if not _is_transient_evalcli_error(exc):
+                    raise
+                print(
+                    f"Transient Cortex error while polling judge run {judge_run_id}; retrying in {poll_interval_sec}s..."
+                )
+                time.sleep(poll_interval_sec)
+                elapsed += poll_interval_sec
+                continue
             status = run.get("status") if isinstance(run, dict) else None
             if isinstance(status, dict):
                 status = status.get("value")
