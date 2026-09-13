@@ -93,15 +93,28 @@ def test_tool_match_queries_and_fetch():
                 "student_tools": ["search"],
                 "teacher_tools": ["read"],
                 "student_trace_id": "s-trace-1",
-                "student_deployment_id": "dep",
+                "student_deployment_id": "scio-prod",
                 "student_min_start_ms": 1_786_400_000_000,
                 "student_max_start_ms": 1_786_400_050_000,
                 "teacher_trace_id": "t-trace-1",
-                "teacher_deployment_id": "dep",
+                "teacher_deployment_id": "scio-prod",
                 "teacher_min_start_ms": 1_786_400_000_000,
                 "teacher_max_start_ms": 1_786_400_050_000,
             },
             {"entry_id": "entry-2", "student_tools": [], "teacher_tools": ["search"]},
+            {
+                "entry_id": "entry-3",
+                "student_tools": ["search"],
+                "teacher_tools": ["read"],
+                "student_trace_id": "s-trace-cust",
+                "student_deployment_id": "glean-televox",
+                "student_min_start_ms": 1_786_400_000_000,
+                "student_max_start_ms": 1_786_400_050_000,
+                "teacher_trace_id": "t-trace-cust",
+                "teacher_deployment_id": "glean-televox",
+                "teacher_min_start_ms": 1_786_400_000_000,
+                "teacher_max_start_ms": 1_786_400_050_000,
+            },
         ],
     ]
 
@@ -140,14 +153,41 @@ def test_tool_match_queries_and_fetch():
     assert analysis.per_entry["entry-1"].student_action_inputs == ('{"query":"stu"}',)
     # entry-2 exposes no trace locator, so it is never fetched and stays empty.
     assert analysis.per_entry["entry-2"].teacher_action_inputs == ()
+    # Customer deployments 403 on analyze-trace; skip them and still score the mismatch.
+    assert analysis.per_entry["entry-3"].tools_match is False
+    assert analysis.per_entry["entry-3"].teacher_action_inputs == ()
+    assert {call.kwargs["trace_id"] for call in evalcli.get_analysis_trace.call_args_list} == {
+        "t-trace-1",
+        "s-trace-1",
+    }
     # The trace window pads the entry's span bounds by the configured lead/trail.
     teacher_call = next(
         call for call in evalcli.get_analysis_trace.call_args_list if call.kwargs["trace_id"] == "t-trace-1"
     )
     assert teacher_call.kwargs["start_time_millis"] == 1_786_400_000_000 - 3_600_000
     assert teacher_call.kwargs["end_time_millis"] == 1_786_400_050_000 + 60_000
-    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2")
+    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2", "entry-3")
     assert client.query.call_count == 2
+
+    objective = FirstToolMatchObjective()
+    output = next(
+        row.output
+        for row in objective.scored_rows(
+            analysis, focused=True, capture_traces=True, query="q", deployment_id="scio-prod"
+        )
+        if row.entry_id == "entry-1"
+    )
+    example = objective.build_reflective_example(
+        "MODULE",
+        {
+            "data": {"eval_set_name": "set"},
+            "score": 0.0,
+            "objective_scores": {"tool_alignment": 0.0, "completeness": 0.5},
+            "output": output,
+        },
+        {},
+    )
+    assert example["Action Inputs"] == ['{"query":"case 007"}']
 
 
 def test_aggregate_and_empty_analysis():
@@ -165,25 +205,6 @@ def test_aggregate_and_empty_analysis():
     analysis = empty_tool_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))
     with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
         require_compared_eval_entries(analysis)
-
-
-def test_tool_reflective_example_surfaces_teacher_action_inputs():
-    objective = FirstToolMatchObjective()
-    trajectory = {
-        "data": {"eval_set_name": "set"},
-        "score": 0.0,
-        "objective_scores": {"tool_alignment": 0.0, "completeness": 0.5},
-        "output": {
-            "entry_id": "e1",
-            "deployment_id": "dep",
-            "query": "set:v1",
-            "student_tool_events": ["search"],
-            "teacher_tool_events": ["read"],
-            "teacher_action_inputs": [f'{{"query":"q{i}"}}' for i in range(6)],
-        },
-    }
-    example = objective.build_reflective_example("MODULE", trajectory, {})
-    assert example["Action Inputs"] == [f'{{"query":"q{i}"}}' for i in range(5)]
 
 
 def test_select_mismatch_groups():

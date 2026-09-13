@@ -105,9 +105,16 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _analysis_cache(self) -> dict[tuple[str, str], Any]:
         return self.objective.analysis_cache
 
-    def _get_or_fetch_analysis(self, teacher_eval_id: str, student_eval_id: str):
+    def _get_or_fetch_analysis(
+        self,
+        teacher_eval_id: str,
+        student_eval_id: str,
+        *,
+        include_action_inputs: bool = True,
+    ):
         self.objective.bigquery_client = self.bigquery_client
-        self.objective.evalcli = self.runner.evalcli
+        # Val-only eval sets never feed reflection; skip analyze-trace hydration.
+        self.objective.evalcli = self.runner.evalcli if include_action_inputs else None
         self.objective.lookback_days = self.agentspan_lookback_days
         analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()
@@ -464,7 +471,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     "teacher_eval_run_id": pair.teacher_eval_id,
                 }
             )
-            analysis = self._get_or_fetch_analysis(pair.teacher_eval_id, pair.student_eval_id)
+            analysis = self._get_or_fetch_analysis(
+                pair.teacher_eval_id,
+                pair.student_eval_id,
+                include_action_inputs=not bool(al_data_inst.get("validation_only")),
+            )
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             if is_focused_eval:
@@ -472,6 +483,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             else:
                 self.objective.validate_full_eval(analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
+            # TODO: Populate the real user query for teacher-student matching.
             query = f"{al_data_inst.get('eval_set_name', '')}:{al_data_inst.get('eval_set_version', '')}"
             student_judges = {
                 judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)

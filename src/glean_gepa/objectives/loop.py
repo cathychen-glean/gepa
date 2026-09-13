@@ -132,6 +132,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
         include_error_examples: bool = True,
         include_per_entry: bool = True,
         evalcli: Any | None = None,
+        include_action_inputs: bool = True,
     ) -> EvalRunLoopCountAnalysis:
         del include_error_examples
         cached = self._eval_analysis_cache.get(eval_id)
@@ -148,6 +149,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
             eval_id=eval_id,
             lookback_days=self.lookback_days,
             evalcli=evalcli,
+            include_action_inputs=include_action_inputs,
         )
         if analysis.aggregate.compared_entries == 0:
             print(f"[Cache] Not caching provisional empty loop analysis for eval_id: {eval_id}")

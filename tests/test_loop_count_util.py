@@ -82,7 +82,7 @@ def test_loop_count_query_and_fetch():
                 "loop_count": 5,
                 "has_error": False,
                 "trace_id": "trace-2",
-                "deployment_id": "dep",
+                "deployment_id": "scio-prod",
                 "min_start_ms": 1_786_400_000_000,
                 "max_start_ms": 1_786_400_050_000,
             },
@@ -113,6 +113,34 @@ def test_loop_count_query_and_fetch():
     assert analysis.high_signal_entry_ids == ("entry-2", "entry-3")
     assert analysis.aggregate.matching_entries == 1
     assert client.query.call_count == 2
+
+    evalcli.get_analysis_trace.reset_mock()
+    client.query.side_effect = [
+        [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
+        [
+            {
+                "entry_id": "entry-2",
+                "loop_count": 5,
+                "has_error": False,
+                "trace_id": "trace-2",
+                "deployment_id": "scio-prod",
+                "min_start_ms": 1_786_400_000_000,
+                "max_start_ms": 1_786_400_050_000,
+            }
+        ],
+    ]
+    skipped = fetch_eval_run_loop_count_analysis(
+        client,
+        eval_id="student",
+        lookback_days=7,
+        end_date=date(2026, 8, 11),
+        evalcli=evalcli,
+        include_action_inputs=False,
+    )
+    assert skipped.per_entry["entry-2"].loop_efficiency == 1 / 4
+    assert skipped.per_entry["entry-2"].action_inputs == ()
+    evalcli.get_analysis_trace.assert_not_called()
+    evalcli.get_analysis_view.assert_called()
 
 
 def test_evalcli_overlay_prefers_loopcount_and_correctness_judge():
@@ -167,7 +195,7 @@ def test_loop_objective_scores_incorrect_or_extra_loops_below_one():
     objective = LoopEfficiencyObjective(bigquery_client=MagicMock())
     per_entry = {
         "ok": LoopCountEntryMetrics("ok", 2, 1.0, False),
-        "slow": LoopCountEntryMetrics("slow", 4, 1.0, False),
+        "slow": LoopCountEntryMetrics("slow", 4, 1.0, False, action_inputs=tuple(f"cmd{i}" for i in range(6))),
         "wrong": LoopCountEntryMetrics("wrong", 1, 0.0, True),
     }
     analysis = EvalRunLoopCountAnalysis(
@@ -194,25 +222,17 @@ def test_loop_objective_scores_incorrect_or_extra_loops_below_one():
     assert by_entry["slow"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 0.0
     assert by_entry["wrong"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 0.0
     assert objective.focused_pass_rate(analysis, ["ok", "slow", "wrong"]) == 1 / 3
-
-
-def test_loop_reflective_example_surfaces_student_action_inputs():
-    objective = LoopEfficiencyObjective(bigquery_client=MagicMock())
-    trajectory = {
-        "data": {"eval_set_name": "set"},
-        "score": 0.0,
-        "objective_scores": {LOOP_EFFICIENCY_OBJECTIVE: 0.0},
-        "output": {
-            "entry_id": "e1",
-            "deployment_id": "dep",
-            "query": "set:v1 entry=e1",
-            "student_loops": 6,
-            "correctness": 1.0,
-            "action_inputs": [f'{{"command":"cmd{i}"}}' for i in range(6)],
+    example = objective.build_reflective_example(
+        "MODULE",
+        {
+            "data": {"eval_set_name": "set"},
+            "score": 0.0,
+            "objective_scores": {LOOP_EFFICIENCY_OBJECTIVE: 0.0},
+            "output": by_entry["slow"].output,
         },
-    }
-    example = objective.build_reflective_example("MODULE", trajectory, {})
-    assert example["Action Inputs"] == [f'{{"command":"cmd{i}"}}' for i in range(5)]
+        {},
+    )
+    assert example["Action Inputs"] == [f"cmd{i}" for i in range(5)]
 
 
 def test_single_model_adapter_uses_query_canonical_focused_sets_for_loops():

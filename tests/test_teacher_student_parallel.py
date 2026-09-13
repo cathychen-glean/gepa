@@ -259,6 +259,49 @@ def test_get_or_fetch_analysis_caches_fetch():
     assert second is fetched
 
 
+def test_validation_only_skips_action_input_evalcli():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.bigquery_client = MagicMock()
+    fetched = EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id="student-1",
+            compared_entries=1,
+            matching_entries=1,
+            tool_match_rate=1.0,
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        return_value=fetched,
+    ) as fetch:
+        adapter._finish_batch_evals(
+            [
+                _StartedPair(
+                    al_data_inst={**EVAL_SET, "validation_only": True},
+                    teacher_eval_id="teacher-1",
+                    student_eval_id="student-1",
+                )
+            ],
+            capture_traces=False,
+        )
+
+    fetch.assert_called_once_with(
+        adapter.bigquery_client,
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        lookback_days=adapter.agentspan_lookback_days,
+        evalcli=None,
+    )
+
+
 def test_finish_batch_evals_uses_tool_match_and_completeness():
     adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
     analysis = EvalRunToolMatchAnalysis(

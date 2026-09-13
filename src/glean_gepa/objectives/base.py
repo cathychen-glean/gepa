@@ -232,6 +232,7 @@ class SingleModelObjective(ABC):
         include_error_examples: bool = True,
         include_per_entry: bool = True,
         evalcli: Any | None = None,
+        include_action_inputs: bool = True,
     ) -> Any: ...
 
     @abstractmethod

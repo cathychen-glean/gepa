@@ -31,6 +31,8 @@ TRACE_WINDOW_TRAIL_MS = 60_000
 # thousands of sequential analyze-trace calls. Entries are enriched in the
 # deterministic high-signal order, covering those most likely to be surfaced.
 DEFAULT_MAX_TRACE_FETCHES = 60
+# Customer deployments 403 on ``analyze trace``. Reflection only reads Action Inputs from scio-prod
+INTERNAL_TRACE_DEPLOYMENT_ID = "scio-prod"
 
 
 @dataclass(frozen=True)
@@ -127,15 +129,20 @@ def fetch_action_inputs_by_entry(
 ) -> dict[str, tuple[str, ...]]:
     """Fetch detailed traces and return ``{entry_id: action_inputs}``.
 
-    Silently skips entries whose trace cannot be fetched (a transient analyze-trace
-    failure should degrade to "no evidence", never abort the surrounding analysis).
+    Skips locators that are not on ``scio-prod``: customer deployments reject
+    ``analyze trace`` with 403, and validation scoring does not need payloads.
     """
     get_trace = getattr(evalcli, "get_analysis_trace", None)
     if not callable(get_trace):
         return {}
     resolved: dict[str, tuple[str, ...]] = {}
     fetched = 0
+    skipped_external = 0
+    label = f"{role_label} " if role_label else ""
     for locator in locators:
+        if locator.deployment_id != INTERNAL_TRACE_DEPLOYMENT_ID:
+            skipped_external += 1
+            continue
         if fetched >= max_fetches:
             break
         fetched += 1
@@ -147,17 +154,22 @@ def fetch_action_inputs_by_entry(
                 end_time_millis=locator.end_ms,
             )
         except Exception as exc:
-            label = f"{role_label} " if role_label else ""
             print(f"[Action Inputs] Failed to fetch {label}trace for entry {locator.entry_id}: {exc}")
             continue
         inputs = extract_trace_action_inputs(trace, skip_tools=skip_tools, limit=limit)
         if inputs:
             resolved[locator.entry_id] = inputs
+    if skipped_external:
+        print(
+            f"[Action Inputs] Skipping {skipped_external} {label}traces on non-"
+            f"{INTERNAL_TRACE_DEPLOYMENT_ID} deployments"
+        )
     return resolved
 
 
 __all__ = [
     "DEFAULT_MAX_TRACE_FETCHES",
+    "INTERNAL_TRACE_DEPLOYMENT_ID",
     "TraceActionInputLocator",
     "build_trace_locator",
     "extract_trace_action_inputs",

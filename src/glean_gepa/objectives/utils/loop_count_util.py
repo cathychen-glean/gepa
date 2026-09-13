@@ -199,6 +199,7 @@ def fetch_eval_run_loop_count_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     evalcli: Any | None = None,
+    include_action_inputs: bool = True,
 ) -> EvalRunLoopCountAnalysis:
     result = run_windowed_per_entry_query(
         client,
@@ -232,7 +233,7 @@ def fetch_eval_run_loop_count_analysis(
     high_signal_entry_ids = tuple(
         sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
     )
-    if evalcli is not None:
+    if evalcli is not None and include_action_inputs:
         per_entry = _enrich_action_inputs(evalcli, per_entry, per_entry_rows, high_signal_entry_ids)
     return EvalRunLoopCountAnalysis(
         eval_id=eval_id,

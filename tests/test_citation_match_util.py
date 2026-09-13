@@ -87,7 +87,7 @@ def test_citation_match_queries_and_fetch():
                 "student_citations": ["a"],
                 "teacher_citations": ["b"],
                 "teacher_trace_id": "t-trace-1",
-                "teacher_deployment_id": "dep",
+                "teacher_deployment_id": "scio-prod",
                 "teacher_min_start_ms": 1_786_400_000_000,
                 "teacher_max_start_ms": 1_786_400_050_000,
             },
@@ -149,7 +149,9 @@ def test_citations_pack_constructs_the_citation_match_objective(tmp_path):
 def test_citation_match_objective_scores_and_flags_mismatches():
     objective = CitationMatchObjective()
     analysis = empty_citation_match_analysis("teacher", "student")
-    analysis.per_entry["e1"] = CitationMatchEntryMetrics("e1", ("a",), ("a", "b"), False)
+    analysis.per_entry["e1"] = CitationMatchEntryMetrics(
+        "e1", ("a",), ("a", "b"), False, teacher_action_inputs=tuple(f"q{i}" for i in range(6))
+    )
     analysis.per_entry["e2"] = CitationMatchEntryMetrics("e2", ("a",), ("a",), True)
     rows = objective.scored_rows(
         analysis,
@@ -163,23 +165,14 @@ def test_citation_match_objective_scores_and_flags_mismatches():
     assert by_entry["e2"].dimension_scores["citation_match"] == 1.0
     assert objective.is_high_signal(by_entry["e1"].output)
     assert not objective.is_high_signal(by_entry["e2"].output)
-
-
-def test_citation_reflective_example_surfaces_teacher_action_inputs():
-    objective = CitationMatchObjective()
-    trajectory = {
-        "data": {"eval_set_name": "set"},
-        "score": 0.0,
-        "objective_scores": {"citation_match": 0.0, "completeness": 0.5},
-        "output": {
-            "entry_id": "e1",
-            "deployment_id": "dep",
-            "query": "set:v1",
-            "student_citations": ["a"],
-            "teacher_citations": ["b"],
-            "teacher_action_inputs": [f'{{"query":"q{i}"}}' for i in range(6)],
+    example = objective.build_reflective_example(
+        "MODULE",
+        {
+            "data": {"eval_set_name": "set"},
+            "score": 0.0,
+            "objective_scores": {"citation_match": 0.0, "completeness": 0.5},
+            "output": by_entry["e1"].output,
         },
-    }
-    example = objective.build_reflective_example("MODULE", trajectory, {})
-    # The teacher's searches surface as intent evidence, truncated to five.
-    assert example["Action Inputs"] == [f'{{"query":"q{i}"}}' for i in range(5)]
+        {},
+    )
+    assert example["Action Inputs"] == [f"q{i}" for i in range(5)]
