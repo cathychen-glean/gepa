@@ -15,10 +15,6 @@ CONDITIONAL_PRESERVE_RULE = (
     "<<<[[name]] ... >>> wrapper. You may modify the enclosed text as needed but be aware of the conditional."
 )
 
-# Reflection sees TEACHER_* evidence rows, but the student never does: the teacher is a
-# separate offline eval run used only for scoring. Without this rule the reflector writes
-# instructions the student cannot possibly follow, e.g. "cite exactly the teacher's
-# citationIds for this turn", which scores as a prompt edit but is inert at inference.
 TEACHER_IS_OFFLINE_RULE = (
     "The teacher is an offline scoring reference, not something the student can see at runtime. "
     "Never tell the student to consult, mirror, match, copy, or ask the teacher, and never mention "

@@ -166,8 +166,6 @@ class CitationMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         citation_match = objective_scores.get(self.name, trajectory["score"])
-        # Absent is not zero: the completeness judge is off by default, and defaulting
-        # it to 0.0 would report a failed judge on every example.
         completeness = objective_scores.get("completeness")
         student_citations = list(output.get("student_citations") or [])
         teacher_citations = list(output.get("teacher_citations") or [])

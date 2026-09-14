@@ -22,8 +22,7 @@ UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS = 1
 EXECUTE_ACTION_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
 )
-# Predicate matching a run that died rather than finishing its trajectory, e.g. a
-# deployment whose provider rejects the configured model with a non-retryable 400.
+# Predicate matching a run that died rather than finishing its trajectory
 AGENT_RUN_FAILURE_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Agent Run:') "
     "AND jsonPayload.span_info.execution_status.code = 'ERROR'"

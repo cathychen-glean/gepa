@@ -23,10 +23,6 @@ from glean_gepa.objectives.utils.agentspan_query import (
 )
 
 TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
-# find_skills_assistant is dropped because it never fires on its own: across a 206-entry
-# val set it accompanied Discover every single time, adjacent and in matching counts. The
-# pair is one discovery step emitting two spans, so scoring whichever span landed first
-# recorded a transposition as a wrong first tool.
 SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool", "find_skills_assistant"})
 
 
@@ -92,12 +88,7 @@ def build_tool_match_per_entry_query(
     *,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
-    """Build SQL that pairs teacher and student tool sequences per eval entry.
-
-    Rows carry ``run_failed`` so the caller can drop entries whose teacher or student
-    run died. Such a run emits no tool spans past the failure, and the outer join
-    below would otherwise read that truncated sequence as a deliberate tool choice.
-    """
+    """Build SQL that pairs teacher and student tool sequences per eval entry."""
     skipped = ", ".join(f"'{name}'" for name in sorted(SKIPPED_TOOL_NAMES))
     return f"""
 WITH failed_runs AS (

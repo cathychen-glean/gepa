@@ -7,18 +7,9 @@ detailed trace served by ``evalcli analyze trace`` still carries it under each
 ``Execute Action`` span's ``attributes.input``, which is the same surviving source
 the Shell objective already uses.
 
-That attribute holds one of two envelopes. Agent-side tools (Shell, Write, Ask User
-Questions) put their whole payload in a flat ``action_input`` string. Glean retrieval
-tools (Glean Search, Employee Search, Document Reader) instead double-encode the call
-under ``input`` and name the arguments per tool — ``glean_search_tool_args``,
-``code_search``, and so on — with no ``action_input`` anywhere. Reading only
-``action_input`` therefore drops every Glean tool payload, which is exactly the
-evidence first-tool reflection needs.
-
-This module locates those traces from scrub-safe identifiers (trace id, deployment,
-span timestamps) that *do* survive scrubbing, fetches them for a bounded set of
-entries, and extracts the ordered ``action_input`` payloads so reflection has real
-per-entry intent evidence instead of an empty field.
+This module locates traces from scrub-safe identifiers (trace id, deployment,
+span timestamps) that survive scrubbing, fetches them for a bounded set of
+entries, and extracts each span's tool payload from whichever envelope it used.
 """
 
 from __future__ import annotations
@@ -31,16 +22,9 @@ from typing import Any
 from glean_gepa.objectives.utils.agentspan_query import action_input_tuple
 
 _EXECUTE_ACTION_PREFIX = "Execute Action: "
-# Keys of the nested Glean envelope that identify the call rather than describe its
-# arguments; everything else in that object is the tool's real payload.
 _CALL_METADATA_KEYS = frozenset({"id", "action", "tool_id", "tool_name"})
-# The analyze-trace API filters by wall-clock time rather than eval id, so widen
-# the window around the entry's Execute Action span bounds to tolerate ingest skew.
 TRACE_WINDOW_LEAD_MS = 3_600_000
 TRACE_WINDOW_TRAIL_MS = 60_000
-# Cap trace fetches per role so a large high-signal set cannot fan out into
-# thousands of sequential analyze-trace calls. Entries are enriched in the
-# deterministic high-signal order, covering those most likely to be surfaced.
 DEFAULT_MAX_TRACE_FETCHES = 60
 # Customer deployments 403 on ``analyze trace``. Reflection only reads Action Inputs from scio-prod
 INTERNAL_TRACE_DEPLOYMENT_ID = "scio-prod"
@@ -254,11 +238,7 @@ def fetch_first_tool_inputs_by_entry(
     max_fetches: int = DEFAULT_MAX_TRACE_FETCHES,
     role_label: str = "",
 ) -> dict[str, tuple[str, str]]:
-    """Fetch detailed traces and return ``{entry_id: (tool_name, payload)}``.
-
-    Only the first non-skipped tool call is kept, so first-tool reflection cites the
-    call it actually scored rather than a later one from the same rollout.
-    """
+    """Fetch detailed traces and return ``{entry_id: (tool_name, payload)}``."""
     resolved: dict[str, tuple[str, str]] = {}
     for entry_id, trace in _iter_entry_traces(evalcli, locators, max_fetches=max_fetches, role_label=role_label):
         pairs = extract_trace_tool_inputs(trace, skip_tools=skip_tools, limit=1)
