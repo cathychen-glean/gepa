@@ -56,6 +56,8 @@ FINISHED_TASK_STATUSES = frozenset({"TASK_SUCCEEDED", "TASK_FAILED"})
 # Succeeded+failed must strictly exceed 9x the unfinished remainder (~90% done).
 MIN_FINISHED_TO_UNFINISHED_RATIO = 9
 
+# Marks a call killed by EVALCLI_TIMEOUT_SEC; listed below so it retries.
+EVALCLI_TIMEOUT_MARKER = "evalcli timed out"
 TRANSIENT_EVALCLI_PATTERNS = (
     "API request failed: 502",
     "API request failed: 503",
@@ -67,11 +69,21 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "MySQL server has gone away",
     "(2013,",
     "(2006,",
+    EVALCLI_TIMEOUT_MARKER,
 )
 # evalcli sometimes exits 1 with a bare "Error:" and empty stdout.
 OPAQUE_EVALCLI_ERROR_MARKER = "stderr: Error:\nstdout:"
+# A retried `run create` collides with the insert its own timed-out attempt already
+# committed, so the primary-key violation means "this run exists", not "create failed".
+DUPLICATE_EVAL_RUN_PATTERNS = ("duplicate entry", "(1062,")
 JUDGE_CREATE_ATTEMPTS = 4
 JUDGE_CREATE_RETRY_SEC = 30
+# evalcli can hang indefinitely instead of returning: a `run create` has been seen
+# wedged for an hour after the server had already created the run, stalling the whole
+# optimization behind a subprocess that never exits. Every call is bounded so a hang
+# surfaces as a retryable error. Generous enough for the slowest legitimate calls
+# (paging eval set entries, fetching a large analysis trace).
+EVALCLI_TIMEOUT_SEC = 900
 
 MIN_INGESTED_ENTRY_FRACTION = 0.5
 
@@ -135,6 +147,12 @@ def _is_transient_evalcli_error(exc: EvalCliError) -> bool:
     return OPAQUE_EVALCLI_ERROR_MARKER in message
 
 
+def is_duplicate_eval_run_error(exc: EvalCliError) -> bool:
+    """Report whether a `run create` failed because the run ID is already taken."""
+    message = str(exc).lower()
+    return any(pattern in message for pattern in DUPLICATE_EVAL_RUN_PATTERNS)
+
+
 def _task_count(entry: dict[str, Any]) -> int:
     count = entry.get("count") or 0
     return count if isinstance(count, int) else 0
@@ -195,7 +213,15 @@ class EvalCliClient:
 
     def _invoke(self, *args: str, expect_json: bool = False) -> Any:
         cmd = [self.binary, *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=_subprocess_env())
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, env=_subprocess_env(), timeout=EVALCLI_TIMEOUT_SEC
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EvalCliError(
+                f"{EVALCLI_TIMEOUT_MARKER} after {EVALCLI_TIMEOUT_SEC}s: {' '.join(cmd)}\n"
+                "The command was killed; any server-side work it started may still be running."
+            ) from exc
         if proc.returncode != 0:
             raise EvalCliError(
                 f"evalcli failed (exit {proc.returncode}): {' '.join(cmd)}\n"
@@ -224,9 +250,7 @@ class EvalCliClient:
                     raise
                 if attempt + 1 >= JUDGE_CREATE_ATTEMPTS:
                     break
-                print(
-                    f"Transient evalcli error during {label}; retrying in {JUDGE_CREATE_RETRY_SEC}s..."
-                )
+                print(f"Transient evalcli error during {label}; retrying in {JUDGE_CREATE_RETRY_SEC}s...")
                 time.sleep(JUDGE_CREATE_RETRY_SEC)
         assert last_exc is not None
         raise last_exc
@@ -263,7 +287,13 @@ class EvalCliClient:
         if eval_params:
             cmd.extend(["--eval-params", eval_params])
 
-        result = self._invoke_json_retrying(*cmd, label=f"run create {eval_run_id}")
+        try:
+            result = self._invoke_json_retrying(*cmd, label=f"run create {eval_run_id}")
+        except EvalCliError as exc:
+            if not is_duplicate_eval_run_error(exc):
+                raise
+            print(f"Eval run {eval_run_id} already exists; adopting it instead of creating a duplicate")
+            return eval_run_id
         if not isinstance(result, dict):
             raise EvalCliError(f"Unexpected eval run create response: {result!r}")
         return str(result.get("id") or eval_run_id)
