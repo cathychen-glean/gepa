@@ -15,19 +15,28 @@ CONDITIONAL_PRESERVE_RULE = (
     "<<<[[name]] ... >>> wrapper. You may modify the enclosed text as needed but be aware of the conditional."
 )
 
+TEACHER_IS_OFFLINE_RULE = (
+    "The teacher is an offline scoring reference, not something the student can see at runtime. "
+    "Never tell the student to consult, mirror, match, copy, or ask the teacher, and never mention "
+    "the teacher in the prompt text at all. Instead, work out WHICH behavior produced the teacher's "
+    "result and state that as a standalone rule the student can follow using only the user's request "
+    "and its own tool results."
+)
+
 FULL_PROMPT_TEACHER_STUDENT_RESPONSIBILITY = (
     "You are editing the ENTIRE student system prompt as a single string. Any section "
     "may change — routing, execution discipline, coding instructions, tool surface, "
     "or response guidelines — if it improves first-tool alignment with the teacher. "
-    f"Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} "
+    f"Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} {TEACHER_IS_OFFLINE_RULE} "
     "Propose a complete updated prompt with minimal deltas."
 )
 
 FULL_PROMPT_CITATION_MATCH_RESPONSIBILITY = (
     "You are editing the ENTIRE student system prompt as a single string. Prioritize the "
     "Citation Contract, [[citation_instructions]], and response-guideline citation rules so "
-    "the student cites the same sources as the teacher. Other sections may change only if they "
-    f"cause missing or extra citations. Preserve [[placeholder]] tokens. {CONDITIONAL_PRESERVE_RULE} "
+    "the student independently arrives at the same sources the teacher cited. Other sections may "
+    "change only if they cause missing or extra citations. Preserve [[placeholder]] tokens. "
+    f"{CONDITIONAL_PRESERVE_RULE} {TEACHER_IS_OFFLINE_RULE} "
     "Propose a complete updated prompt with minimal deltas."
 )
 
@@ -36,7 +45,7 @@ RULES_EXT_CITATION_MATCH_RESPONSIBILITY = (
     "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
     "existing Rules, do not add a heading, and do not exceed two bullets. Target citation "
     "mismatches (missing teacher sources, extra student sources, or dropped citationId values "
-    "after filtering SDK results). Keep each bullet operational and concise."
+    f"after filtering SDK results). Keep each bullet operational and concise. {TEACHER_IS_OFFLINE_RULE}"
 )
 
 RULES_EXT_RESPONSIBILITY = (
@@ -44,7 +53,7 @@ RULES_EXT_RESPONSIBILITY = (
     "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
     "existing Rules, do not add a heading, and do not exceed two bullets. Target first-tool "
     "mismatches whose tools are not core tools (for example Write vs (none)). Keep each "
-    "bullet operational and concise."
+    f"bullet operational and concise. {TEACHER_IS_OFFLINE_RULE}"
 )
 
 WRITING_CODE_SINGLE_MODEL_RESPONSIBILITY = (
@@ -92,7 +101,8 @@ def core_tool_reflection_prompt(module_name: str) -> str:
         f"You are editing only the prompt-visible schema.description for the core tool `{module_name}`. "
         "The override replaces description text only — not the tool signature, parameters, or Returns. "
         "Rewrite the description so the student uses this tool as the first action when the teacher does, "
-        "and does not use it first when the teacher chooses a different tool. Keep the text operational and concise."
+        "and does not use it first when the teacher chooses a different tool. Keep the text operational and concise. "
+        f"{TEACHER_IS_OFFLINE_RULE}"
     )
 
 

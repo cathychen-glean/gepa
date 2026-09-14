@@ -22,6 +22,11 @@ UTC_TABLE_SUFFIX_LOOKAHEAD_DAYS = 1
 EXECUTE_ACTION_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Execute Action:') AND jsonPayload.action.execution_mode = 'EXECUTE'"
 )
+# Predicate matching a run that died rather than finishing its trajectory
+AGENT_RUN_FAILURE_FILTER = (
+    "STARTS_WITH(jsonPayload.span_info.span_name, 'Agent Run:') "
+    "AND jsonPayload.span_info.execution_status.code = 'ERROR'"
+)
 # Note: the scrubber strips ``span_info.inputs`` from this table, so tool-call
 # payloads are not queryable here. Objectives instead carry the scrub-safe
 # ``trace_id``/``project_id``/timestamps out of BigQuery and resolve the payloads
