@@ -18,6 +18,9 @@ from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
+# Stop after this many consecutive iterations that propose no candidate.
+DEFAULT_MAX_STALLED_PROPOSALS = 10
+
 
 def optimize(
     *,
@@ -32,6 +35,7 @@ def optimize(
     run_dir: str | None,
     frontier_type: FrontierType,
     val_evaluation_policy: EvaluationPolicy | None = None,
+    max_stalled_proposals: int | None = DEFAULT_MAX_STALLED_PROPOSALS,
 ) -> GEPAResult:
     """Run the Glean proposer while keeping custom wiring outside ``gepa.api``."""
     del trainset  # The proposer owns its training loader; the engine only needs validation data.
@@ -53,6 +57,7 @@ def optimize(
         logger=logger,
         experiment_tracker=experiment_tracker,
         stop_callback=stop_callback,
+        max_stalled_proposals=max_stalled_proposals,
         val_evaluation_policy=val_evaluation_policy,
     )
 
