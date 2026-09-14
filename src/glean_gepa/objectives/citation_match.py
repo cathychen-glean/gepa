@@ -166,7 +166,9 @@ class CitationMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         citation_match = objective_scores.get(self.name, trajectory["score"])
-        completeness = objective_scores.get("completeness", 0.0)
+        # Absent is not zero: the completeness judge is off by default, and defaulting
+        # it to 0.0 would report a failed judge on every example.
+        completeness = objective_scores.get("completeness")
         student_citations = list(output.get("student_citations") or [])
         teacher_citations = list(output.get("teacher_citations") or [])
         mismatch = citation_mismatch_pair(teacher_citations, student_citations)
@@ -176,7 +178,7 @@ class CitationMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"Citation-set mismatch: {missing}; {extra}.")
         if citation_match < 1.0:
             feedback_parts.append(f"Citation match issue: score={citation_match:.2f}.")
-        if completeness < 0.7:
+        if completeness is not None and completeness < 0.7:
             feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
 
         inputs: ReflectiveExampleInputs = {
@@ -188,6 +190,12 @@ class CitationMatchObjective(TeacherStudentObjective):
         # The raw user query is scrubbed, so surface the teacher's tool payloads
         # (the searches it ran) as the intent signal behind the cited sources.
         teacher_action_inputs = output.get("teacher_action_inputs") or []
+        metrics: ReflectiveExampleMetrics = {
+            "score": trajectory["score"],
+            "citation_match": citation_match,
+        }
+        if completeness is not None:
+            metrics["completeness"] = completeness
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -201,18 +209,18 @@ class CitationMatchObjective(TeacherStudentObjective):
             "Action Inputs": list(teacher_action_inputs[:5]),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student citation divergence.",
-            "Metrics": {
-                "score": trajectory["score"],
-                "citation_match": citation_match,
-                "completeness": completeness,
-            },
+            "Metrics": metrics,
         }
 
     def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        return (
-            f"score={metrics['score']:.2f}, citation_match={metrics.get('citation_match', metrics['score']):.2f}, "
-            f"completeness={metrics.get('completeness', 0.0):.2f}"
-        )
+        parts = [
+            f"score={metrics['score']:.2f}",
+            f"citation_match={metrics.get('citation_match', metrics['score']):.2f}",
+        ]
+        completeness = metrics.get("completeness")
+        if completeness is not None:
+            parts.append(f"completeness={completeness:.2f}")
+        return ", ".join(parts)
 
 
 register_telemetry_source("teacher_student", "citation_match", CitationMatchObjective)

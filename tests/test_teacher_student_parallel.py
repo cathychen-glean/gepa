@@ -357,6 +357,85 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
     assert result.trajectories[0]["score"] == pytest.approx(0.5)
 
 
+def _finish_one_pair(adapter, evalcli: MagicMock, *, validation_only: bool = False):
+    adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis()
+    al_data_inst = {**EVAL_SET, **({"validation_only": True} if validation_only else {})}
+    return adapter._finish_batch_evals(
+        [
+            _StartedPair(
+                al_data_inst=al_data_inst,
+                teacher_eval_id="teacher-1",
+                student_eval_id="student-1",
+                eval_set_name="Glean Chat V2 Medium",
+                eval_set_version="20260907",
+            )
+        ],
+        capture_traces=True,
+    )
+
+
+def test_reflection_reports_the_real_user_query_not_the_eval_set_stand_in():
+    """Agentspan scrubs the query, so every example used to be labelled with the
+    same ``eval_set:version`` string and no task was distinguishable."""
+    evalcli = MagicMock()
+    evalcli.list_eval_set_entries.return_value = [
+        {"id": "entry-1", "input": {"query": "how many employees does Glean have in Belgium"}},
+        {"id": "entry-other", "input": {"query": "unrelated"}},
+    ]
+    adapter = _teacher_student_adapter(evalcli)
+
+    result = _finish_one_pair(adapter, evalcli)
+
+    assert result.outputs[0]["query"] == "how many employees does Glean have in Belgium"
+    assert result.trajectories is not None
+    example = adapter.objective.build_reflective_example(RULES_EXT_KEY, result.trajectories[0], {})
+    assert example["Inputs"]["query"] == "how many employees does Glean have in Belgium"
+
+
+def test_entries_are_listed_from_the_eval_set_that_actually_ran():
+    """A focused batch runs against a generated high-signal set, and scoring
+    reports that set's entry ids, so the base version would not join."""
+    evalcli = MagicMock()
+    evalcli.list_eval_set_entries.return_value = []
+    adapter = _teacher_student_adapter(evalcli)
+
+    _finish_one_pair(adapter, evalcli)
+
+    assert evalcli.list_eval_set_entries.call_args.kwargs["eval_set_version"] == "20260907"
+    assert EVAL_SET["eval_set_version"] == "20260806"
+
+
+def test_entry_queries_are_listed_once_per_eval_set_version():
+    evalcli = MagicMock()
+    evalcli.list_eval_set_entries.return_value = [{"id": "entry-1", "input": {"query": "case 007"}}]
+    adapter = _teacher_student_adapter(evalcli)
+
+    _finish_one_pair(adapter, evalcli)
+    _finish_one_pair(adapter, evalcli)
+
+    assert evalcli.list_eval_set_entries.call_count == 1
+
+
+def test_pii_gated_validation_sets_are_never_listed_and_keep_the_stand_in():
+    evalcli = MagicMock()
+    adapter = _teacher_student_adapter(evalcli)
+
+    result = _finish_one_pair(adapter, evalcli, validation_only=True)
+
+    evalcli.list_eval_set_entries.assert_not_called()
+    assert result.outputs[0]["query"] == "Glean Chat V2 Medium:20260806"
+
+
+def test_unresolved_entries_fall_back_to_the_eval_set_stand_in():
+    evalcli = MagicMock()
+    evalcli.list_eval_set_entries.return_value = [{"id": "some-other-entry", "input": {"query": "case 007"}}]
+    adapter = _teacher_student_adapter(evalcli)
+
+    result = _finish_one_pair(adapter, evalcli)
+
+    assert result.outputs[0]["query"] == "Glean Chat V2 Medium:20260806"
+
+
 def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
     """Full validation must stay aligned with the caller's batch.
 
@@ -755,6 +834,9 @@ def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
     search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
     assert write_ids == [f"write-{i}" for i in range(8)]
     assert search_ids == [f"search-{i}" for i in range(12)]
+    # An empty student sequence means every span was a skipped one, so say so rather
+    # than printing "(none)", which reflection read as a hole in the trace.
     assert examples[RULES_EXT_KEY][0]["Feedback"].startswith(
-        "First-tool mismatch: teacher used Write and student used (none)."
+        "First-tool mismatch: teacher used Write and student called no scored tool, "
+        "emitting only skipped steps such as the automatic vault retrieval or shell."
     )

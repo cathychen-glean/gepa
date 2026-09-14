@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from glean_gepa.evalcli_client import (
     CORRECTNESS_INPUT_MAPPINGS,
     CORRECTNESS_JUDGE_TYPE,
     CORRECTNESS_RUN_PARAMS,
+    EVALCLI_TIMEOUT_SEC,
     EvalCliClient,
     EvalCliError,
     _subprocess_env,
@@ -29,6 +31,27 @@ OPAQUE_EVALCLI_ERROR = EvalCliError(
     "stderr: Error:\n"
     "stdout: "
 )
+
+
+def test_a_hung_evalcli_call_is_killed_and_retried():
+    """An evalcli call that never returns must not stall the run forever.
+
+    A `run create` was observed wedged for an hour after the server had already
+    created the run, blocking the optimization behind a subprocess that never exited.
+    """
+    client = EvalCliClient(binary="/fake/evalcli")
+    timed_out = subprocess.TimeoutExpired(cmd=["/fake/evalcli", "run", "create"], timeout=EVALCLI_TIMEOUT_SEC)
+    with patch("glean_gepa.evalcli_client.subprocess.run", side_effect=timed_out) as mock_run:
+        with pytest.raises(EvalCliError, match="evalcli timed out"):
+            client._invoke("run", "create")
+    assert mock_run.call_args.kwargs["timeout"] == EVALCLI_TIMEOUT_SEC
+
+    # The timeout is transient, so the retry path recovers when the next call returns.
+    with patch("glean_gepa.evalcli_client.time.sleep"):
+        with patch.object(
+            client, "_invoke_json", side_effect=[EvalCliError("evalcli timed out after 900s"), {"id": "r"}]
+        ):
+            assert client._invoke_json_retrying("run", "create", label="run create r") == {"id": "r"}
 
 
 def test_coding_harness_sc_params_selects_coding_agent_loop():
@@ -94,6 +117,49 @@ def test_create_eval_run_invokes_evalcli_with_expected_args():
     assert "--preset" not in args
     assert "--sc-params" in args
     assert "--eval-params" in args
+
+
+def test_create_eval_run_adopts_a_run_its_own_retry_already_inserted():
+    """A timed-out `run create` can commit the insert before the retry goes out.
+
+    The retry then fails on the primary key it just took, which means the run exists
+    rather than that creation failed, so the ID must be adopted instead of raising.
+    """
+    client = EvalCliClient(binary="/fake/evalcli")
+    duplicate = EvalCliError(
+        "evalcli failed (exit 1): /bin/evalcli run create --id run_dup --json\n"
+        "stderr: Error: API request failed: 500\n"
+        'Response: {"detail":"[run_dup] Failed to insert eval run: (pymysql.err.IntegrityError) '
+        "(1062, \\\"Duplicate entry 'run_dup' for key 'PRIMARY'\\\")\"}\n"
+        "stdout: "
+    )
+
+    with patch.object(client, "_invoke_json", side_effect=duplicate):
+        assert (
+            client.create_eval_run(
+                eval_run_id="run_dup",
+                eval_set_name="AI Answers Small",
+                eval_set_version="20260403",
+                deployment_ids=["scio-prod"],
+                description="GEPA eval run for AI Answers Small:20260403",
+            )
+            == "run_dup"
+        )
+
+
+def test_create_eval_run_still_raises_unrelated_failures():
+    client = EvalCliClient(binary="/fake/evalcli")
+    with (
+        patch.object(client, "_invoke_json", side_effect=EvalCliError("evalcli failed (exit 1): no such eval set")),
+        pytest.raises(EvalCliError, match="no such eval set"),
+    ):
+        client.create_eval_run(
+            eval_run_id="run_missing",
+            eval_set_name="AI Answers Small",
+            eval_set_version="20260403",
+            deployment_ids=["scio-prod"],
+            description="GEPA eval run for AI Answers Small:20260403",
+        )
 
 
 @pytest.mark.parametrize(
@@ -449,9 +515,7 @@ def test_find_judge_run_id_matches_base_eval_run():
         ]
     }
     with patch.object(client, "_invoke_json", return_value=listing):
-        found = client.find_judge_run_id(
-            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
-        )
+        found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
     assert found == "judge-wanted"
 
 
@@ -460,9 +524,7 @@ def test_find_judge_run_id_skips_rows_where_id_is_only_the_base():
     client = EvalCliClient(binary="/fake/evalcli")
     listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "some-other-eval", "n": "eval-best"}]}
     with patch.object(client, "_invoke_json", return_value=listing):
-        found = client.find_judge_run_id(
-            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
-        )
+        found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
     assert found is None
 
 
@@ -470,9 +532,7 @@ def test_find_judge_run_id_reads_canonical_base_field():
     client = EvalCliClient(binary="/fake/evalcli")
     listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "eval-best", "baseEvalRunId": "eval-base"}]}
     with patch.object(client, "_invoke_json", return_value=listing):
-        found = client.find_judge_run_id(
-            "eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base"
-        )
+        found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
     assert found == "judge-1"
 
 

@@ -47,16 +47,35 @@ def test_citation_set_scoring_dedupes_and_ignores_order():
     assert mismatch.extra == ()
 
 
-def _trace_with_action_inputs(*action_inputs: str) -> dict:
-    """A detailed-trace payload whose Execute Action spans carry ``action_input``."""
+def _trace_with_glean_search(*queries: str) -> dict:
+    """A detailed trace of Glean Search calls.
+
+    Glean tools double-encode their arguments under ``input`` rather than emitting an
+    ``action_input`` key, so citations reflection sees nothing unless both envelopes
+    are parsed.
+    """
     return {
         "trace": {
             "spans": [
                 {
-                    "name": "Execute Action: Search",
-                    "attributes": {"input": {"strValue": json.dumps({"action_input": action_input})}},
+                    "name": "Execute Action: Glean Search",
+                    "attributes": {
+                        "input": {
+                            "strValue": json.dumps(
+                                {
+                                    "input": json.dumps(
+                                        {
+                                            "id": "call-1",
+                                            "action": "Glean Search",
+                                            "glean_search_tool_args": {"query": query},
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    },
                 }
-                for action_input in action_inputs
+                for query in queries
             ]
         }
     }
@@ -70,10 +89,12 @@ def test_citation_match_queries_and_fetch():
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
-    assert "citationId" in sql
+    assert "UNNEST(jsonPayload.agent_run.citations_data.positioned_citations)" in sql
+    assert "citation.doc_id" in sql
+    assert "REGEXP_EXTRACT_ALL" not in sql
+    assert "TO_JSON_STRING" not in sql
+    assert "citationId" not in sql
     assert "FULL OUTER JOIN" in sql
-    # Tool payloads are scrubbed from this table, so the query must NOT read them here
-    # and must instead carry the scrub-safe locators used to fetch the detailed trace.
     assert "span_info.inputs" not in sql
     assert "agent_trace.trace_id" in sql
     assert "student_trace_id" in sql and "teacher_trace_id" in sql
@@ -96,7 +117,7 @@ def test_citation_match_queries_and_fetch():
     ]
 
     evalcli = MagicMock()
-    evalcli.get_analysis_trace.return_value = _trace_with_action_inputs('{"query":"does BILL help"}')
+    evalcli.get_analysis_trace.return_value = _trace_with_glean_search("does BILL help")
 
     analysis = fetch_eval_run_citation_match_analysis(
         client,
@@ -108,7 +129,9 @@ def test_citation_match_queries_and_fetch():
     )
     assert analysis.per_entry["entry-1"].citations_match is False
     # The teacher's tool payload is resolved from the detailed trace, not the scrubbed table.
-    assert analysis.per_entry["entry-1"].teacher_action_inputs == ('{"query":"does BILL help"}',)
+    assert analysis.per_entry["entry-1"].teacher_action_inputs == (
+        '{"glean_search_tool_args": {"query": "does BILL help"}}',
+    )
     assert analysis.per_entry["entry-2"].citations_match is True
     assert analysis.high_signal_entry_ids == ("entry-1",)
     assert analysis.aggregate.citation_match_rate == 0.5

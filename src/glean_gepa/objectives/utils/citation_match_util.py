@@ -23,9 +23,8 @@ from glean_gepa.objectives.utils.agentspan_query import (
 CITATION_MATCH_OBJECTIVE = "citation_match"
 # Reflection surfaces at most this many tool payloads per entry.
 ACTION_INPUT_SURFACE_LIMIT = 5
-# Pull citation IDs out of whatever JSON path the span uses. Confirm against a
-# real agentspan row if this over- or under-matches.
-_CITATION_ID_JSON_REGEX = r'"(?:citationId|citation_id)"\\s*:\\s*"([^"]+)"'
+CITATION_ARRAY_PATH = "jsonPayload.agent_run.citations_data.positioned_citations"
+CITATION_ID_FIELD = "doc_id"
 
 
 class NoComparedCitationEntriesError(RuntimeError):
@@ -165,9 +164,9 @@ def build_citation_match_per_entry_query(
 ) -> str:
     """Pair teacher and student citation-id sets per eval entry.
 
-    Citation IDs are scraped from the span JSON rather than a single nested
-    field, so this still works if Cito/MCP stores them under different paths.
-    Swap the ``REGEXP_EXTRACT_ALL`` expression if a structured array is better.
+    Reads ``agent_run`` rather than ``agent_step``: the run-level array is the
+    answer's final cited set and is a superset of the per-step arrays, so
+    unioning the two adds nothing.
     """
     return f"""
 WITH citation_spans AS (
@@ -180,7 +179,11 @@ WITH citation_spans AS (
     jsonPayload.context.agent_trace.trace_id AS trace_id,
     resource.labels.project_id AS deployment_id,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms,
-    REGEXP_EXTRACT_ALL(TO_JSON_STRING(jsonPayload), r'{_CITATION_ID_JSON_REGEX}') AS citation_ids
+    ARRAY(
+      SELECT citation.{CITATION_ID_FIELD}
+      FROM UNNEST({CITATION_ARRAY_PATH}) AS citation
+      WHERE citation.{CITATION_ID_FIELD} IS NOT NULL AND citation.{CITATION_ID_FIELD} != ''
+    ) AS citation_ids
   FROM `{agentspan_table}`
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
