@@ -35,8 +35,8 @@ def _rollout_output(
     teacher_tools: list[str],
     student_tool_calls: int | None = None,
     teacher_tool_calls: int | None = None,
-    student_action_inputs: list[str] | None = None,
-    teacher_action_inputs: list[str] | None = None,
+    student_first_tool_input: tuple[str, str] | None = None,
+    teacher_first_tool_input: tuple[str, str] | None = None,
 ) -> TeacherStudentALRolloutOutput:
     """One rollout row. Tool-call counts default to the listed events."""
     output: TeacherStudentALRolloutOutput = {
@@ -58,11 +58,39 @@ def _rollout_output(
         "teacher_output_tokens": 0,
         "entry_id": entry_id,
     }
-    if student_action_inputs:
-        output["student_action_inputs"] = list(student_action_inputs)
-    if teacher_action_inputs:
-        output["teacher_action_inputs"] = list(teacher_action_inputs)
+    if student_first_tool_input:
+        output["student_first_tool_input"] = list(student_first_tool_input)
+    if teacher_first_tool_input:
+        output["teacher_first_tool_input"] = list(teacher_first_tool_input)
     return output
+
+
+def _first_tool_phrase(role: str, tool: str) -> str:
+    """Describe a role's first tool, spelling out what an absent one means.
+
+    An empty scored sequence is a real choice, not missing data: every span the role
+    emitted was a skipped one, so it never reached for a tool this objective scores.
+    Reporting that as "(none)" read to reflection like a gap in the trace.
+    """
+    if tool:
+        return f"{role} used {tool}"
+    return f"{role} called no scored tool, emitting only skipped steps such as the automatic vault retrieval or shell"
+
+
+def _first_tool_input_lines(output: Mapping[str, Any]) -> list[str]:
+    """The scored first tool call, labelled with the role and tool that issued it.
+
+    Prefers the teacher's call because that is the behaviour being taught, and falls
+    back to the student's so reflection still sees what the task was about when the
+    teacher answered without calling a tool. An unlabelled payload is worse than
+    none here: reflection cannot tell whose call it is reading.
+    """
+    for role in ("teacher", "student"):
+        pair = output.get(f"{role}_first_tool_input")
+        if isinstance(pair, list | tuple) and len(pair) == 2 and pair[1]:
+            tool, payload = pair
+            return [f"{role} first tool ({tool or 'unknown'}): {payload}"]
+    return []
 
 
 class FirstToolMatchObjective(TeacherStudentObjective):
@@ -134,8 +162,8 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                     query=query,
                     student_tools=list(tool_match.student_tools),
                     teacher_tools=list(tool_match.teacher_tools),
-                    student_action_inputs=list(tool_match.student_action_inputs),
-                    teacher_action_inputs=list(tool_match.teacher_action_inputs),
+                    student_first_tool_input=tool_match.student_first_tool_input,
+                    teacher_first_tool_input=tool_match.teacher_first_tool_input,
                 ),
             )
             for entry_id, tool_match in analysis.per_entry.items()
@@ -192,7 +220,9 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         tool_alignment = objective_scores.get(self.name, trajectory["score"])
-        completeness = objective_scores.get("completeness", 0.0)
+        # Absent is not zero: the completeness judge is off by default, and defaulting
+        # it to 0.0 would report a failed judge on every example.
+        completeness = objective_scores.get("completeness")
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
         mismatch = first_tool_mismatch_pair(teacher_tools, student_tools)
@@ -200,12 +230,12 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         if mismatch is not None:
             teacher_first, student_first = mismatch
             feedback_parts.append(
-                f"First-tool mismatch: teacher used {teacher_first or '(none)'} "
-                f"and student used {student_first or '(none)'}."
+                f"First-tool mismatch: {_first_tool_phrase('teacher', teacher_first)} "
+                f"and {_first_tool_phrase('student', student_first)}."
             )
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
-        if completeness < 0.7:
+        if completeness is not None and completeness < 0.7:
             feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
 
         inputs: ReflectiveExampleInputs = {
@@ -214,9 +244,12 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             "deployment_id": output["deployment_id"],
             "query": output["query"],
         }
-        # The raw user query is scrubbed from telemetry, so the teacher's tool
-        # payloads are the only surviving signal for what the task actually was.
-        teacher_action_inputs = output.get("teacher_action_inputs") or []
+        metrics: ReflectiveExampleMetrics = {
+            "score": trajectory["score"],
+            "tool_alignment": tool_alignment,
+        }
+        if completeness is not None:
+            metrics["completeness"] = completeness
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -225,21 +258,21 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                 "student_tools": student_tools,
                 "teacher_tools": teacher_tools,
             },
-            "Action Inputs": list(teacher_action_inputs[:5]),
+            "Action Inputs": _first_tool_input_lines(output),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
-            "Metrics": {
-                "score": trajectory["score"],
-                "tool_alignment": tool_alignment,
-                "completeness": completeness,
-            },
+            "Metrics": metrics,
         }
 
     def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        return (
-            f"score={metrics['score']:.2f}, tool_alignment={metrics.get('tool_alignment', metrics['score']):.2f}, "
-            f"completeness={metrics.get('completeness', 0.0):.2f}"
-        )
+        parts = [
+            f"score={metrics['score']:.2f}",
+            f"tool_alignment={metrics.get('tool_alignment', metrics['score']):.2f}",
+        ]
+        completeness = metrics.get("completeness")
+        if completeness is not None:
+            parts.append(f"completeness={completeness:.2f}")
+        return ", ".join(parts)
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
         return high_signal_core_tool_keys(trajectories)

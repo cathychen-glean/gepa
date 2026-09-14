@@ -24,6 +24,7 @@ from glean_gepa.al_adapter import (
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
+from glean_gepa.eval_entry_queries import fetch_entry_queries
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
@@ -46,6 +47,10 @@ class _StartedPair:
     al_data_inst: TeacherStudentALDataInst
     teacher_eval_id: str
     student_eval_id: str
+    # The eval set the runs actually executed against. For a focused batch this is
+    # the generated high-signal set, whose entry ids are the ones scoring reports.
+    eval_set_name: str = ""
+    eval_set_version: str = ""
 
 
 class TeacherStudentAdapter(GleanAdapterBase):
@@ -82,6 +87,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self.telemetry_dimensions = self.objective.telemetry_dimensions
         self._judge_runs: dict[tuple[str, str], str] = {}
         self._judge_cache: dict[tuple[str, str], JudgeAnalysis] = {}
+        self._entry_query_cache: dict[tuple[str, str], dict[str, str]] = {}
         super().__init__(
             runner=runner,
             thresholds=thresholds,
@@ -119,6 +125,26 @@ class TeacherStudentAdapter(GleanAdapterBase):
         analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()
         return analysis
+
+    def _entry_queries_for(self, pair: _StartedPair) -> dict[str, str]:
+        """Real user queries for one pair's entries, keyed by entry id.
+
+        Validation eval sets run on customer deployments whose entries are
+        PII-gated, and they never feed reflection, so they are not listed at all.
+        """
+        if pair.al_data_inst.get("validation_only"):
+            return {}
+        cache_key = (pair.eval_set_name, pair.eval_set_version)
+        cached = self._entry_query_cache.get(cache_key)
+        if cached is None:
+            cached = fetch_entry_queries(
+                self.runner.evalcli,
+                eval_set_name=pair.eval_set_name,
+                eval_set_version=pair.eval_set_version,
+                deployment_ids=pair.al_data_inst.get("deployment_ids") or [],
+            )
+            self._entry_query_cache[cache_key] = cached
+        return cached
 
     def _evaluate_teacher_student(
         self,
@@ -241,6 +267,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     al_data_inst=al_data_inst,
                     teacher_eval_id=teacher_eval_id,
                     student_eval_id=student_eval_id,
+                    eval_set_name=eval_set_name,
+                    eval_set_version=eval_set_version,
                 )
             )
         return started, pending_waits
@@ -483,8 +511,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
             else:
                 self.objective.validate_full_eval(analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
-            # TODO: Populate the real user query for teacher-student matching.
             query = f"{al_data_inst.get('eval_set_name', '')}:{al_data_inst.get('eval_set_version', '')}"
+            entry_queries = self._entry_queries_for(pair)
             student_judges = {
                 judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
                 for judge in self.pointwise_judges
@@ -509,6 +537,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
 
             for row in scored_rows:
                 output = cast(TeacherStudentALRolloutOutput, dict(row.output))
+                if row.entry_id and (entry_query := entry_queries.get(row.entry_id)):
+                    output["query"] = entry_query
                 all_outputs.append(output)
                 objective_score = {
                     **self.constant_scores,

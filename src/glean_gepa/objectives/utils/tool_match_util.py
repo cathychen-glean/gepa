@@ -9,9 +9,10 @@ from typing import Any
 
 from glean_gepa.objectives.utils.action_input_trace import (
     build_trace_locator,
-    fetch_action_inputs_by_entry,
+    fetch_first_tool_inputs_by_entry,
 )
 from glean_gepa.objectives.utils.agentspan_query import (
+    AGENT_RUN_FAILURE_FILTER,
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
     EXECUTE_ACTION_FILTER,
@@ -22,9 +23,11 @@ from glean_gepa.objectives.utils.agentspan_query import (
 )
 
 TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
-SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool"})
-# Reflection surfaces at most this many tool payloads per entry.
-ACTION_INPUT_SURFACE_LIMIT = 5
+# find_skills_assistant is dropped because it never fires on its own: across a 206-entry
+# val set it accompanied Discover every single time, adjacent and in matching counts. The
+# pair is one discovery step emitting two spans, so scoring whichever span landed first
+# recorded a transposition as a wrong first tool.
+SKIPPED_TOOL_NAMES = frozenset({"Personal Knowledge Vault Retrieve", "Shell", "Shell Tool", "find_skills_assistant"})
 
 
 class NoComparedEvalEntriesError(RuntimeError):
@@ -33,12 +36,19 @@ class NoComparedEvalEntriesError(RuntimeError):
 
 @dataclass(frozen=True)
 class ToolMatchEntryMetrics:
+    """One entry's first-tool comparison.
+
+    This objective scores only the first tool each role picked, so the payloads are
+    likewise the first call's — surfacing later calls would invite reflection to
+    rewrite a prompt over a decision that was never scored.
+    """
+
     entry_id: str
     student_tools: tuple[str, ...]
     teacher_tools: tuple[str, ...]
     tools_match: bool
-    student_action_inputs: tuple[str, ...] = ()
-    teacher_action_inputs: tuple[str, ...] = ()
+    student_first_tool_input: tuple[str, str] | None = None
+    teacher_first_tool_input: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +58,7 @@ class ToolMatchMetrics:
     compared_entries: int
     matching_entries: int
     tool_match_rate: float
+    excluded_failed_runs: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,10 +92,32 @@ def build_tool_match_per_entry_query(
     *,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
-    """Build SQL that pairs teacher and student tool sequences per eval entry."""
+    """Build SQL that pairs teacher and student tool sequences per eval entry.
+
+    Rows carry ``run_failed`` so the caller can drop entries whose teacher or student
+    run died. Such a run emits no tool spans past the failure, and the outer join
+    below would otherwise read that truncated sequence as a deliberate tool choice.
+    """
     skipped = ", ".join(f"'{name}'" for name in sorted(SKIPPED_TOOL_NAMES))
     return f"""
-WITH tool_spans AS (
+WITH failed_runs AS (
+  SELECT DISTINCT
+    COALESCE(
+      jsonPayload.context.eval.entry_uuid,
+      CAST(jsonPayload.context.eval.entry_id AS STRING)
+    ) AS entry_id
+  FROM `{agentspan_table}`
+  WHERE {wildcard_shard_filter("start_date", "end_date")}
+    AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
+    AND {AGENT_RUN_FAILURE_FILTER}
+    -- @eval_ids is exactly the teacher/student pair, so any hit means one of the two
+    -- roles died on this entry. A NULL here would make the IN below return NULL.
+    AND COALESCE(
+      jsonPayload.context.eval.entry_uuid,
+      CAST(jsonPayload.context.eval.entry_id AS STRING)
+    ) IS NOT NULL
+),
+tool_spans AS (
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
     COALESCE(
@@ -124,6 +157,7 @@ teacher AS (
 )
 SELECT
   COALESCE(student.entry_id, teacher.entry_id) AS entry_id,
+  COALESCE(student.entry_id, teacher.entry_id) IN (SELECT entry_id FROM failed_runs) AS run_failed,
   IFNULL(student.tools, ARRAY<STRING>[]) AS student_tools,
   IFNULL(teacher.tools, ARRAY<STRING>[]) AS teacher_tools,
   student.trace_id AS student_trace_id,
@@ -164,6 +198,11 @@ def first_tool_mismatch_pair(
     return (teacher, student)
 
 
+def entry_run_failed(row: dict[str, Any]) -> bool:
+    """Whether either role's run died on this entry, leaving no comparable trajectory."""
+    return bool(row.get("run_failed"))
+
+
 def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics:
     student_tools = scored_tool_sequence(row.get("student_tools"))
     teacher_tools = scored_tool_sequence(row.get("teacher_tools"))
@@ -179,6 +218,8 @@ def aggregate_tool_match_metrics(
     teacher_eval_id: str,
     student_eval_id: str,
     per_entry: dict[str, ToolMatchEntryMetrics],
+    *,
+    excluded_failed_runs: int = 0,
 ) -> ToolMatchMetrics:
     compared = len(per_entry)
     matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
@@ -188,6 +229,7 @@ def aggregate_tool_match_metrics(
         compared_entries=compared,
         matching_entries=matching,
         tool_match_rate=(matching / compared) if compared else 0.0,
+        excluded_failed_runs=excluded_failed_runs,
     )
 
 
@@ -249,9 +291,11 @@ def fetch_eval_run_tool_match_analysis(
         )
 
     start_date, resolved_end, per_entry_rows = result
+    scored_rows = [row for row in per_entry_rows if not entry_run_failed(row)]
+    excluded_failed_runs = len(per_entry_rows) - len(scored_rows)
     per_entry = {
         metrics.entry_id: metrics
-        for row in per_entry_rows
+        for row in scored_rows
         for metrics in [parse_tool_match_entry_metrics(row)]
         if metrics.entry_id
     }
@@ -259,13 +303,18 @@ def fetch_eval_run_tool_match_analysis(
         sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.tools_match)
     )
     if evalcli is not None:
-        per_entry = _enrich_action_inputs(evalcli, per_entry, per_entry_rows, high_signal_entry_ids)
+        per_entry = _enrich_action_inputs(evalcli, per_entry, scored_rows, high_signal_entry_ids)
     return EvalRunToolMatchAnalysis(
         teacher_eval_id=teacher_eval_id,
         student_eval_id=student_eval_id,
         start_date=start_date,
         end_date=resolved_end,
-        aggregate=aggregate_tool_match_metrics(teacher_eval_id, student_eval_id, per_entry),
+        aggregate=aggregate_tool_match_metrics(
+            teacher_eval_id,
+            student_eval_id,
+            per_entry,
+            excluded_failed_runs=excluded_failed_runs,
+        ),
         per_entry=per_entry,
         high_signal_entry_ids=high_signal_entry_ids,
     )
@@ -277,7 +326,7 @@ def _enrich_action_inputs(
     per_entry_rows: list[dict[str, Any]],
     high_signal_entry_ids: tuple[str, ...],
 ) -> dict[str, ToolMatchEntryMetrics]:
-    """Attach teacher and student tool payloads to high-signal entries from traces.
+    """Attach each role's first tool call to high-signal entries from traces.
 
     The scrubbed table cannot serve tool payloads, so resolve them from each role's
     detailed trace located by the scrub-safe ids returned alongside the tool names.
@@ -301,18 +350,16 @@ def _enrich_action_inputs(
                 collected.append(locator)
         return collected
 
-    student_inputs = fetch_action_inputs_by_entry(
+    student_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
         _locators("student"),
         skip_tools=SKIPPED_TOOL_NAMES,
-        limit=ACTION_INPUT_SURFACE_LIMIT,
         role_label="student",
     )
-    teacher_inputs = fetch_action_inputs_by_entry(
+    teacher_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
         _locators("teacher"),
         skip_tools=SKIPPED_TOOL_NAMES,
-        limit=ACTION_INPUT_SURFACE_LIMIT,
         role_label="teacher",
     )
     if not student_inputs and not teacher_inputs:
@@ -320,8 +367,8 @@ def _enrich_action_inputs(
     return {
         entry_id: replace(
             metrics,
-            student_action_inputs=student_inputs.get(entry_id, metrics.student_action_inputs),
-            teacher_action_inputs=teacher_inputs.get(entry_id, metrics.teacher_action_inputs),
+            student_first_tool_input=student_inputs.get(entry_id, metrics.student_first_tool_input),
+            teacher_first_tool_input=teacher_inputs.get(entry_id, metrics.teacher_first_tool_input),
         )
         for entry_id, metrics in per_entry.items()
     }
@@ -335,10 +382,15 @@ def require_compared_eval_entries(analysis: EvalRunToolMatchAnalysis) -> None:
     """
     if analysis.aggregate.compared_entries > 0:
         return
+    excluded = analysis.aggregate.excluded_failed_runs
+    reason = (
+        f"all {excluded} candidate entries were dropped because a teacher or student run failed"
+        if excluded
+        else "wait for agentspan ingest or check that the eval runs actually executed entries"
+    )
     raise NoComparedEvalEntriesError(
         f"No eval entries were compared for student {analysis.student_eval_id} vs "
-        f"teacher {analysis.teacher_eval_id}. Wait for agentspan ingest or "
-        f"check that the eval runs actually executed entries."
+        f"teacher {analysis.teacher_eval_id}: {reason}."
     )
 
 
@@ -349,6 +401,11 @@ def log_tool_match_analysis(analysis: EvalRunToolMatchAnalysis) -> None:
         f"{aggregate.tool_match_rate:.2%} first-tool match "
         f"({aggregate.matching_entries}/{aggregate.compared_entries})"
     )
+    if aggregate.excluded_failed_runs:
+        print(
+            f"[Tool Match] Excluded {aggregate.excluded_failed_runs} entries whose teacher or "
+            "student run failed; check per-deployment error rates if this is a large share"
+        )
     for entry_id in analysis.high_signal_entry_ids[:5]:
         metrics = analysis.per_entry[entry_id]
         print(
