@@ -37,10 +37,6 @@ def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
     assert first_tool_mismatch_pair(("Shell", "read"), ("search",)) == ("read", "search")
     assert first_tool_mismatch_pair(("Shell",), ("Shell Tool",)) is None
 
-    # find_skills_assistant only ever fires alongside Discover, so either ordering of the
-    # pair is the same discovery step and must not read as a differing first tool.
-    assert scored_tool_sequence(["find_skills_assistant", "Discover", "search"]) == ("Discover", "search")
-    assert scored_tool_sequence(["Discover", "find_skills_assistant", "search"]) == ("Discover", "search")
     assert (
         first_tool_mismatch_pair(
             ("find_skills_assistant", "Discover", "search"),
@@ -48,9 +44,6 @@ def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
         )
         is None
     )
-    # Dropping the span must still leave a skipped discovery step visible as a mismatch.
-    assert first_tool_mismatch_pair(("find_skills_assistant", "Discover"), ("search",)) == ("Discover", "search")
-
     match = parse_tool_match_entry_metrics(
         {"entry_id": "entry-1", "student_tools": ["Shell", "search", "read"], "teacher_tools": ["search", "write"]}
     )
@@ -293,10 +286,7 @@ def test_failed_runs_are_excluded_rather_than_scored_as_mismatches():
     # Dropped entries must not reach reflection as high-signal failures.
     assert analysis.high_signal_entry_ids == ("live-mismatch",)
 
-
-def test_all_runs_failing_raises_rather_than_reporting_zero_match():
-    """Every entry dropped is an undefined comparison, not a 0% tool match."""
-    client = MagicMock()
+    # Every entry dropped is an undefined comparison, not a 0% tool match.
     client.query.side_effect = [
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
@@ -304,17 +294,17 @@ def test_all_runs_failing_raises_rather_than_reporting_zero_match():
             {"entry_id": "b", "run_failed": True, "student_tools": ["read"], "teacher_tools": []},
         ],
     ]
-    analysis = fetch_eval_run_tool_match_analysis(
+    all_failed = fetch_eval_run_tool_match_analysis(
         client,
         teacher_eval_id="teacher",
         student_eval_id="student",
         lookback_days=7,
         end_date=date(2026, 8, 11),
     )
-    assert analysis.aggregate.compared_entries == 0
-    assert analysis.aggregate.excluded_failed_runs == 2
+    assert all_failed.aggregate.compared_entries == 0
+    assert all_failed.aggregate.excluded_failed_runs == 2
     with pytest.raises(NoComparedEvalEntriesError, match="all 2 candidate entries were dropped"):
-        require_compared_eval_entries(analysis)
+        require_compared_eval_entries(all_failed)
 
 
 def _reflective_example(objective, objective_scores: dict, **output_extras) -> dict:

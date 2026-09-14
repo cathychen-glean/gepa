@@ -65,34 +65,6 @@ def _rollout_output(
     return output
 
 
-def _first_tool_phrase(role: str, tool: str) -> str:
-    """Describe a role's first tool, spelling out what an absent one means.
-
-    An empty scored sequence is a real choice, not missing data: every span the role
-    emitted was a skipped one, so it never reached for a tool this objective scores.
-    Reporting that as "(none)" read to reflection like a gap in the trace.
-    """
-    if tool:
-        return f"{role} used {tool}"
-    return f"{role} called no scored tool, emitting only skipped steps such as the automatic vault retrieval or shell"
-
-
-def _first_tool_input_lines(output: Mapping[str, Any]) -> list[str]:
-    """The scored first tool call, labelled with the role and tool that issued it.
-
-    Prefers the teacher's call because that is the behaviour being taught, and falls
-    back to the student's so reflection still sees what the task was about when the
-    teacher answered without calling a tool. An unlabelled payload is worse than
-    none here: reflection cannot tell whose call it is reading.
-    """
-    for role in ("teacher", "student"):
-        pair = output.get(f"{role}_first_tool_input")
-        if isinstance(pair, list | tuple) and len(pair) == 2 and pair[1]:
-            tool, payload = pair
-            return [f"{role} first tool ({tool or 'unknown'}): {payload}"]
-    return []
-
-
 class FirstToolMatchObjective(TeacherStudentObjective):
     """Score the student's first tool call against the teacher's."""
 
@@ -220,8 +192,6 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         tool_alignment = objective_scores.get(self.name, trajectory["score"])
-        # Absent is not zero: the completeness judge is off by default, and defaulting
-        # it to 0.0 would report a failed judge on every example.
         completeness = objective_scores.get("completeness")
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
@@ -229,10 +199,13 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         feedback_parts = []
         if mismatch is not None:
             teacher_first, student_first = mismatch
-            feedback_parts.append(
-                f"First-tool mismatch: {_first_tool_phrase('teacher', teacher_first)} "
-                f"and {_first_tool_phrase('student', student_first)}."
+            # An empty scored sequence is a real choice, not missing trace data.
+            no_tool = (
+                "called no scored tool, emitting only skipped steps such as the automatic vault retrieval or shell"
             )
+            teacher_phrase = f"used {teacher_first}" if teacher_first else no_tool
+            student_phrase = f"used {student_first}" if student_first else no_tool
+            feedback_parts.append(f"First-tool mismatch: teacher {teacher_phrase} and student {student_phrase}.")
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
         if completeness is not None and completeness < 0.7:
@@ -250,6 +223,13 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         }
         if completeness is not None:
             metrics["completeness"] = completeness
+        action_inputs: list[str] = []
+        for role in ("teacher", "student"):
+            pair = output.get(f"{role}_first_tool_input")
+            if isinstance(pair, list | tuple) and len(pair) == 2 and pair[1]:
+                tool, payload = pair
+                action_inputs = [f"{role} first tool ({tool or 'unknown'}): {payload}"]
+                break
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -258,7 +238,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                 "student_tools": student_tools,
                 "teacher_tools": teacher_tools,
             },
-            "Action Inputs": _first_tool_input_lines(output),
+            "Action Inputs": action_inputs,
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
             "Metrics": metrics,

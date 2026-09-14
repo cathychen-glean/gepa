@@ -22,6 +22,8 @@ from glean_gepa.teacher_student_adapter import (
     COMPLETENESS_JUDGE,
     TeacherStudentAdapter,
     _StartedPair,
+    _entry_queries_from_listing,
+    _fetch_entry_queries,
 )
 
 EVAL_SET = {
@@ -357,7 +359,7 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
     assert result.trajectories[0]["score"] == pytest.approx(0.5)
 
 
-def _finish_one_pair(adapter, evalcli: MagicMock, *, validation_only: bool = False):
+def _finish_one_pair(adapter, *, validation_only: bool = False):
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis()
     al_data_inst = {**EVAL_SET, **({"validation_only": True} if validation_only else {})}
     return adapter._finish_batch_evals(
@@ -374,7 +376,42 @@ def _finish_one_pair(adapter, evalcli: MagicMock, *, validation_only: bool = Fal
     )
 
 
-def test_reflection_reports_the_real_user_query_not_the_eval_set_stand_in():
+def test_entry_queries_reads_both_listing_shapes_and_skips_unusable_rows():
+    resolved = _entry_queries_from_listing(
+        [
+            {"id": "entry-1", "input": {"query": "how many employees in Belgium"}},
+            # Some listings carry the query at the top level rather than under input.
+            {"id": "entry-2", "query": "  draft the BNZ follow-up  "},
+            # Unusable: no id to join on, no query text, or a non-string payload.
+            {"input": {"query": "orphaned"}},
+            {"id": "entry-3", "input": {"query": "   "}},
+            {"id": "entry-4", "input": {}},
+            {"id": "entry-5", "input": {"query": {"text": "nested"}}},
+            "not-a-mapping",
+        ]
+    )
+
+    assert resolved == {
+        "entry-1": "how many employees in Belgium",
+        "entry-2": "draft the BNZ follow-up",
+    }
+
+
+def test_fetch_entry_queries_returns_empty_without_a_usable_listing():
+    """Customer eval sets are PII-gated, so a refused listing must leave reflection on
+    the stand-in rather than fail the batch, and a pair carrying no eval set must not
+    spend an RPC to discover there is nothing to list."""
+    refused = MagicMock()
+    refused.list_eval_set_entries.side_effect = RuntimeError("403 PII-gated")
+    assert _fetch_entry_queries(refused, eval_set_name="set", eval_set_version="20260907", deployment_ids=["x"]) == {}
+
+    skipped = MagicMock()
+    assert _fetch_entry_queries(skipped, eval_set_name="", eval_set_version="20260907", deployment_ids=[]) == {}
+    assert _fetch_entry_queries(None, eval_set_name="set", eval_set_version="20260907", deployment_ids=[]) == {}
+    skipped.list_eval_set_entries.assert_not_called()
+
+
+def test_real_user_queries_join_per_entry_from_the_eval_set_that_ran():
     """Agentspan scrubs the query, so every example used to be labelled with the
     same ``eval_set:version`` string and no task was distinguishable."""
     evalcli = MagicMock()
@@ -384,55 +421,38 @@ def test_reflection_reports_the_real_user_query_not_the_eval_set_stand_in():
     ]
     adapter = _teacher_student_adapter(evalcli)
 
-    result = _finish_one_pair(adapter, evalcli)
+    result = _finish_one_pair(adapter)
+    _finish_one_pair(adapter)
 
     assert result.outputs[0]["query"] == "how many employees does Glean have in Belgium"
     assert result.trajectories is not None
     example = adapter.objective.build_reflective_example(RULES_EXT_KEY, result.trajectories[0], {})
     assert example["Inputs"]["query"] == "how many employees does Glean have in Belgium"
-
-
-def test_entries_are_listed_from_the_eval_set_that_actually_ran():
-    """A focused batch runs against a generated high-signal set, and scoring
-    reports that set's entry ids, so the base version would not join."""
-    evalcli = MagicMock()
-    evalcli.list_eval_set_entries.return_value = []
-    adapter = _teacher_student_adapter(evalcli)
-
-    _finish_one_pair(adapter, evalcli)
-
-    assert evalcli.list_eval_set_entries.call_args.kwargs["eval_set_version"] == "20260907"
+    # A focused batch runs against a generated high-signal set and scoring reports that
+    # set's entry ids, so listing the batch's base version would not join.
+    assert evalcli.list_eval_set_entries.call_args.kwargs == {
+        "eval_set_name": "Glean Chat V2 Medium",
+        "eval_set_version": "20260907",
+        "deployment_ids": ["scio-prod"],
+    }
     assert EVAL_SET["eval_set_version"] == "20260806"
+    assert evalcli.list_eval_set_entries.call_count == 1, "listed once per version, not once per pair"
 
-
-def test_entry_queries_are_listed_once_per_eval_set_version():
-    evalcli = MagicMock()
-    evalcli.list_eval_set_entries.return_value = [{"id": "entry-1", "input": {"query": "case 007"}}]
-    adapter = _teacher_student_adapter(evalcli)
-
-    _finish_one_pair(adapter, evalcli)
-    _finish_one_pair(adapter, evalcli)
-
-    assert evalcli.list_eval_set_entries.call_count == 1
+    # An entry the listing does not cover keeps the stand-in instead of borrowing
+    # another entry's query.
+    unlisted = MagicMock()
+    unlisted.list_eval_set_entries.return_value = [{"id": "some-other-entry", "input": {"query": "case 007"}}]
+    fallback = _finish_one_pair(_teacher_student_adapter(unlisted))
+    assert fallback.outputs[0]["query"] == "Glean Chat V2 Medium:20260806"
 
 
 def test_pii_gated_validation_sets_are_never_listed_and_keep_the_stand_in():
     evalcli = MagicMock()
     adapter = _teacher_student_adapter(evalcli)
 
-    result = _finish_one_pair(adapter, evalcli, validation_only=True)
+    result = _finish_one_pair(adapter, validation_only=True)
 
     evalcli.list_eval_set_entries.assert_not_called()
-    assert result.outputs[0]["query"] == "Glean Chat V2 Medium:20260806"
-
-
-def test_unresolved_entries_fall_back_to_the_eval_set_stand_in():
-    evalcli = MagicMock()
-    evalcli.list_eval_set_entries.return_value = [{"id": "some-other-entry", "input": {"query": "case 007"}}]
-    adapter = _teacher_student_adapter(evalcli)
-
-    result = _finish_one_pair(adapter, evalcli)
-
     assert result.outputs[0]["query"] == "Glean Chat V2 Medium:20260806"
 
 
