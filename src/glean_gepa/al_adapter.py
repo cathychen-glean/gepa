@@ -143,68 +143,6 @@ AGENTIC_LOOP_MODEL_OVERRIDES = {
     "claude_opus": "CLAUDE_5_OPUS",
 }
 
-# The scParams backing the Coding Harness evalcli preset. Keep nested values
-# percent-encoded: scParams itself is comma-delimited, so decoding them would
-# change the meaning of the nested agentic-loop configuration.
-CODING_HARNESS_SC_PARAMS = (
-    "co.lo.mo.slwo.disabled=1,"
-    "ro.scholastic_required=true,"
-    "db.disable_usr=true,"
-    "db.filter_query_debug_results=true,"
-    "db.filter_bad_query_jiras=true,"
-    "db.include_final_scores=true,"
-    "ro.ro.fetch_supplemental_results=false,"
-    "db.ranking_only=true,"
-    "db.debug_mode=1,"
-    "co.debug_only_disabled_tools_list=gmail_search;outlook_search;respond;think;curl,"
-    "db.get_doc_metadata=true,"
-    "co.lo.enable_agent_recommendation=false,"
-    "ro.feso.slso.drop_slack_native=false,"
-    "ro.feso.slso.rts_count=0,"
-    "ro.feso.slso.skip_inline_rts=true,"
-    "co.disable_full_document_content=true,"
-    "wo.plan_only_dry_run_for_write_actions=true,"
-    "wo.plan_only_dry_run_for_write_actions_in_actas=true,"
-    "co.internal_looping_pyagent_default_route_override=coding_agent_loop,"
-    "co.lo.cao.agentic_loop_sc_params=co.so.enable_for_agentic_loop%3D1%2C"
-    "co.so.enable_programmatic_tool_calling%3D1%2C"
-    "co.so.ptc_allowed_tools%3D_none%2C"
-    "co.so.ptc_only_tools%3Dglean_search%253Bglean_document_reader%253Buser_activity_retrieve%253B"
-    "email_search_v2%253Bmeeting_lookup%253Bdiscover%253Btodo_write%253Bemployee_search%253B"
-    "ask_user_questions%253Bcode_search%253Bimage_generation%253Bcode_repository_agent%253B"
-    "web_search%253Bretrieve_personalized_writing_context%253Bcreate_image_collection%253Bcreate_ppt%253B"
-    "create_presentation_pdf%253Bsalesforce_context_selector%253Bjira_schema_reader%2C"
-    "co.so.enable_dynamic_tools_in_ptc%3D1%2C"
-    "co.lo.enable_todo%3D1%2C"
-    "co.enable_skill_reader_for_o3_agentic_loop%3D1%2C"
-    "co.cito.enable_mcp_citations_prompt%3D1%2C"
-    "co.lo.enable_artifacts%3Dtrue%2C"
-    "co.lo.artifact_per_type_skills%3Dtrue%2C"
-    "co.so.enable_approval_required_tools_in_ptc%3D1%2C"
-    "acto.enable_preview_and_cta_in_hitl_banner%3D1%2C"
-    "co.so.enable_ptc_tool_output_to_afs%3D1%2C"
-    "co.lo.enable_ask_user_questions%3D1%2C"
-    "co.use_discovery_layer%3D1%2C"
-    "co.so.enable_dev_message_at_max_turns%3Dtrue%2C"
-    "co.so.compact_max_chars%3D50000%2C"
-    "co.so.compact_max_chars_per_tool%3Dglean_document_reader%3A320000%3Bglean_search%3A160000%3B"
-    "code_search%3A160000%3Bemail_search_v2%3A160000%3Buser_activity_retrieve%3A160000%3B"
-    "meeting_lookup%3A160000%2C"
-    "co.so.upload_llm_rendered_to_afs%3Dtrue%2C"
-    "co.lo.cao.use_auto_mode%3Dtrue%2C"
-    "co.lo.cao.use_knowledge_tool%3D0%2C"
-    "co.lo.suppress_shell_step_when_detailed_message%3D1%2C"
-    "co.so.omit_file_path_when_no_compaction%3Dtrue%2C"
-    "co.enable_run_tool_action_summary_event_response%3D1%2C"
-    "co.lo.cao.bare_tool_configs%3DCode%2520Search%253ASearch%2520company%2520code%252C%2520configs%252C%2520schemas%252C%2520commits%252C%2520and%2520snippets.%2520Primary%2520tool%2520for%2520any%2520technical%2520question%2520about%2520implementation%2520ground%2520truth%252C%2520system%2520behavior%252C%2520code%2520locations%252C%2520bugs%252C%2520errors%252C%2520config%2520keys%252C%2520APIs%252C%2520data%2520models%252C%2520feature%2520flags%252C%2520or%2520how%252Fwhere%252Fwhy%2520something%2520is%2520implemented.%253BUser%2520Activity%2520Retrieve%253ARetrieves%2520all%2520cross-app%2520work%2520activities%2520over%2520a%2520date%2520range%253BMap%253ARuns%2520parallel%2520subtasks%2520across%2520multiple%2520inputs.%2520Use%2520sparingly.%253BCode%2520Repository%2520Agent%253AMakes%2520code%2520changes%2520and%2520creates%2520PRs%253BEmail%2520Search%2520V2%253ASearches%2520over%2520the%2520user%2527s%2520emails%253BSandbox%2520File%2520View%253AView%2520image%2520files%2520%28.jpg%252F.jpeg%252F.png%29%2520from%2520the%2520sandbox%2520for%2520visual%2520inspection%253BData%2520Analysis%253AUse%2520for%2520ANY%2520SQL%252C%2520analytics%252C%2520BI%252C%2520metrics%252C%2520KPI%252C%2520reporting%252C%2520pipeline%252FCRM%252C%2520or%2520data-lookup%2520query.%2520Returns%2520a%2520routing%2520playbook%2520across%2520the%2520connected%2520data%2520sources.%2520Always%2520run%2520it%2520first%252C%2520before%2520drilling%2520into%2520a%2520specific%2520data%2520source.%2520It%2520requires%2520zero%2520args%2520%25E2%2580%2594%2520just%2520use%2520%2560print%2528asyncio.run%2528data_analysis%2528%2529%2529%2529%2560%2520directly%2520%2528skip%2520%2560help%2560for%2520this%2520tool%2529.%2C"
-    "co.lo.warm_start_discover_skills_header_override%3DSuggested%2520skills%2520%2528read%2520only%2520if%2520CLEARLY%2520relevant%2529%253A%2C"
-    "llmo.per_prompt_overrides.intermediary_updates_instructions%3DIyMjIEludGVybWVkaWFyeSBVcGRhdGVzCldoaWxlIHdvcmtpbmcsIGVtaXQgQlJJRUYgYW5kIHNpbXBsZSAoMS0yIHNlbnRlbmNlKSBzdGF0dXMgdXBkYXRlcyBhdCBiaWcgbWlsZXN0b25lcy4KUnVsZXM6Ci0gVXBkYXRlcyBhcmUgb2JzZXJ2YXRpb25hbCwgbm90IGRlY2lzaW9uYWwuIERvIG5vdCB1c2UgdXBkYXRlcyB0byBkZXRlcm1pbmUgd2hhdCB0byBkbyBuZXh0LgotIERvIG5vdCBuYXJyYXRlIHRvb2wgY2FsbCBvciBza2lsbCB1c2FnZS4gVXBkYXRlIG9ubHkgd2hlbiB5b3UgZm91bmQgc3Vic3RhbnRpYWwgaW5mb3JtYXRpb24uCi0gQWZ0ZXIgY29tcGxldGluZyBhIHNlYXJjaCBvciB0b29sIGNhbGwsIGNoZWNrIHdoZXRoZXIgdGhlIHVzZXIncyBvcmlnaW5hbCByZXF1ZXN0IGlzIGZ1bGx5IHNhdGlzZmllZCBiZWZvcmUgY29uc2lkZXJpbmcgdGhlIHRhc2sgZG9uZS4gRmluZGluZyBpbmZvcm1hdGlvbiBpcyBub3QgdGhlIHNhbWUgYXMgZGVsaXZlcmluZyB0aGUgZmluYWwgb3V0cHV0Lg%3D%3D%2C"
-    "co.lo.cao.hide_shell_tool_output_file_path%3Dtrue%2C"
-    "co.lo.cao.enable_split_tool_sdk%3D1%2C"
-    "co.use_gateway_for_discovery%3D1%2C"
-    "co.lo.cao.bare_tools_redlist%3Dsalesforce_context_selector%253Bjira_schema_reader"
-)
-
 
 # ---------------------------
 # 1) Prompt modules + candidate
