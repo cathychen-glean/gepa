@@ -112,8 +112,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Set up stopping mechanism
         self.stop_callback = stop_callback
-        # Guard against a degenerate no-progress spin: some proposers legitimately
-        # return no candidates for an iteration so we stop gracefully.
+        # Guard against a degenerate no-progress spin
         self.max_stalled_proposals = max_stalled_proposals
         self.adapter = adapter
 

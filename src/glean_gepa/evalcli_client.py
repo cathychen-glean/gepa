@@ -13,9 +13,6 @@ from typing import Any
 
 from glean_gepa.debug import debug_print
 
-# The Coding Harness execution preset still records runnerType=NEXT_STEP, which
-# current evalcli rejects. Coding-agent-loop behavior is carried by sc-params;
-# GLEAN_CHAT is the accepted runner that executes them.
 CODING_HARNESS_RUNNER_TYPE = "GLEAN_CHAT"
 
 CORRECTNESS_INPUT_MAPPINGS = json.dumps(
@@ -56,7 +53,6 @@ FINISHED_TASK_STATUSES = frozenset({"TASK_SUCCEEDED", "TASK_FAILED"})
 # Succeeded+failed must strictly exceed 9x the unfinished remainder (~90% done).
 MIN_FINISHED_TO_UNFINISHED_RATIO = 9
 
-# Marks a call killed by EVALCLI_TIMEOUT_SEC; listed below so it retries.
 EVALCLI_TIMEOUT_MARKER = "evalcli timed out"
 TRANSIENT_EVALCLI_PATTERNS = (
     "API request failed: 502",
@@ -78,11 +74,6 @@ OPAQUE_EVALCLI_ERROR_MARKER = "stderr: Error:\nstdout:"
 DUPLICATE_EVAL_RUN_PATTERNS = ("duplicate entry", "(1062,")
 JUDGE_CREATE_ATTEMPTS = 4
 JUDGE_CREATE_RETRY_SEC = 30
-# evalcli can hang indefinitely instead of returning: a `run create` has been seen
-# wedged for an hour after the server had already created the run, stalling the whole
-# optimization behind a subprocess that never exits. Every call is bounded so a hang
-# surfaces as a retryable error. Generous enough for the slowest legitimate calls
-# (paging eval set entries, fetching a large analysis trace).
 EVALCLI_TIMEOUT_SEC = 900
 
 MIN_INGESTED_ENTRY_FRACTION = 0.5
