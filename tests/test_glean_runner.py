@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.prompt import candidate_module_names, compile_system_prompt, materialize_system_prompt
+from glean_gepa.prompt import compile_system_prompt, materialize_system_prompt
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
@@ -26,7 +26,6 @@ from glean_gepa.runner import (
     SCIO_PROD_DEPLOYMENT_IDS,
     TEACHER_STUDENT_DEPLOYMENT_IDS,
     _default_cache_file,
-    _format_run_config,
     _load_seed_candidate,
     _make_evalset,
     _parse_args,
@@ -44,7 +43,7 @@ SEED_BOTH = {"WRITING_CODE": "patterns", "FULL_PROMPT": "PREFIX\n{WRITING_CODE}\
 SEED_WITH_RULES_SLOT = {**SEED_BOTH, "WRITING_CODE": "patterns\n{RULES_EXT}"}
 
 
-def test_compile_and_materialize_splice_writing_code_when_present():
+def test_compile_and_materialize_system_prompt():
     assert compile_system_prompt(SEED_BOTH) == "PREFIX\npatterns\nSUFFIX"
     assert materialize_system_prompt(SEED_BOTH) == "PREFIX\npatterns\nSUFFIX"
 
@@ -54,17 +53,12 @@ def test_compile_and_materialize_splice_writing_code_when_present():
     assert "{WRITING_CODE}" not in stock
     assert "## Writing Code" in stock
 
-
-def test_compile_system_prompt_leaves_writing_code_slot_when_key_absent():
     assert compile_system_prompt({}) == DEFAULT_FULL_PROMPT
     assert (
         compile_system_prompt({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"}) == "PREFIX\n{WRITING_CODE}\nSUFFIX"
     )
 
-
-def test_materialize_system_prompt_fills_defaults_when_modules_missing():
     prompt = materialize_system_prompt({})
-
     assert prompt == DEFAULT_FULL_PROMPT.replace("{WRITING_CODE}", DEFAULT_WRITING_CODE)
     assert "{WRITING_CODE}" not in prompt
     assert "{RULES_EXT}" in prompt
@@ -158,13 +152,6 @@ def test_editing_rules_ext_without_a_slot_is_refused():
         _seed_for_editable_modules(SEED_BOTH, [RULES_EXT_KEY])
 
 
-def test_writing_code_only_does_not_expand_core_tools():
-    editable_modules = [WRITING_CODE_KEY]
-
-    assert candidate_module_names(editable_modules) == editable_modules
-    assert _seed_for_editable_modules(SEED_BOTH, editable_modules) == {WRITING_CODE_KEY: "patterns"}
-
-
 def test_parse_editable_modules():
     assert _parse_editable_modules(WRITING_CODE_KEY) == [WRITING_CODE_KEY]
     assert _parse_editable_modules(f"{WRITING_CODE_KEY},{RULES_EXT_KEY}") == [WRITING_CODE_KEY, RULES_EXT_KEY]
@@ -208,12 +195,6 @@ def test_committed_seed_candidate_pins_only_writing_code():
     assert _seed_for_editable_modules(raw, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: raw[WRITING_CODE_KEY]}
     assert _seed_for_editable_modules(raw, [RULES_EXT_KEY])[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
     assert "{RULES_EXT}" in materialize_system_prompt(raw)
-
-
-def test_parse_args_defaults_editable_modules_to_writing_code():
-    args = _parse_args(["--seed_candidate", "seed.json"])
-
-    assert args.editable_modules == WRITING_CODE_KEY
 
 
 def test_parse_args_accepts_all_reflection_samples_and_hamming_k():
@@ -310,10 +291,7 @@ def test_eval_version_days_back_holds_the_train_window_still(frozen_today):
     assert val_shifted == [_version(1), _version(0)]
     # The shifted train window excludes everything newer than the as-of date.
     assert _version(0) not in train_shifted and _version(1) not in train_shifted
-
-
-def test_eval_version_days_back_defaults_to_today(frozen_today):
-    assert _auto_selected_split(None) == _auto_selected_split(0)
+    assert _auto_selected_split(None) == (train_today, val_today)
     assert _parse_args(["--seed_candidate", "seed.json"]).eval_version_days_back == 0
 
 

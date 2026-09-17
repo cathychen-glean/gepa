@@ -323,3 +323,4 @@ def test_runner_without_config_keeps_cli_defaults():
     assert args.experiment is None
     assert args.judging_mode == "single_model"
     assert args.student_model == "gpt"
+    assert args.editable_modules == "WRITING_CODE"

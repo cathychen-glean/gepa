@@ -17,6 +17,8 @@ def test_hamming_distance_supports_small_variations_and_length_differences():
     assert is_within_hamming_distance("error-100", "error-101", 1)
     assert is_within_hamming_distance("abc", "ab", 1)
     assert not is_within_hamming_distance("error-100", "error-999", 1)
+    with pytest.raises(ValueError, match="non-negative"):
+        is_within_hamming_distance("a", "b", -1)
 
 
 def test_strip_stdout_sections_preserves_stderr_and_surrounding_error_text():
@@ -60,11 +62,6 @@ def test_deduplicate_reflective_examples_keeps_entries_without_errors():
     ]
 
     assert deduplicate_reflective_examples(examples, k=10) == examples
-
-
-def test_hamming_distance_rejects_negative_k():
-    with pytest.raises(ValueError, match="non-negative"):
-        is_within_hamming_distance("a", "b", -1)
 
 
 def test_single_model_adapter_all_mode_deduplicates_errors_before_prompting():

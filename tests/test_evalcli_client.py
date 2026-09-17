@@ -467,26 +467,6 @@ def test_list_eval_set_versions_returns_matching_and_unspecified_deployments():
     )
 
 
-def test_list_eval_set_versions_returns_version_rows():
-    client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(
-        client, "_invoke_json", return_value={"evalSetVersions": [{"version": "20260827"}]}
-    ) as mock_invoke:
-        rows = client.list_eval_set_versions(eval_set_name="Glean Chat V2 Medium", deployment_ids=["scio-prod"])
-
-    assert rows == [{"version": "20260827"}]
-    assert mock_invoke.call_args[0] == (
-        "evalsets",
-        "versions",
-        "--name",
-        "Glean Chat V2 Medium",
-        "--page",
-        "1",
-        "--page-size",
-        "100",
-    )
-
-
 def test_compare_eval_metrics_uses_pairwise_compare_command():
     client = EvalCliClient(binary="/fake/evalcli")
     payload = {"systemMetrics": {}, "judgeMetrics": {}}
