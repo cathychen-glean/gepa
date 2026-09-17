@@ -59,6 +59,7 @@ from glean_gepa.prompt_constants import (
     KNOWN_PROMPT_KEYS,
     MODULE_TOKEN_BUDGETS,
     PROMPT_MODULE_DEFAULTS,
+    RULES_EXT_KEY,
     WRITING_CODE_KEY,
 )
 from glean_gepa.run_log import capture_run_log, log_section
@@ -182,6 +183,16 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
     if WRITING_CODE_KEY not in editable_modules:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
+    if RULES_EXT_KEY in editable_modules and "{RULES_EXT}" not in seed.get(
+        WRITING_CODE_KEY, seed.get(FULL_PROMPT_KEY, "")
+    ):
+        # Without the slot the module compiles away silently, so the run would spend
+        # its whole budget evolving text the student never sees.
+        raise SystemExit(
+            f"{RULES_EXT_KEY} is editable but the seed prompt has no {{RULES_EXT}} slot. "
+            f"Add {{RULES_EXT}} to {WRITING_CODE_KEY} in the seed file, or drop {RULES_EXT_KEY} "
+            "from editable_modules."
+        )
     return seed
 
 

@@ -148,6 +148,19 @@ def test_seed_for_editable_modules():
     assert overridden[FULL_PROMPT_KEY] == materialize_system_prompt({})
 
 
+def test_editing_rules_ext_without_a_slot_is_refused():
+    """A seed with no {RULES_EXT} compiles the module away, so the run would evolve
+    text the student never sees. Fail at startup instead of burning the budget."""
+    with pytest.raises(SystemExit, match="no {RULES_EXT} slot"):
+        _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY, RULES_EXT_KEY])
+
+    with pytest.raises(SystemExit, match="no {RULES_EXT} slot"):
+        _seed_for_editable_modules(SEED_BOTH, [RULES_EXT_KEY])
+
+    kept = _seed_for_editable_modules(SEED_WITH_RULES_SLOT, [WRITING_CODE_KEY, RULES_EXT_KEY])
+    assert kept[WRITING_CODE_KEY] == "patterns\n{RULES_EXT}"
+
+
 def test_writing_code_only_does_not_expand_core_tools():
     editable_modules = [WRITING_CODE_KEY]
 
