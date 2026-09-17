@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import (
     TeacherStudentALRolloutOutput,
@@ -21,7 +21,25 @@ from glean_gepa.objectives.utils.citation_match_util import (
     log_citation_match_analysis,
     require_compared_citation_entries,
 )
-from glean_gepa.reflection_prompts import teacher_student_citation_reflection_prompt
+from glean_gepa.prompt_constants import RULES_EXT_KEY, WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+
+WRITING_CODE_RESPONSIBILITY = (
+    "Focus ONLY on the coding and execution instructions that decide which sources reach the answer: "
+    "printing raw SDK results, carrying each result's `citationId` through any filtering, ranking, or "
+    "summarizing step, and not truncating output the answer still has to cite. Change other guidance "
+    "only where it produces missing or extra citations. "
+    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE} Propose minimal deltas."
+)
+
+RULES_EXT_RESPONSIBILITY = (
+    "You are writing at most two markdown bullets that will be appended after the existing "
+    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
+    "existing Rules, do not add a heading, and do not exceed two bullets. Target citation "
+    "mismatches (missing teacher sources, extra student sources, or dropped citationId values "
+    "after filtering SDK results). Keep each bullet operational and concise. "
+    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+)
 
 
 def _rollout_output(
@@ -75,6 +93,13 @@ class CitationMatchObjective(TeacherStudentObjective):
     focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
     failure_label = "HIGH-SIGNAL FAILURES (teacher vs student citation match)"
     reflection_report_title = "REFLECTION: teacher vs student citation sets"
+    teacher_compared_key = "teacher_citations"
+    student_compared_key = "student_citations"
+    mismatch_pair = citation_mismatch_pair
+    module_responsibilities: ClassVar[Mapping[str, str]] = {
+        WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY,
+        RULES_EXT_KEY: RULES_EXT_RESPONSIBILITY,
+    }
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         self.bigquery_client = bigquery_client
@@ -141,19 +166,13 @@ class CitationMatchObjective(TeacherStudentObjective):
             for entry_id, citation_match in analysis.per_entry.items()
         ]
 
-    def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
-        return citation_mismatch_pair(output.get("teacher_citations"), output.get("student_citations"))
-
-    def reflection_prompt(self, module_name: str) -> str:
-        return teacher_student_citation_reflection_prompt(module_name)
-
     def failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         del component_name
         output = trajectory["output"]
         citation_match = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
             int(citation_match < 1.0),
-            int(citation_mismatch_pair(output.get("teacher_citations"), output.get("student_citations")) is not None),
+            int(self._mismatch_key(output) is not None),
         )
 
     def build_reflective_example(
@@ -169,7 +188,7 @@ class CitationMatchObjective(TeacherStudentObjective):
         completeness = objective_scores.get("completeness")
         student_citations = list(output.get("student_citations") or [])
         teacher_citations = list(output.get("teacher_citations") or [])
-        mismatch = citation_mismatch_pair(teacher_citations, student_citations)
+        mismatch = self._mismatch_key(output)
         feedback_parts = []
         if mismatch is not None:
             missing, extra = mismatch

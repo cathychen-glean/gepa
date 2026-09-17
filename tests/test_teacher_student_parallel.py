@@ -821,13 +821,13 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
     eval_batch = GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[])
 
     examples = adapter.make_reflective_dataset(
-        {"FULL_PROMPT": "prompt"},
+        {"WRITING_CODE": "prompt"},
         eval_batch,
-        ["FULL_PROMPT", "glean_search", "discover", "glean_document_reader"],
+        ["WRITING_CODE", "glean_search", "discover", "glean_document_reader"],
         k=8,
     )
 
-    assert len(examples["FULL_PROMPT"]) == 20
+    assert len(examples["WRITING_CODE"]) == 20
     search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
     discover_ids = [example["Inputs"]["entry_id"] for example in examples["discover"]]
     reader_ids = [example["Inputs"]["entry_id"] for example in examples["glean_document_reader"]]

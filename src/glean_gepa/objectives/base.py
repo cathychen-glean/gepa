@@ -11,10 +11,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from glean_gepa.adapter_types import JudgingMode
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.reflection_prompts import DEFAULT_MODULE_RESPONSIBILITY, core_tool_reflection_prompt
 
 if TYPE_CHECKING:
     from gepa.core.adapter import EvaluationBatch
@@ -42,6 +44,21 @@ class ScoredRow:
     data_overrides: Mapping[str, Any] = field(default_factory=dict)
 
 
+def module_responsibility(
+    module_name: str,
+    *,
+    responsibilities: Mapping[str, str],
+    reflects_core_tools: bool,
+) -> str:
+    """Resolve the responsibility text the reflector gets for ``module_name``."""
+    responsibility = responsibilities.get(module_name)
+    if responsibility is not None:
+        return responsibility
+    if reflects_core_tools and module_name in CORE_TOOL_KEYS:
+        return core_tool_reflection_prompt(module_name)
+    return DEFAULT_MODULE_RESPONSIBILITY
+
+
 class TeacherStudentObjective(ABC):
     """Paired teacher-vs-student trace comparison."""
 
@@ -50,13 +67,14 @@ class TeacherStudentObjective(ABC):
     focused_bucket_type: str
     failure_label: str = "HIGH-SIGNAL FAILURES"
     reflection_report_title: str = "REFLECTION: teacher vs student traces"
+    teacher_compared_key: str
+    student_compared_key: str
+    mismatch_pair: Callable[[Any, Any], tuple[str, str] | None]
+    module_responsibilities: ClassVar[Mapping[str, str]] = {}
+    reflects_core_tools: bool = False
     bigquery_client: Any | None = None
-    # evalcli client used to resolve per-entry tool payloads from detailed traces
-    # (the scrubbed table cannot serve them). The adapter injects it before analyze.
     evalcli: Any | None = None
     lookback_days: int = 1
-    # Per-pair analysis cache, keyed by (teacher_eval_id, student_eval_id).
-    # Concrete objectives populate this in ``__init__``.
     _paired_analysis_cache: dict[tuple[str, str], Any]
 
     @property
@@ -121,9 +139,12 @@ class TeacherStudentObjective(ABC):
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
         return self._mismatch_key(output) is not None
 
-    @abstractmethod
     def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
         """Signature of the teacher/student divergence in ``output``, or ``None`` when aligned."""
+        return type(self).mismatch_pair(
+            output.get(self.teacher_compared_key),
+            output.get(self.student_compared_key),
+        )
 
     def _select_mismatch_groups(
         self, mismatch_keys: Sequence[tuple[str, str] | None]
@@ -135,9 +156,12 @@ class TeacherStudentObjective(ABC):
         component_name: str,
         selected: list[Any],
         selected_keys: list[tuple[str, str] | None],
+        *,
+        trajectories: list[Any],
+        mismatch_keys: list[tuple[str, str] | None],
     ) -> list[Any]:
         """Trajectories to reflect on for ``component_name`` (default: all selected)."""
-        del component_name, selected_keys
+        del component_name, selected_keys, trajectories, mismatch_keys
         return selected
 
     def make_reflective_dataset(
@@ -165,7 +189,13 @@ class TeacherStudentObjective(ABC):
         selected_keys = [mismatch_keys[index] for index in selected_indices]
         examples: dict[str, list[ReflectiveExample]] = {}
         for component_name in components_to_update:
-            chosen = self._component_trajectories(component_name, selected, selected_keys)
+            chosen = self._component_trajectories(
+                component_name,
+                selected,
+                selected_keys,
+                trajectories=trajectories,
+                mismatch_keys=mismatch_keys,
+            )
             examples[component_name] = [build_example(component_name, trajectory, candidate) for trajectory in chosen]
         mismatch_count = sum(key is not None for key in mismatch_keys)
         selected_entry_ids = [
@@ -189,8 +219,13 @@ class TeacherStudentObjective(ABC):
         )
         return examples
 
-    @abstractmethod
-    def reflection_prompt(self, module_name: str) -> str: ...
+    @classmethod
+    def reflection_prompt(cls, module_name: str) -> str:
+        return module_responsibility(
+            module_name,
+            responsibilities=cls.module_responsibilities,
+            reflects_core_tools=cls.reflects_core_tools,
+        )
 
     @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...
@@ -223,6 +258,8 @@ class SingleModelObjective(ABC):
     pending_error_type: type[Exception] = RuntimeError
     # Human-readable telemetry name for pending/read logs; empty falls back to ``name``.
     pending_telemetry_label: str = ""
+    module_responsibilities: ClassVar[Mapping[str, str]] = {}
+    reflects_core_tools: bool = False
 
     @abstractmethod
     def analyze(
@@ -276,8 +313,13 @@ class SingleModelObjective(ABC):
         deployment_ids: Sequence[str],
     ) -> list[dict[str, Any]] | None: ...
 
-    @abstractmethod
-    def reflection_prompt(self, module_name: str) -> str: ...
+    @classmethod
+    def reflection_prompt(cls, module_name: str) -> str:
+        return module_responsibility(
+            module_name,
+            responsibilities=cls.module_responsibilities,
+            reflects_core_tools=cls.reflects_core_tools,
+        )
 
     @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...

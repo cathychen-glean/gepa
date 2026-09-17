@@ -25,15 +25,16 @@ from glean_gepa.prompt_constants import (
 
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")
+_RULES_EXT_SLOT = re.compile(r"\{RULES_EXT\}[ \t]*\n?")
 
 
 def materialize_system_prompt(candidate: dict[str, str]) -> str:
     """Inject writing-code into one system prompt, leaving ``{RULES_EXT}`` for compile time.
 
-    Used when ``FULL_PROMPT`` is an editable GEPA module: after this, there is
-    no ``{WRITING_CODE}`` slot and GEPA iterates on the full prompt as a single string.
-    ``RULES_EXT`` stays a placeholder so later children can rewrite those bullets
-    without re-materializing Writing Code.
+    Used to freeze the system prompt for runs that do not edit ``WRITING_CODE``:
+    after this there is no ``{WRITING_CODE}`` slot left to fill at compile time.
+    ``RULES_EXT`` stays a placeholder so children editing those bullets do not
+    re-materialize Writing Code.
     """
     template = candidate.get(FULL_PROMPT_KEY, DEFAULT_FULL_PROMPT)
     writing_code = candidate.get(WRITING_CODE_KEY, DEFAULT_WRITING_CODE)
@@ -52,7 +53,8 @@ def compile_system_prompt(candidate: dict[str, str]) -> str:
     if WRITING_CODE_KEY in candidate:
         template = template.replace("{WRITING_CODE}", candidate[WRITING_CODE_KEY])
     if "{RULES_EXT}" in template:
-        template = template.replace("{RULES_EXT}", candidate.get(RULES_EXT_KEY, DEFAULT_RULES_EXT).strip())
+        rules_ext = candidate.get(RULES_EXT_KEY, DEFAULT_RULES_EXT).strip()
+        template = template.replace("{RULES_EXT}", rules_ext) if rules_ext else _RULES_EXT_SLOT.sub("", template)
     return template
 
 

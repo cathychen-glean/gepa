@@ -11,7 +11,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, NotRequired, TypedDict, cast
+from typing import Any, Callable, Iterable, Mapping, NotRequired, Sequence, TypedDict, cast
 
 from gepa.core.adapter import EvaluationBatch
 from glean_gepa.adapter_types import (
@@ -32,13 +32,13 @@ from glean_gepa.evalcli_client import (
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, prepare_high_signal_eval_batch
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import (
-    CONSOLIDATE_LENGTH_EMPTY,
-    CONSOLIDATE_LENGTH_NONEMPTY,
     EMPTY_DIAGNOSIS_FALLBACK,
-    LENGTH_RULE_EMPTY,
-    LENGTH_RULE_NONEMPTY,
     consolidate_prompt,
     diagnosis_prompt,
+    drops_render_slot,
+    length_rule_for,
+    module_char_budget,
+    sanitize_proposed_module,
 )
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
@@ -163,7 +163,7 @@ class ModuleSpec:
 @dataclass
 class Candidate:
     model: str  # "gpt" | "fast" | "claude_sonnet" | "claude_opus"
-    prompt_modules: dict[str, str]  # Editable keys, e.g. {"FULL_PROMPT": "..."}
+    prompt_modules: dict[str, str]  # Editable keys, e.g. {"WRITING_CODE": "..."}
     module_specs: dict[str, ModuleSpec]
     global_token_cap: int  # relative to baseline prompt for that model
     baseline_prompt_hash: str  # used to define "relative cap"
@@ -179,11 +179,7 @@ def approx_token_len(text: str) -> int:
 
 
 def total_prompt_tokens(candidate: Candidate) -> int:
-    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions.
-
-    Core-tool descriptions have their own per-module budgets and must not crowd out
-    ``FULL_PROMPT`` under the global cap.
-    """
+    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions."""
     return sum(approx_token_len(text) for key, text in candidate.prompt_modules.items() if key not in CORE_TOOL_KEYS)
 
 
@@ -303,6 +299,15 @@ class JudgeResult:
 # 3) Teacher cache + runner interfaces
 # ---------------------------
 
+# (model, prompt_hash, eval_set_name, eval_set_version, run_label, deployment_signature)
+EvalCacheKey = tuple[str, str, str, str, str, str]
+EVAL_CACHE_KEY_FIELDS = 6
+
+
+def deployment_signature(deployment_ids: Sequence[str]) -> str:
+    """Identify the deployment subset an eval run actually executed on so they can be reproduced"""
+    return ",".join(sorted({str(item) for item in deployment_ids}))
+
 
 class ALRunner:
     """
@@ -330,9 +335,9 @@ class ALRunner:
         self._cache_lock = threading.RLock()
 
         # Track eval run IDs: cache_key -> eval_run_id
-        self._eval_run_ids: dict[tuple[str, str, str, str, str], str] = {}
+        self._eval_run_ids: dict[EvalCacheKey, str] = {}
         # Started-but-not-yet-complete runs: eval_run_id -> cache_key
-        self._in_flight: dict[str, tuple[str, str, str, str, str]] = {}
+        self._in_flight: dict[str, EvalCacheKey] = {}
         # Judge runs: (eval_run_id, base_eval_run_id, judge_type) -> judge_run_id
         self._judge_run_ids: dict[tuple[str, str, str], str] = {}
         # Eval IDs created or verified in this process; disk-loaded IDs are probed.
@@ -342,7 +347,7 @@ class ALRunner:
         if self.cache_file:
             self._load_cache()
 
-    def _parse_cache_key(self, raw_key: Any) -> tuple[str, str, str, str, str] | None:
+    def _parse_cache_key(self, raw_key: Any) -> EvalCacheKey | None:
         if isinstance(raw_key, list):
             parsed = raw_key
         elif isinstance(raw_key, str):
@@ -352,9 +357,16 @@ class ALRunner:
                 return None
         else:
             return None
-        if not isinstance(parsed, list) or len(parsed) != 5:
+        if not isinstance(parsed, list) or len(parsed) != EVAL_CACHE_KEY_FIELDS:
             return None
-        return (str(parsed[0]), str(parsed[1]), str(parsed[2]), str(parsed[3]), str(parsed[4]))
+        return (
+            str(parsed[0]),
+            str(parsed[1]),
+            str(parsed[2]),
+            str(parsed[3]),
+            str(parsed[4]),
+            str(parsed[5]),
+        )
 
     @staticmethod
     def _parse_judge_cache_key(raw_key: Any) -> tuple[str, str, str] | None:
@@ -455,7 +467,7 @@ class ALRunner:
                 self._judge_run_ids.pop(key, None)
             self._save_cache()
 
-    def _promote_completed(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+    def _promote_completed(self, cache_key: EvalCacheKey, eval_run_id: str) -> None:
         with self._cache_lock:
             self._eval_run_ids[cache_key] = eval_run_id
             stale_inflight = [eid for eid, key in self._in_flight.items() if key == cache_key or eid == eval_run_id]
@@ -464,7 +476,7 @@ class ALRunner:
             self._verified_eval_ids.add(eval_run_id)
             self._save_cache()
 
-    def _remember_in_flight(self, cache_key: tuple[str, str, str, str, str], eval_run_id: str) -> None:
+    def _remember_in_flight(self, cache_key: EvalCacheKey, eval_run_id: str) -> None:
         with self._cache_lock:
             self._in_flight[eval_run_id] = cache_key
             self._verified_eval_ids.add(eval_run_id)
@@ -492,7 +504,7 @@ class ALRunner:
             return "missing"
         return self._fallback_eval_state(eval_run_id)
 
-    def _resolve_cached_eval(self, cache_key: tuple[str, str, str, str, str]) -> tuple[str, bool] | None:
+    def _resolve_cached_eval(self, cache_key: EvalCacheKey) -> tuple[str, bool] | None:
         """Return (eval_id, wait_required) for a reusable cached run, or None to create."""
         with self._cache_lock:
             completed_id = self._eval_run_ids.get(cache_key)
@@ -570,12 +582,13 @@ class ALRunner:
             (eval_run_id, wait_required). wait_required is False when a completed
             run was already cached.
         """
-        cache_key = (
+        cache_key: EvalCacheKey = (
             model,
             hashlib.md5(system_prompt.encode()).hexdigest()[:16],
             eval_set_name,
             eval_set_version,
             run_label,
+            deployment_signature(deployment_ids),
         )
         resolved = self._resolve_cached_eval(cache_key)
         if resolved is not None:
@@ -1501,10 +1514,9 @@ class GleanAdapterBase:
         ``diagnosis`` is the first-pass reflection text (failure modes and WHY).
         """
         current = candidate.prompt_modules.get(components_to_update[0], "")
-        if current.strip():
-            length_rule, consolidate_length = LENGTH_RULE_NONEMPTY, CONSOLIDATE_LENGTH_NONEMPTY
-        else:
-            length_rule, consolidate_length = LENGTH_RULE_EMPTY, CONSOLIDATE_LENGTH_EMPTY
+        spec = candidate.module_specs.get(components_to_update[0])
+        token_budget = spec.token_budget if spec else None
+        length_rule = length_rule_for(current, token_budget)
 
         ex_blocks = []
         for r in reflective_examples:
@@ -1554,15 +1566,22 @@ class GleanAdapterBase:
         consolidate_text = consolidate_prompt(
             module_name=module_name,
             max_variants=max_variants,
-            consolidate_length=consolidate_length,
+            consolidate_length=length_rule,
             current=current,
             example_blocks="".join(ex_blocks),
             suggestions=raw,
         )
         consolidated = reflection_llm(consolidate_text).strip()
-        variants = [
-            variant
-            for variant in (v.strip() for v in consolidated.split("===VARIANT==="))
-            if variant and variant.upper() != "NOT_RELEVANT"
-        ]
+        variants = []
+        for chunk in consolidated.split("===VARIANT==="):
+            variant = sanitize_proposed_module(chunk, current=current, module_name=module_name)
+            if not variant or variant.upper() == "NOT_RELEVANT":
+                continue
+            if drops_render_slot(variant, current=current):
+                print(f"Discarding {module_name} variant that dropped a render slot")
+                continue
+            variants.append(variant)
+        budget = module_char_budget(current, token_budget)
+        if budget is not None:
+            variants = [variant for variant in variants if len(variant) <= budget]
         return variants[:max_variants], False, raw

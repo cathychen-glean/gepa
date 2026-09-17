@@ -188,6 +188,35 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
     assert "EXECUTION_ERRORS: ['command exited with status 1']" in captured_prompts[1]
 
 
+def test_proposals_that_drop_a_render_slot_are_rejected():
+    """A Writing Code rewrite without ``{RULES_EXT}`` would silently orphan that module."""
+    current = "- stock rule\n{RULES_EXT}\n### Sandbox\n"
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"WRITING_CODE": current},
+        module_specs={"WRITING_CODE": ModuleSpec("WRITING_CODE", "free_text", 1024)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    kept = "- tightened rule\n{RULES_EXT}\n### Sandbox\n"
+    prompts: list[str] = []
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return "diagnosis" if len(prompts) == 1 else f"- tightened rule\n### Sandbox\n===VARIANT==={kept}"
+
+    variants, _, _ = adapter.propose_new_texts(reflection_lm, candidate, ["WRITING_CODE"], [])
+
+    assert variants == [kept.strip()]
+    assert "{RULES_EXT}" in prompts[0]
+
+
 def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     evalcli = EvalCliClient(binary="/fake/evalcli")
     adapter = SingleModelAdapter(

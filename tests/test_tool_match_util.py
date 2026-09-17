@@ -24,6 +24,7 @@ from glean_gepa.objectives.utils.tool_match_util import (
     require_compared_eval_entries,
     scored_tool_sequence,
 )
+from glean_gepa.prompt_constants import RULES_EXT_KEY
 
 
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
@@ -348,6 +349,28 @@ def test_first_tool_payload_falls_back_to_the_student_call():
     assert both["Action Inputs"] == ['teacher first tool (Glean Document Reader): {"urls": ["x"]}']
     assert _reflective_example(objective, scores)["Action Inputs"] == []
     assert _reflective_example(objective, scores, teacher_first_tool_input=["Glean Search", ""])["Action Inputs"] == []
+
+    payload = '{"file_path":"SKILL.md","old_string":"' + "x" * 900 + '"}'
+    long = _reflective_example(objective, scores, teacher_first_tool_input=["Edit", payload])
+    assert long["Action Inputs"][0].endswith("... (truncated)")
+    assert len(long["Action Inputs"][0]) < len(payload)
+
+
+def test_rules_ext_reflects_on_its_own_ranking_of_non_core_mismatches():
+    objective = FirstToolMatchObjective()
+    trajectories = [{"entry_id": f"core-{i}"} for i in range(5)] + [{"entry_id": f"write-{i}"} for i in range(5)]
+    mismatch_keys = [("Glean Search", "")] * 5 + [("Write", "")] * 5
+    selected, selected_keys = trajectories[:6], mismatch_keys[:6]
+
+    chosen = objective._component_trajectories(
+        RULES_EXT_KEY, selected, selected_keys, trajectories=trajectories, mismatch_keys=mismatch_keys
+    )
+    assert [entry["entry_id"] for entry in chosen] == [f"write-{i}" for i in range(5)]
+
+    core = objective._component_trajectories(
+        "glean_search", selected, selected_keys, trajectories=trajectories, mismatch_keys=mismatch_keys
+    )
+    assert [entry["entry_id"] for entry in core] == [f"core-{i}" for i in range(5)]
 
 
 def test_unscored_completeness_is_omitted_rather_than_reported_as_zero():

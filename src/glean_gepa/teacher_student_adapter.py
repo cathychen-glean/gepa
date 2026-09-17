@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -180,7 +179,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _get_or_start_eval(
         self,
         *,
-        cache_key: tuple[str, ...],
         model: str,
         system_prompt: str,
         eval_set_name: str,
@@ -208,10 +206,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self,
         batch: list[TeacherStudentALDataInst],
         candidate: dict[str, str],
-    ) -> tuple[list[_StartedPair], dict[str, tuple[tuple[str, ...], str]]]:
+    ) -> tuple[list[_StartedPair], dict[str, str]]:
         system_prompt = compile_encoded_prompt(candidate)
         started: list[_StartedPair] = []
-        pending_waits: dict[str, tuple[tuple[str, ...], str]] = {}
+        pending_waits: dict[str, str] = {}
         for al_data_inst in batch:
             target = resolve_eval_run_target(
                 self.runner.evalcli,
@@ -229,29 +227,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
             eval_set_version = target.eval_set_version
             deployment_ids = al_data_inst.get("deployment_ids", [])
             run_label = target.run_label
-            teacher_prompt_hash = hashlib.md5(b"<<TEACHER_PROD_PROMPT>>").hexdigest()[:16]
-            student_prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
-            teacher_cache_key = (
-                eval_set_name,
-                eval_set_version,
-                self.teacher_model,
-                teacher_prompt_hash,
-                run_label,
-            )
-            student_cache_key = (
-                eval_set_name,
-                eval_set_version,
-                self.student_model,
-                student_prompt_hash,
-                run_label,
-            )
             teacher_eval_id = al_data_inst.get("cached_teacher_eval_run_id")
             wait_teacher = False
             if teacher_eval_id:
                 print(f"[Child cache HIT] Using cached teacher eval_id: {teacher_eval_id}")
             else:
                 teacher_eval_id, wait_teacher = self._get_or_start_eval(
-                    cache_key=teacher_cache_key,
                     model=self.teacher_model,
                     system_prompt="<<TEACHER_PROD_PROMPT>>",
                     eval_set_name=eval_set_name,
@@ -266,7 +247,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 print(f"[Child cache HIT] Using cached student eval_id: {student_eval_id}")
             else:
                 student_eval_id, wait_student = self._get_or_start_eval(
-                    cache_key=student_cache_key,
                     model=self.student_model,
                     system_prompt=system_prompt,
                     eval_set_name=eval_set_name,
@@ -276,9 +256,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     run_label=run_label,
                 )
             if wait_teacher:
-                pending_waits[teacher_eval_id] = (teacher_cache_key, "teacher")
+                pending_waits[teacher_eval_id] = "teacher"
             if wait_student:
-                pending_waits[student_eval_id] = (student_cache_key, "student")
+                pending_waits[student_eval_id] = "student"
             started.append(
                 _StartedPair(
                     al_data_inst=al_data_inst,
@@ -290,8 +270,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
             )
         return started, pending_waits
 
-    def _wait_pending_evals(self, pending_waits: dict[str, tuple[tuple[str, ...], str]]) -> None:
-        for eval_id, (_cache_key, role) in pending_waits.items():
+    def _wait_pending_evals(self, pending_waits: dict[str, str]) -> None:
+        for eval_id, role in pending_waits.items():
             self.runner.wait(eval_id)
             print(f"Recorded completed {role} eval_id: {eval_id}")
             for judge in self.pointwise_judges:
@@ -430,7 +410,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
     ) -> list[GleanEvaluationBatch]:
         typed_batch = cast(list[TeacherStudentALDataInst], batch)
         all_started: list[list[_StartedPair]] = []
-        pending_waits: dict[str, tuple[tuple[str, ...], str]] = {}
+        pending_waits: dict[str, str] = {}
         for candidate in candidates:
             started, candidate_pending = self._start_batch_evals(typed_batch, candidate)
             all_started.append(started)
