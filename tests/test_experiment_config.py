@@ -282,7 +282,7 @@ def test_runner_config_sets_yaml_defaults_and_cli_overrides():
     assert args.student_model == "fast"
     assert args.teacher_model == args.experiment.models["teacher"]
     assert args.seed_candidate == Path("data/seed_candidate.json")
-    assert args.run_dir == Path("run_ts")
+    assert args.run_dir == Path(args.experiment.run["dir"])
     assert args.experiment.primary_objective == "tool_alignment"
     # Derived from the widest lookback_days across the merged signals, so it
     # tracks the pack rather than pinning a value the pack is expected to tune.

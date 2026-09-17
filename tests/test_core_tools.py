@@ -16,9 +16,10 @@ from glean_gepa.prompt import (
 from glean_gepa.prompt_constants import (
     CORE_TOOL_DESCRIPTIONS,
     CORE_TOOLS,
-    FULL_PROMPT_KEY,
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
+    WRITING_CODE_KEY,
+    WRITING_CODE_TOKEN_BUDGET,
 )
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
@@ -119,16 +120,16 @@ def test_pick_modules_to_edit_rewrites_only_eligible_high_signal_core_tools():
             }
         ],
     )
-    prompt_only = TeacherStudentAdapter(**kwargs, editable_modules=[FULL_PROMPT_KEY])
+    prompt_only = TeacherStudentAdapter(**kwargs, editable_modules=[WRITING_CODE_KEY])
     core_tools = TeacherStudentAdapter(**kwargs, editable_modules=list(CORE_TOOLS))
-    both = TeacherStudentAdapter(**kwargs, editable_modules=[FULL_PROMPT_KEY, *CORE_TOOLS])
+    both = TeacherStudentAdapter(**kwargs, editable_modules=[WRITING_CODE_KEY, *CORE_TOOLS])
     search_only = TeacherStudentAdapter(**kwargs, editable_modules=["glean_search"])
 
-    assert pick_modules_to_edit(prompt_only) == [FULL_PROMPT_KEY]
-    assert pick_modules_to_edit(prompt_only, eval_batch) == [FULL_PROMPT_KEY]
+    assert pick_modules_to_edit(prompt_only) == [WRITING_CODE_KEY]
+    assert pick_modules_to_edit(prompt_only, eval_batch) == [WRITING_CODE_KEY]
     assert pick_modules_to_edit(core_tools) == []
     assert pick_modules_to_edit(core_tools, eval_batch) == ["glean_search", "discover"]
-    assert pick_modules_to_edit(both, eval_batch) == [FULL_PROMPT_KEY, "glean_search", "discover"]
+    assert pick_modules_to_edit(both, eval_batch) == [WRITING_CODE_KEY, "glean_search", "discover"]
     assert pick_modules_to_edit(search_only, eval_batch) == ["glean_search"]
 
     rules_and_core = TeacherStudentAdapter(**kwargs, editable_modules=[*CORE_TOOLS, RULES_EXT_KEY])
@@ -142,8 +143,8 @@ def test_pick_modules_to_edit_rewrites_only_eligible_high_signal_core_tools():
 def test_total_prompt_tokens_excludes_core_tool_descriptions():
     candidate = Candidate(
         model="gpt",
-        prompt_modules={"FULL_PROMPT": "abcd" * 10, "glean_search": "x" * 400},
-        module_specs={"FULL_PROMPT": ModuleSpec("FULL_PROMPT", "free_text", 8192)},
+        prompt_modules={WRITING_CODE_KEY: "abcd" * 10, "glean_search": "x" * 400},
+        module_specs={WRITING_CODE_KEY: ModuleSpec(WRITING_CODE_KEY, "free_text", WRITING_CODE_TOKEN_BUDGET)},
         global_token_cap=4096,
         baseline_prompt_hash="h",
     )

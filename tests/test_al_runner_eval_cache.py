@@ -26,7 +26,7 @@ def test_start_writes_in_flight_and_wait_promotes_cancelled(tmp_path):
     saved = json.loads(cache_file.read_text())
     assert saved["completed"] == {}
     assert saved["in_flight"]["run_abc"][0] == "fast"
-    assert saved["in_flight"]["run_abc"][2:] == ["set", "v1", "gepa"]
+    assert saved["in_flight"]["run_abc"][2:] == ["set", "v1", "gepa", "prod"]
 
     runner.wait(eval_id)
     saved = json.loads(cache_file.read_text())
@@ -100,11 +100,11 @@ def test_wait_polls_when_completed_id_is_probed_ongoing(tmp_path):
     second_client.wait_for_eval_run.assert_called_once_with("run_abc")
 
 
-def test_v1_flat_cache_still_waits_when_run_is_ongoing(tmp_path):
-    """Legacy flat caches load every id as completed; an ongoing probe still wins."""
+def test_flat_cache_still_waits_when_run_is_ongoing(tmp_path):
+    """Flat caches load every id as completed; an ongoing probe still wins."""
     cache_file = tmp_path / "eval-runs.json"
     prompt_hash = hashlib.md5(b"prompt").hexdigest()[:16]
-    cache_file.write_text(json.dumps({json.dumps(["fast", prompt_hash, "set", "v1", "gepa"]): "run_old"}))
+    cache_file.write_text(json.dumps({json.dumps(["fast", prompt_hash, "set", "v1", "gepa", "prod"]): "run_old"}))
     client = MagicMock()
     client.get_eval_run_status.return_value = [{"taskCountsByStatus": [{"status": "TASK_RUNNING", "count": 2}]}]
     runner = ALRunner(evalcli=client, cache_file=str(cache_file))
@@ -193,15 +193,51 @@ def test_dropping_stale_eval_discards_its_judge_runs(tmp_path):
     assert json.loads(cache_file.read_text())["judge_runs"] == {}
 
 
-def test_v1_eval_run_cache_still_loads(tmp_path):
+def test_cache_entry_without_deployments_is_not_reused(tmp_path):
+    """A cache entry predating the deployment field must be re-run, not adopted.
+
+    Its deployment subset is unknown, so reusing it can pair a student against a
+    teacher that shares none of its entry ids, scoring every entry as a mismatch.
+    """
     cache_file = tmp_path / "eval-runs.json"
     prompt_hash = hashlib.md5(b"prompt").hexdigest()[:16]
     cache_file.write_text(json.dumps({json.dumps(["fast", prompt_hash, "set", "v1", "gepa"]): "run_old"}))
     client = MagicMock()
-    client.get_eval_run_status.return_value = [{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 3}]}]
+    client.create_eval_run.return_value = "run_new"
     runner = ALRunner(evalcli=client, cache_file=str(cache_file))
+
     eval_id, wait_required = _start(runner)
 
-    assert eval_id == "run_old"
+    assert eval_id == "run_new"
+    assert wait_required is True
+    client.create_eval_run.assert_called_once()
+
+
+def test_same_prompt_on_different_deployments_is_a_separate_eval(tmp_path):
+    """Deployments decide which entries run, so they must not share a cache entry."""
+    cache_file = tmp_path / "eval-runs.json"
+    first = ALRunner(evalcli=MagicMock(create_eval_run=MagicMock(return_value="run_a")), cache_file=str(cache_file))
+    first.start("fast", "prompt", "set", "v1", ["prod"])
+
+    second_client = MagicMock(create_eval_run=MagicMock(return_value="run_b"))
+    second = ALRunner(evalcli=second_client, cache_file=str(cache_file))
+    eval_id, _ = second.start("fast", "prompt", "set", "v1", ["other-deployment"])
+
+    assert eval_id == "run_b"
+    second_client.create_eval_run.assert_called_once()
+
+
+def test_deployment_order_does_not_change_the_cache_key(tmp_path):
+    """The same deployment set listed in a different order is the same eval."""
+    cache_file = tmp_path / "eval-runs.json"
+    first = ALRunner(evalcli=MagicMock(create_eval_run=MagicMock(return_value="run_a")), cache_file=str(cache_file))
+    first.start("fast", "prompt", "set", "v1", ["beta", "alpha"])
+
+    second_client = MagicMock()
+    second_client.get_eval_run_status.return_value = [{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 3}]}]
+    second = ALRunner(evalcli=second_client, cache_file=str(cache_file))
+    eval_id, wait_required = second.start("fast", "prompt", "set", "v1", ["alpha", "beta"])
+
+    assert eval_id == "run_a"
     assert wait_required is False
-    client.create_eval_run.assert_not_called()
+    second_client.create_eval_run.assert_not_called()

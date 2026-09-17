@@ -54,6 +54,7 @@ from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt, ma
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
+    EDITABLE_PROMPT_KEYS,
     FULL_PROMPT_KEY,
     KNOWN_PROMPT_KEYS,
     MODULE_TOKEN_BUDGETS,
@@ -85,6 +86,16 @@ CUSTOMER_EVAL_DEPLOYMENT_IDS = [
     "pricefx-prod",
     "seatgeek",
     "tealium",
+    "televox",
+    "thoughtworks",
+]
+# Claude-capable subset of the customer pool, plus scio-prod.
+TEACHER_STUDENT_DEPLOYMENT_IDS = [
+    "bill",
+    "guild",
+    "happyreturns",
+    "howardhughes",
+    "seatgeek",
     "televox",
     "thoughtworks",
 ]
@@ -140,14 +151,19 @@ def _parse_editable_modules(raw: str) -> list[str]:
             for key in CORE_TOOLS:
                 if key not in modules:
                     modules.append(key)
-        elif part in KNOWN_PROMPT_KEYS:
+        elif part in EDITABLE_PROMPT_KEYS:
             if part not in modules:
                 modules.append(part)
+        elif part == FULL_PROMPT_KEY:
+            raise SystemExit(
+                f"{FULL_PROMPT_KEY} is not editable: it is the render template. Edit a scoped "
+                f"module ({WRITING_CODE_KEY}, RULES_EXT, or core tools) instead."
+            )
         else:
             unknown.append(part)
     if unknown:
         unknown_list = ", ".join(sorted(repr(key) for key in unknown))
-        known_list = ", ".join(sorted([*KNOWN_PROMPT_KEYS, CORE_TOOLS_GROUP]))
+        known_list = ", ".join(sorted([*EDITABLE_PROMPT_KEYS, CORE_TOOLS_GROUP]))
         raise SystemExit(f"unknown editable_modules: {unknown_list}. Known keys: {known_list}")
     return modules
 
@@ -155,23 +171,16 @@ def _parse_editable_modules(raw: str) -> list[str]:
 def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str]) -> dict[str, str]:
     """Build the GEPA candidate dict for the requested editable modules.
 
-    ``FULL_PROMPT`` is a fully stitched system prompt when that key is editable.
-    When neither ``FULL_PROMPT`` nor ``WRITING_CODE`` is editable, the materialized
-    seed prompt is still attached so evals keep a frozen system prompt. Core-tool
+    When ``WRITING_CODE`` is not editable, the materialized seed prompt is attached
+    under ``FULL_PROMPT`` so evals keep a frozen system prompt. Core-tool
     descriptions are attached only when they are editable, so a ``WRITING_CODE``-only
     run keeps the legacy candidate and compiled-prompt hashes.
     ``RULES_EXT`` is copied from the seed when listed; compile time splices it into
     the ``{RULES_EXT}`` slot after Writing Code **Rules:**. Keys omitted from
     ``raw`` use ``PROMPT_MODULE_DEFAULTS``.
     """
-    seed: dict[str, str] = {}
-    for key in editable_modules:
-        if key == FULL_PROMPT_KEY:
-            seed[key] = materialize_system_prompt(raw)
-        else:
-            seed[key] = raw.get(key, PROMPT_MODULE_DEFAULTS[key])
-    editing_system_prompt = any(key in {FULL_PROMPT_KEY, WRITING_CODE_KEY} for key in editable_modules)
-    if not editing_system_prompt:
+    seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
+    if WRITING_CODE_KEY not in editable_modules:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
     return seed
 
@@ -360,21 +369,23 @@ def _select_covered_dated_versions(
     return list(reversed(selected))
 
 
-def _resolve_customer_deployments(state_file: Path | None, *, seed: int | None = None) -> list[str]:
-    """Sample the customer deployments this run evaluates on.
-
-    The sample is written to the run directory and reused on resume: re-sampling
-    would change the eval-set identity and miss every cached eval run.
-    """
+def _resolve_customer_deployments(
+    state_file: Path | None,
+    *,
+    seed: int | None = None,
+    pool: list[str] | None = None,
+) -> list[str]:
+    """Sample the customer deployments this run evaluates on."""
+    candidates = list(CUSTOMER_EVAL_DEPLOYMENT_IDS if pool is None else pool)
     if state_file is not None and state_file.is_file():
         saved = json.loads(state_file.read_text())
         if not isinstance(saved, list) or not saved:
             raise SystemExit(f"{state_file} does not hold a list of customer deployments: {saved!r}")
-        if any(item not in CUSTOMER_EVAL_DEPLOYMENT_IDS for item in saved):
+        if any(item not in candidates for item in saved):
             raise SystemExit(f"{state_file} does not hold a list of customer deployments: {saved!r}")
         return [str(item) for item in saved]
 
-    sampled = sorted(random.Random(seed).sample(CUSTOMER_EVAL_DEPLOYMENT_IDS, MAX_EVAL_RUN_DEPLOYMENTS))
+    sampled = sorted(random.Random(seed).sample(candidates, MAX_EVAL_RUN_DEPLOYMENTS))
     if state_file is not None:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps(sampled))
@@ -794,10 +805,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--editable_modules",
         default=WRITING_CODE_KEY,
-        help="Comma-separated prompt keys to edit (WRITING_CODE, FULL_PROMPT, CORE_TOOLS, "
-        "RULES_EXT, or individual core-tool keys). CORE_TOOLS expands to all core-tool "
-        "descriptions; the proposer only rewrites those involved in high-signal first-tool "
-        "mismatches. RULES_EXT is at most two bullets after Writing Code **Rules:**.",
+        help="Comma-separated prompt keys to edit (WRITING_CODE, CORE_TOOLS, RULES_EXT, or individual core-tool keys).",
     )
     parser.add_argument(
         "--fake_flow",
@@ -924,13 +932,17 @@ def _run_from_args(args: argparse.Namespace) -> None:
     log_section("RUN CONFIG", _format_run_config(args, judging_mode, editable_modules, seed_candidate, experiment))
     evalcli = EvalCliClient(binary=args.evalcli)
     bigquery_client = BigQueryClient(project_id=args.bigquery_project)
+    deployment_pool = (
+        TEACHER_STUDENT_DEPLOYMENT_IDS if judging_mode == "teacher_student" else CUSTOMER_EVAL_DEPLOYMENT_IDS
+    )
     customer_deployments = _resolve_customer_deployments(
         _default_cache_file(args.run_dir, CUSTOMER_DEPLOYMENTS_FILENAME),
         seed=args.customer_deployment_seed,
+        pool=deployment_pool,
     )
     print(
-        f"[Customer eval] Sampled {len(customer_deployments)} of {len(CUSTOMER_EVAL_DEPLOYMENT_IDS)} "
-        f"customer deployments: {','.join(customer_deployments)}"
+        f"[Customer eval] Sampled {len(customer_deployments)} of {len(deployment_pool)} "
+        f"customer deployments allowed for {judging_mode}: {','.join(customer_deployments)}"
     )
     train_versions, val_versions = _resolve_eval_version_split(args, evalcli, customer_deployments)
     eval_set_name, deployment_ids = evalset_identity(experiment)

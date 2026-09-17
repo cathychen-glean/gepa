@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import (
     TeacherStudentALRolloutOutput,
@@ -12,6 +12,7 @@ from glean_gepa.adapter_types import (
 from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
@@ -23,7 +24,15 @@ from glean_gepa.objectives.utils.tool_match_util import (
 )
 from glean_gepa.prompt import high_signal_core_tool_keys, is_core_tool_span, tool_description_override_key
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS, RULES_EXT_KEY
-from glean_gepa.reflection_prompts import teacher_student_reflection_prompt
+from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+
+RULES_EXT_RESPONSIBILITY = (
+    "You are writing at most two markdown bullets that will be appended after the existing "
+    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
+    "existing Rules, do not add a heading, and do not exceed two bullets. Target first-tool "
+    "mismatches whose tools are not core tools (for example Write vs (none)). Keep each "
+    f"bullet operational and concise. {NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+)
 
 
 def _rollout_output(
@@ -73,6 +82,13 @@ class FirstToolMatchObjective(TeacherStudentObjective):
     focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
     failure_label = "HIGH-SIGNAL FAILURES (teacher vs student tool match)"
     reflection_report_title = "REFLECTION: teacher vs student tool sequences"
+    teacher_compared_key = "teacher_tool_events"
+    student_compared_key = "student_tool_events"
+    mismatch_pair = first_tool_mismatch_pair
+    module_responsibilities: ClassVar[Mapping[str, str]] = {
+        RULES_EXT_KEY: RULES_EXT_RESPONSIBILITY,
+    }
+    reflects_core_tools = True
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         self.bigquery_client = bigquery_client
@@ -141,14 +157,14 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             for entry_id, tool_match in analysis.per_entry.items()
         ]
 
-    def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
-        return first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-
     def _component_trajectories(
         self,
         component_name: str,
         selected: list[Any],
         selected_keys: list[tuple[str, str] | None],
+        *,
+        trajectories: list[Any],
+        mismatch_keys: list[tuple[str, str] | None],
     ) -> list[Any]:
         """Route mismatches to the tool-description or rules module they implicate."""
         if component_name in CORE_TOOL_KEYS:
@@ -159,15 +175,14 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                 and any(tool_description_override_key(name) == component_name for name in pair if name)
             ]
         if component_name == RULES_EXT_KEY:
-            return [
-                trajectory
-                for trajectory, pair in zip(selected, selected_keys, strict=True)
-                if pair is not None and not any(is_core_tool_span(name) for name in pair if name)
+            non_core = [
+                (trajectory, key)
+                for trajectory, key in zip(trajectories, mismatch_keys, strict=True)
+                if key is not None and not any(is_core_tool_span(name) for name in key if name)
             ]
+            indices, _ = select_mismatch_groups([key for _, key in non_core])
+            return [non_core[index][0] for index in indices]
         return selected
-
-    def reflection_prompt(self, module_name: str) -> str:
-        return teacher_student_reflection_prompt(module_name)
 
     def failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         del component_name
@@ -175,10 +190,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         tool_alignment = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
             int(tool_alignment < 0.7),
-            int(
-                first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-                is not None
-            ),
+            int(self._mismatch_key(output) is not None),
             int(output.get("student_tool_errors", 0) > 0),
         )
 
@@ -195,7 +207,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         completeness = objective_scores.get("completeness")
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
-        mismatch = first_tool_mismatch_pair(teacher_tools, student_tools)
+        mismatch = self._mismatch_key(output)
         feedback_parts = []
         if mismatch is not None:
             teacher_first, student_first = mismatch
@@ -228,7 +240,10 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             pair = output.get(f"{role}_first_tool_input")
             if isinstance(pair, list | tuple) and len(pair) == 2 and pair[1]:
                 tool, payload = pair
-                action_inputs = [f"{role} first tool ({tool or 'unknown'}): {payload}"]
+                payload_text = str(payload)
+                if len(payload_text) > 240:
+                    payload_text = payload_text[:240] + "... (truncated)"
+                action_inputs = [f"{role} first tool ({tool or 'unknown'}): {payload_text}"]
                 break
         return {
             "Inputs": inputs,

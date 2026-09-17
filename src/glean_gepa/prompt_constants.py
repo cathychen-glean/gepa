@@ -3,9 +3,6 @@
 """Prompt-module keys, stock text, and token budgets for the Glean assistant."""
 
 # --- Candidate keys ---
-# WRITING_CODE sits under "## Writing Code". FULL_PROMPT is the whole system prompt
-# (materialized when that key is edited). RULES_EXT is at most two bullets after
-# Writing Code **Rules:**.
 WRITING_CODE_KEY = "WRITING_CODE"
 FULL_PROMPT_KEY = "FULL_PROMPT"
 RULES_EXT_KEY = "RULES_EXT"
@@ -29,8 +26,7 @@ CORE_TOOLS_GROUP = "CORE_TOOLS"
 
 # --- Token budgets ---
 WRITING_CODE_TOKEN_BUDGET = 1024
-FULL_PROMPT_TOKEN_BUDGET = 8192
-RULES_EXT_TOKEN_BUDGET = 64
+RULES_EXT_TOKEN_BUDGET = 128
 CORE_TOOL_TOKEN_BUDGET = 2048
 
 # --- Eval wiring ---
@@ -323,10 +319,11 @@ PROMPT_MODULE_DEFAULTS = {
     RULES_EXT_KEY: DEFAULT_RULES_EXT,
     **CORE_TOOL_DESCRIPTIONS,
 }
+# Keys a seed file may override
 KNOWN_PROMPT_KEYS = frozenset(PROMPT_MODULE_DEFAULTS)
+EDITABLE_PROMPT_KEYS = KNOWN_PROMPT_KEYS - {FULL_PROMPT_KEY}
 MODULE_TOKEN_BUDGETS = {
     WRITING_CODE_KEY: WRITING_CODE_TOKEN_BUDGET,
-    FULL_PROMPT_KEY: FULL_PROMPT_TOKEN_BUDGET,
     RULES_EXT_KEY: RULES_EXT_TOKEN_BUDGET,
     **dict.fromkeys(CORE_TOOLS, CORE_TOOL_TOKEN_BUDGET),
 }

@@ -24,7 +24,9 @@ from glean_gepa.runner import (
     GLEAN_CHAT_EVAL_SET_NAME,
     MAX_EVAL_RUN_DEPLOYMENTS,
     SCIO_PROD_DEPLOYMENT_IDS,
+    TEACHER_STUDENT_DEPLOYMENT_IDS,
     _default_cache_file,
+    _format_run_config,
     _load_seed_candidate,
     _make_evalset,
     _parse_args,
@@ -39,6 +41,7 @@ from glean_gepa.runner import (
 )
 
 SEED_BOTH = {"WRITING_CODE": "patterns", "FULL_PROMPT": "PREFIX\n{WRITING_CODE}\nSUFFIX"}
+SEED_WITH_RULES_SLOT = {**SEED_BOTH, "WRITING_CODE": "patterns\n{RULES_EXT}"}
 
 
 def test_compile_and_materialize_splice_writing_code_when_present():
@@ -86,7 +89,17 @@ def test_compile_system_prompt_splices_rules_ext_after_rules():
     empty = compile_system_prompt(
         {WRITING_CODE_KEY: writing, FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX", RULES_EXT_KEY: ""}
     )
-    assert empty == "PREFIX\nintro\n**Rules:**\n- stock rule\n\n### Sandbox\n\nSUFFIX"
+    assert empty == "PREFIX\nintro\n**Rules:**\n- stock rule\n### Sandbox\n\nSUFFIX"
+
+    # A rewritten Writing Code may reflow the slot; the literal token must never ship.
+    reflowed = compile_system_prompt(
+        {
+            WRITING_CODE_KEY: "intro\n**Rules:**\n- stock rule\n{RULES_EXT}  \n### Sandbox\n",
+            FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX",
+            RULES_EXT_KEY: "",
+        }
+    )
+    assert reflowed == empty
 
 
 @pytest.mark.parametrize(
@@ -108,13 +121,9 @@ def test_load_seed_candidate_accepts_known_keys(tmp_path, raw):
 
 
 def test_seed_for_editable_modules():
-    assert _seed_for_editable_modules(SEED_BOTH, [FULL_PROMPT_KEY]) == {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
     assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: "patterns"}
 
     raw = {**SEED_BOTH, "glean_search": "Search less."}
-    seed = _seed_for_editable_modules(raw, [FULL_PROMPT_KEY])
-    assert seed == {FULL_PROMPT_KEY: "PREFIX\npatterns\nSUFFIX"}
-
     frozen = _seed_for_editable_modules(SEED_BOTH, [])
     assert frozen[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
     assert WRITING_CODE_KEY not in frozen
@@ -125,9 +134,9 @@ def test_seed_for_editable_modules():
     assert core_tool_seed["discover"] == PROMPT_MODULE_DEFAULTS["discover"]
     assert core_tool_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
 
-    rules_seed = _seed_for_editable_modules({**SEED_BOTH, RULES_EXT_KEY: ""}, [RULES_EXT_KEY])
+    rules_seed = _seed_for_editable_modules({**SEED_WITH_RULES_SLOT, RULES_EXT_KEY: ""}, [RULES_EXT_KEY])
     assert rules_seed[RULES_EXT_KEY] == ""
-    assert rules_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
+    assert rules_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\n{RULES_EXT}\nSUFFIX"
 
     defaulted = _seed_for_editable_modules({}, [WRITING_CODE_KEY, RULES_EXT_KEY])
     assert defaulted[WRITING_CODE_KEY] == DEFAULT_WRITING_CODE
@@ -147,16 +156,23 @@ def test_writing_code_only_does_not_expand_core_tools():
 
 
 def test_parse_editable_modules():
-    assert _parse_editable_modules("FULL_PROMPT") == [FULL_PROMPT_KEY]
-    assert _parse_editable_modules("WRITING_CODE,FULL_PROMPT") == [WRITING_CODE_KEY, FULL_PROMPT_KEY]
+    assert _parse_editable_modules(WRITING_CODE_KEY) == [WRITING_CODE_KEY]
+    assert _parse_editable_modules(f"{WRITING_CODE_KEY},{RULES_EXT_KEY}") == [WRITING_CODE_KEY, RULES_EXT_KEY]
     assert _parse_editable_modules("glean_search") == ["glean_search"]
     assert _parse_editable_modules(RULES_EXT_KEY) == [RULES_EXT_KEY]
     assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},{RULES_EXT_KEY}") == [*CORE_TOOLS, RULES_EXT_KEY]
     assert _parse_editable_modules(CORE_TOOLS_GROUP) == list(CORE_TOOLS)
-    assert _parse_editable_modules(f"FULL_PROMPT,{CORE_TOOLS_GROUP}") == [FULL_PROMPT_KEY, *CORE_TOOLS]
+    assert _parse_editable_modules(f"{WRITING_CODE_KEY},{CORE_TOOLS_GROUP}") == [WRITING_CODE_KEY, *CORE_TOOLS]
     assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},glean_search") == list(CORE_TOOLS)
     with pytest.raises(SystemExit, match="unknown editable_modules"):
         _parse_editable_modules("GLOBAL_ROLE")
+
+
+def test_parse_editable_modules_rejects_full_prompt():
+    """FULL_PROMPT is the render template and a seed override, not an evolvable module."""
+    for raw in (FULL_PROMPT_KEY, f"{WRITING_CODE_KEY},{FULL_PROMPT_KEY}"):
+        with pytest.raises(SystemExit, match=f"{FULL_PROMPT_KEY} is not editable"):
+            _parse_editable_modules(raw)
 
 
 @pytest.mark.parametrize(
@@ -183,6 +199,7 @@ def test_committed_seed_candidate_pins_only_writing_code():
     assert set(raw) == {WRITING_CODE_KEY}
     assert _seed_for_editable_modules(raw, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: raw[WRITING_CODE_KEY]}
     assert _seed_for_editable_modules(raw, [RULES_EXT_KEY])[RULES_EXT_KEY] == PROMPT_MODULE_DEFAULTS[RULES_EXT_KEY]
+    assert "{RULES_EXT}" in materialize_system_prompt(raw)
 
 
 def test_parse_args_defaults_editable_modules_to_writing_code():
@@ -305,6 +322,9 @@ def test_customer_deployments_sample_within_the_eval_run_limit(tmp_path):
     assert len(set(sampled)) == MAX_EVAL_RUN_DEPLOYMENTS
     assert set(sampled) <= set(CUSTOMER_EVAL_DEPLOYMENT_IDS)
 
+    ts = _resolve_customer_deployments(tmp_path / "ts.json", seed=7, pool=TEACHER_STUDENT_DEPLOYMENT_IDS)
+    assert set(ts) <= set(TEACHER_STUDENT_DEPLOYMENT_IDS)
+
 
 def test_customer_deployment_sample_is_reused_on_resume(tmp_path):
     """Re-sampling would change the valset identity and miss every cached eval run."""
@@ -329,6 +349,15 @@ def test_customer_deployment_state_file_rejects_invalid_content(tmp_path, saved)
 
     with pytest.raises(SystemExit, match="does not hold a list of customer deployments"):
         _resolve_customer_deployments(state_file)
+
+
+def test_resumed_sample_is_rejected_when_the_mode_no_longer_allows_it(tmp_path):
+    """A run resumed under teacher-student must not carry forward a Claude-gated deployment."""
+    state_file = tmp_path / CUSTOMER_DEPLOYMENTS_FILENAME
+    state_file.write_text(json.dumps(["happyreturns", "pricefx-prod", "thoughtworks"]))
+
+    with pytest.raises(SystemExit, match="does not hold a list of customer deployments"):
+        _resolve_customer_deployments(state_file, pool=TEACHER_STUDENT_DEPLOYMENT_IDS)
 
 
 def test_recent_train_versions_include_the_full_lookback_window():
@@ -375,7 +404,7 @@ def test_auto_val_versions_come_from_customer_deployments(frozen_today):
     )
 
 
-def test_val_version_selection_never_lists_pii_gated_entries():
+def test_val_version_selection_never_lists_pii_gated_entries(frozen_today):
     """`evalsets versions` already reports per-deployment coverage, so selection
     never touches the entries endpoint, which rejects customer deployments."""
     evalcli = MagicMock()

@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any
+from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTrajectory
 from glean_gepa.al_adapter import (
@@ -28,8 +28,15 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
     parse_shell_tool_error_entry_metrics,
     parse_shell_tool_error_metrics,
 )
-from glean_gepa.reflection_prompts import single_model_reflection_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import CONDITIONAL_PRESERVE_RULE
 from glean_gepa.reflection_sampling import strip_stdout_sections
+
+WRITING_CODE_RESPONSIBILITY = (
+    "Focus ONLY on coding instructions that affect shell tool reliability: SDK call patterns, "
+    "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
+    f"Use shell error examples as evidence. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
+)
 
 EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
 
@@ -203,6 +210,8 @@ class ShellSuccessObjective(SingleModelObjective):
     failure_label = "HIGH-SIGNAL FAILURES"
     pending_error_type = ShellToolTelemetryPendingError
     pending_telemetry_label = "shell"
+    module_responsibilities: ClassVar[Mapping[str, str]] = {WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY}
+    reflects_core_tools = True
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         if bigquery_client is None:
@@ -400,9 +409,6 @@ class ShellSuccessObjective(SingleModelObjective):
             entry_ids=list(entry_ids),
             deployment_ids=list(deployment_ids),
         )
-
-    def reflection_prompt(self, module_name: str) -> str:
-        return single_model_reflection_prompt(module_name)
 
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import date
-from typing import Any
+from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTrajectory
 from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
@@ -20,7 +20,15 @@ from glean_gepa.objectives.utils.loop_count_util import (
     fetch_eval_run_loop_count_analysis,
     log_loop_count_analysis,
 )
-from glean_gepa.reflection_prompts import single_model_loop_reflection_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.reflection_prompts import CONDITIONAL_PRESERVE_RULE
+
+WRITING_CODE_RESPONSIBILITY = (
+    "Focus ONLY on coding and execution-discipline instructions that reduce extra agent loops "
+    "without lowering correctness. Batch independent SDK calls, stop once the answer is grounded, "
+    "and never skip the search or citation work the question requires. "
+    f"{CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
+)
 
 EVAL_LOOP_CACHE_SCHEMA_VERSION = 2
 CORRECTNESS_PASS_FOR_FEEDBACK = 0.5
@@ -117,6 +125,9 @@ class LoopEfficiencyObjective(SingleModelObjective):
     failure_label = "HIGH-SIGNAL FAILURES (extra loops or incorrect)"
     pending_error_type = LoopTelemetryPendingError
     pending_telemetry_label = "loop_efficiency"
+    module_responsibilities: ClassVar[Mapping[str, str]] = {
+        WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY,
+    }
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         if bigquery_client is None:
@@ -269,9 +280,6 @@ class LoopEfficiencyObjective(SingleModelObjective):
     ) -> list[dict[str, Any]] | None:
         del eval_set_name, eval_set_version, eval_run_id, entry_ids, deployment_ids
         return None
-
-    def reflection_prompt(self, module_name: str) -> str:
-        return single_model_loop_reflection_prompt(module_name)
 
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name
