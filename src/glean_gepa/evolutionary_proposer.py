@@ -174,6 +174,8 @@ def make_children_for_generation(
 
         # Ask the reflection model for one to three small rewrite variants.
         for module in modules_to_edit:
+            if len(children) >= offspring_count:
+                break
             proposed = adapter.propose_new_texts(
                 reflection_llm=reflection_llm,
                 candidate=parent,
@@ -186,24 +188,27 @@ def make_children_for_generation(
                 print(f"Reflection produced no variants for module {module}")
                 continue
 
-            for variant in variants[: max(1, offspring_count - len(children))]:
+            for variant in variants[: offspring_count - len(children)]:
                 child = apply_single_module_edit(parent, module, variant)
-                if cached_children is not None:
-                    if all(existing.prompt_modules != child.prompt_modules for existing in cached_children):
-                        cached_children.append(child)
-                if append_child(child):
-                    log_section(
-                        f"CHILD PROPOSAL {child.candidate_id}",
-                        format_child_proposal_report(
-                            parent_id=parent.candidate_id,
-                            child_id=child.candidate_id,
-                            module=module,
-                            delta=_format_child_delta(parent, child, module),
-                            justification=diagnosis,
-                        ),
-                    )
-                if len(children) >= offspring_count:
-                    break
+                # Cache only accepted children. A child the generation refused is
+                # unreachable on replay, and its null screening score would read as
+                # unfinished work and pin the training slice forever.
+                if not append_child(child):
+                    continue
+                if cached_children is not None and all(
+                    existing.prompt_modules != child.prompt_modules for existing in cached_children
+                ):
+                    cached_children.append(child)
+                log_section(
+                    f"CHILD PROPOSAL {child.candidate_id}",
+                    format_child_proposal_report(
+                        parent_id=parent.candidate_id,
+                        child_id=child.candidate_id,
+                        module=module,
+                        delta=_format_child_delta(parent, child, module),
+                        justification=diagnosis,
+                    ),
+                )
 
     return children
 
