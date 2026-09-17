@@ -54,9 +54,6 @@ def compile_system_prompt(candidate: dict[str, str]) -> str:
         template = template.replace("{WRITING_CODE}", candidate[WRITING_CODE_KEY])
     if "{RULES_EXT}" in template:
         rules_ext = candidate.get(RULES_EXT_KEY, DEFAULT_RULES_EXT).strip()
-        # An empty module takes its own line with it. Match trailing whitespace too: a
-        # rewritten Writing Code may reflow the slot, and a missed match ships the
-        # literal "{RULES_EXT}" to the student.
         template = template.replace("{RULES_EXT}", rules_ext) if rules_ext else _RULES_EXT_SLOT.sub("", template)
     return template
 

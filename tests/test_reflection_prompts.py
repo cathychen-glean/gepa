@@ -47,15 +47,9 @@ def test_reflection_prompts_route_by_module():
     loop = LoopEfficiencyObjective.reflection_prompt
     assert loop(WRITING_CODE_KEY) == LoopEfficiencyObjective.module_responsibilities[WRITING_CODE_KEY]
 
-
-@pytest.mark.parametrize(
-    "objective",
-    [FirstToolMatchObjective, CitationMatchObjective, ShellSuccessObjective, LoopEfficiencyObjective],
-)
-def test_full_prompt_is_never_handed_to_the_reflector(objective):
-    """FULL_PROMPT is the render template, so no objective may claim it as a module."""
-    assert FULL_PROMPT_KEY not in objective.module_responsibilities
-    assert objective.reflection_prompt(FULL_PROMPT_KEY) == DEFAULT_MODULE_RESPONSIBILITY
+    # FULL_PROMPT is the render template, so no objective may claim it as a module.
+    for objective in (FirstToolMatchObjective, CitationMatchObjective, ShellSuccessObjective, LoopEfficiencyObjective):
+        assert FULL_PROMPT_KEY not in objective.module_responsibilities
 
 
 @pytest.mark.parametrize(

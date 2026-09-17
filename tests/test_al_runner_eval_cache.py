@@ -213,31 +213,27 @@ def test_cache_entry_without_deployments_is_not_reused(tmp_path):
     client.create_eval_run.assert_called_once()
 
 
-def test_same_prompt_on_different_deployments_is_a_separate_eval(tmp_path):
-    """Deployments decide which entries run, so they must not share a cache entry."""
-    cache_file = tmp_path / "eval-runs.json"
-    first = ALRunner(evalcli=MagicMock(create_eval_run=MagicMock(return_value="run_a")), cache_file=str(cache_file))
-    first.start("fast", "prompt", "set", "v1", ["prod"])
+def test_the_deployment_set_decides_the_cache_key(tmp_path):
+    """Deployments decide which entries run, so a different subset is a different eval.
 
-    second_client = MagicMock(create_eval_run=MagicMock(return_value="run_b"))
-    second = ALRunner(evalcli=second_client, cache_file=str(cache_file))
-    eval_id, _ = second.start("fast", "prompt", "set", "v1", ["other-deployment"])
-
-    assert eval_id == "run_b"
-    second_client.create_eval_run.assert_called_once()
-
-
-def test_deployment_order_does_not_change_the_cache_key(tmp_path):
-    """The same deployment set listed in a different order is the same eval."""
+    The same subset in a different order is not: the signature sorts before joining.
+    """
     cache_file = tmp_path / "eval-runs.json"
     first = ALRunner(evalcli=MagicMock(create_eval_run=MagicMock(return_value="run_a")), cache_file=str(cache_file))
     first.start("fast", "prompt", "set", "v1", ["beta", "alpha"])
 
-    second_client = MagicMock()
-    second_client.get_eval_run_status.return_value = [{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 3}]}]
-    second = ALRunner(evalcli=second_client, cache_file=str(cache_file))
-    eval_id, wait_required = second.start("fast", "prompt", "set", "v1", ["alpha", "beta"])
+    other_client = MagicMock(create_eval_run=MagicMock(return_value="run_b"))
+    other = ALRunner(evalcli=other_client, cache_file=str(cache_file))
+    assert other.start("fast", "prompt", "set", "v1", ["other-deployment"])[0] == "run_b"
+    other_client.create_eval_run.assert_called_once()
+
+    reordered_client = MagicMock()
+    reordered_client.get_eval_run_status.return_value = [
+        {"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 3}]}
+    ]
+    reordered = ALRunner(evalcli=reordered_client, cache_file=str(cache_file))
+    eval_id, wait_required = reordered.start("fast", "prompt", "set", "v1", ["alpha", "beta"])
 
     assert eval_id == "run_a"
     assert wait_required is False
-    second_client.create_eval_run.assert_not_called()
+    reordered_client.create_eval_run.assert_not_called()

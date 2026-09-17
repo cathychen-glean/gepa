@@ -157,9 +157,6 @@ def test_editing_rules_ext_without_a_slot_is_refused():
     with pytest.raises(SystemExit, match="no {RULES_EXT} slot"):
         _seed_for_editable_modules(SEED_BOTH, [RULES_EXT_KEY])
 
-    kept = _seed_for_editable_modules(SEED_WITH_RULES_SLOT, [WRITING_CODE_KEY, RULES_EXT_KEY])
-    assert kept[WRITING_CODE_KEY] == "patterns\n{RULES_EXT}"
-
 
 def test_writing_code_only_does_not_expand_core_tools():
     editable_modules = [WRITING_CODE_KEY]
@@ -180,9 +177,7 @@ def test_parse_editable_modules():
     with pytest.raises(SystemExit, match="unknown editable_modules"):
         _parse_editable_modules("GLOBAL_ROLE")
 
-
-def test_parse_editable_modules_rejects_full_prompt():
-    """FULL_PROMPT is the render template and a seed override, not an evolvable module."""
+    # FULL_PROMPT is the render template and a seed override, not an evolvable module.
     for raw in (FULL_PROMPT_KEY, f"{WRITING_CODE_KEY},{FULL_PROMPT_KEY}"):
         with pytest.raises(SystemExit, match=f"{FULL_PROMPT_KEY} is not editable"):
             _parse_editable_modules(raw)

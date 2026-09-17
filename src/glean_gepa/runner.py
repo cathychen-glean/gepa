@@ -170,24 +170,13 @@ def _parse_editable_modules(raw: str) -> list[str]:
 
 
 def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str]) -> dict[str, str]:
-    """Build the GEPA candidate dict for the requested editable modules.
-
-    When ``WRITING_CODE`` is not editable, the materialized seed prompt is attached
-    under ``FULL_PROMPT`` so evals keep a frozen system prompt. Core-tool
-    descriptions are attached only when they are editable, so a ``WRITING_CODE``-only
-    run keeps the legacy candidate and compiled-prompt hashes.
-    ``RULES_EXT`` is copied from the seed when listed; compile time splices it into
-    the ``{RULES_EXT}`` slot after Writing Code **Rules:**. Keys omitted from
-    ``raw`` use ``PROMPT_MODULE_DEFAULTS``.
-    """
+    """Build the GEPA candidate dict for the requested editable modules."""
     seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
     if WRITING_CODE_KEY not in editable_modules:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
     if RULES_EXT_KEY in editable_modules and "{RULES_EXT}" not in seed.get(
         WRITING_CODE_KEY, seed.get(FULL_PROMPT_KEY, "")
     ):
-        # Without the slot the module compiles away silently, so the run would spend
-        # its whole budget evolving text the student never sees.
         raise SystemExit(
             f"{RULES_EXT_KEY} is editable but the seed prompt has no {{RULES_EXT}} slot. "
             f"Add {{RULES_EXT}} to {WRITING_CODE_KEY} in the seed file, or drop {RULES_EXT_KEY} "
