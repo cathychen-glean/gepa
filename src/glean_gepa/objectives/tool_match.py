@@ -14,6 +14,7 @@ from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
+    SKIPPED_TOOL_NAMES,
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
     empty_tool_match_analysis,
@@ -23,8 +24,19 @@ from glean_gepa.objectives.utils.tool_match_util import (
     require_compared_eval_entries,
 )
 from glean_gepa.prompt import high_signal_core_tool_keys, is_core_tool_span, tool_description_override_key
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS, RULES_EXT_KEY
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS, EXECUTION_DISCIPLINE_KEY, RULES_EXT_KEY
 from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+
+EXECUTION_DISCIPLINE_RESPONSIBILITY = (
+    "You are rewriting the bullets under '### Execution Discipline', which set how much effort "
+    "the assistant spends before answering: how many tool loops to use, how many queries to "
+    "issue, whether to retry after an empty result, and when to stop searching and respond. "
+    "Each line must start with '- '. Do not add a heading. This module governs effort and "
+    "stopping conditions only: leave response formatting, citation mechanics, and shell or SDK "
+    "syntax to other modules. Prefer stating the condition under which more work is warranted "
+    "over raising a numeric cap, so the rule generalizes to requests of different sizes. "
+    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+)
 
 RULES_EXT_RESPONSIBILITY = (
     "You are writing at most two markdown bullets that will be appended after the existing "
@@ -87,20 +99,39 @@ class FirstToolMatchObjective(TeacherStudentObjective):
     mismatch_pair = first_tool_mismatch_pair
     module_responsibilities: ClassVar[Mapping[str, str]] = {
         RULES_EXT_KEY: RULES_EXT_RESPONSIBILITY,
+        EXECUTION_DISCIPLINE_KEY: EXECUTION_DISCIPLINE_RESPONSIBILITY,
     }
-    reflects_core_tools = True
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         self.bigquery_client = bigquery_client
         self.lookback_days = lookback_days
+        self.params: dict[str, Any] = {}
         self._paired_analysis_cache: dict[tuple[str, str], EvalRunToolMatchAnalysis] = {}
 
+    def _skipped_tools(self) -> frozenset[str]:
+        raw = self.pack_param("skipped_tools", None)
+        if raw is None:
+            return SKIPPED_TOOL_NAMES
+        return frozenset(str(name) for name in raw)
+
+    def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
+        return first_tool_mismatch_pair(
+            output.get(self.teacher_compared_key),
+            output.get(self.student_compared_key),
+            skip_tools=self._skipped_tools(),
+        )
+
     def analyze(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunToolMatchAnalysis:
+        skipped = self._skipped_tools()
+
+        def fetch(client: Any, **kwargs: Any) -> EvalRunToolMatchAnalysis:
+            return fetch_eval_run_tool_match_analysis(client, skip_tools=skipped, **kwargs)
+
         return self.cached_paired_analysis(
             teacher_eval_id,
             student_eval_id,
             cache=self._paired_analysis_cache,
-            fetch=fetch_eval_run_tool_match_analysis,
+            fetch=fetch,
             empty=empty_tool_match_analysis,
             label="tool match analysis",
         )
@@ -189,7 +220,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         tool_alignment = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(tool_alignment < 0.7),
+            int(tool_alignment < float(self.pack_param("failure_score_below", 0.7))),
             int(self._mismatch_key(output) is not None),
             int(output.get("student_tool_errors", 0) > 0),
         )

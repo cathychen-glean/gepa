@@ -12,11 +12,12 @@ from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, Re
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives.base import ScoredRow, SingleModelObjective, register_telemetry_source
 from glean_gepa.objectives.utils.loop_count_util import (
+    CORRECTNESS_PASS,
     LOOP_EFFICIENCY_OBJECTIVE,
     TARGET_LOOP_COUNT,
     EvalRunLoopCountAnalysis,
     LoopCountEntryMetrics,
-    LoopCountMetrics,
+    aggregate_loop_count_metrics,
     fetch_eval_run_loop_count_analysis,
     log_loop_count_analysis,
 )
@@ -31,11 +32,6 @@ WRITING_CODE_RESPONSIBILITY = (
 )
 
 EVAL_LOOP_CACHE_SCHEMA_VERSION = 2
-CORRECTNESS_PASS_FOR_FEEDBACK = 0.5
-
-
-class LoopTelemetryPendingError(RuntimeError):
-    """Raised when an eval has not yet emitted loop-count telemetry."""
 
 
 def _serialize_eval_analysis(analysis: EvalRunLoopCountAnalysis) -> dict[str, Any]:
@@ -50,7 +46,12 @@ def _serialize_eval_analysis(analysis: EvalRunLoopCountAnalysis) -> dict[str, An
     }
 
 
-def _parse_eval_analysis_cache(raw_cache: Any) -> dict[str, EvalRunLoopCountAnalysis]:
+def _parse_eval_analysis_cache(
+    raw_cache: Any,
+    *,
+    target_loops: int = TARGET_LOOP_COUNT,
+    correctness_pass: float = CORRECTNESS_PASS,
+) -> dict[str, EvalRunLoopCountAnalysis]:
     parsed: dict[str, EvalRunLoopCountAnalysis] = {}
     if not isinstance(raw_cache, dict):
         return parsed
@@ -65,25 +66,21 @@ def _parse_eval_analysis_cache(raw_cache: Any) -> dict[str, EvalRunLoopCountAnal
                     correctness=float(metrics.get("correctness") or 0.0),
                     has_error=bool(metrics.get("has_error")),
                     action_inputs=tuple(metrics.get("action_inputs") or ()),
+                    target_loops=target_loops,
+                    correctness_pass=correctness_pass,
                 )
                 for entry_id, metrics in (raw.get("per_entry") or {}).items()
                 if isinstance(metrics, dict)
             }
-            aggregate_raw = raw.get("aggregate") or {}
             parsed[str(eval_id)] = EvalRunLoopCountAnalysis(
                 eval_id=str(raw.get("eval_id") or eval_id),
                 start_date=date.fromisoformat(raw["start_date"]),
                 end_date=date.fromisoformat(raw["end_date"]),
-                aggregate=LoopCountMetrics(
-                    eval_id=str(aggregate_raw.get("eval_id") or eval_id),
-                    compared_entries=int(aggregate_raw.get("compared_entries") or 0),
-                    matching_entries=int(aggregate_raw.get("matching_entries") or 0),
-                    mean_loop_count=float(aggregate_raw.get("mean_loop_count") or 0.0),
-                    loop_efficiency=float(aggregate_raw.get("loop_efficiency") or 0.0),
-                    mean_correctness=float(aggregate_raw.get("mean_correctness") or 0.0),
-                ),
+                aggregate=aggregate_loop_count_metrics(str(raw.get("eval_id") or eval_id), per_entry),
                 per_entry=per_entry,
-                high_signal_entry_ids=tuple(raw.get("high_signal_entry_ids") or ()),
+                high_signal_entry_ids=tuple(
+                    sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
+                ),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -99,12 +96,13 @@ def _rollout_output(
     loop_count: int,
     correctness: float,
     action_inputs: list[str] | None = None,
+    correctness_pass: float = CORRECTNESS_PASS,
 ) -> SingleModelALRolloutOutput:
     output: SingleModelALRolloutOutput = {
         "deployment_id": deployment_id,
         "query": query,
         "student_tool_calls": loop_count,
-        "student_tool_errors": int(correctness < 0.5),
+        "student_tool_errors": int(correctness < correctness_pass),
         "entry_id": entry_id,
         "shell_error_messages": [],
         "student_eval_run_id": student_eval_id,
@@ -123,7 +121,6 @@ class LoopEfficiencyObjective(SingleModelObjective):
     telemetry_dimensions = (LOOP_EFFICIENCY_OBJECTIVE,)
     focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
     failure_label = "HIGH-SIGNAL FAILURES (extra loops or incorrect)"
-    pending_error_type = LoopTelemetryPendingError
     pending_telemetry_label = "loop_efficiency"
     module_responsibilities: ClassVar[Mapping[str, str]] = {
         WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY,
@@ -134,7 +131,14 @@ class LoopEfficiencyObjective(SingleModelObjective):
             raise ValueError("bigquery_client is required")
         self.bigquery_client = bigquery_client
         self.lookback_days = lookback_days
+        self.params: dict[str, Any] = {}
         self._eval_analysis_cache: dict[str, EvalRunLoopCountAnalysis] = {}
+
+    def _target_loop_count(self) -> int:
+        return int(self.pack_param("target_loop_count", TARGET_LOOP_COUNT))
+
+    def _correctness_pass(self) -> float:
+        return float(self.pack_param("correctness_pass", CORRECTNESS_PASS))
 
     def analyze(
         self,
@@ -161,6 +165,8 @@ class LoopEfficiencyObjective(SingleModelObjective):
             lookback_days=self.lookback_days,
             evalcli=evalcli,
             include_action_inputs=include_action_inputs,
+            target_loops=self._target_loop_count(),
+            correctness_pass=self._correctness_pass(),
         )
         if analysis.aggregate.compared_entries == 0:
             print(f"[Cache] Not caching provisional empty loop analysis for eval_id: {eval_id}")
@@ -208,6 +214,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
         del al_data_inst
         query = f"{eval_set_name}:{eval_set_version}"
         deployment_id = deployment_ids[0] if deployment_ids else ""
+        correctness_pass = self._correctness_pass()
         if not is_focused_eval and not capture_traces:
             return [
                 ScoredRow(
@@ -220,6 +227,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
                         student_eval_id=student_eval_id,
                         loop_count=round(analysis.aggregate.mean_loop_count),
                         correctness=analysis.aggregate.mean_correctness,
+                        correctness_pass=correctness_pass,
                     ),
                 )
             ]
@@ -237,6 +245,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
                         student_eval_id=student_eval_id,
                         loop_count=round(analysis.aggregate.mean_loop_count),
                         correctness=analysis.aggregate.mean_correctness,
+                        correctness_pass=correctness_pass,
                     ),
                 )
             ]
@@ -263,6 +272,7 @@ class LoopEfficiencyObjective(SingleModelObjective):
                         loop_count=loop_count,
                         correctness=correctness,
                         action_inputs=list(metrics.action_inputs) if metrics else None,
+                        correctness_pass=correctness_pass,
                     ),
                     data_overrides={"eval_entry_id": entry_id, "eval_run_id": student_eval_id},
                 )
@@ -285,10 +295,11 @@ class LoopEfficiencyObjective(SingleModelObjective):
         del component_name
         output = trajectory["output"]
         efficiency = trajectory.get("objective_scores", {}).get(self.name, 1.0)
+        target_loops = self._target_loop_count()
         return (
-            int(efficiency < 1.0),
-            int((output.get("correctness") or 1.0) < 0.5),
-            int((output.get("student_loops") or 0) > TARGET_LOOP_COUNT),
+            int(efficiency < float(self.pack_param("failure_score_below", 1.0))),
+            int((output.get("correctness") or 1.0) < self._correctness_pass()),
+            int((output.get("student_loops") or 0) > target_loops),
         )
 
     def build_reflective_example(
@@ -302,14 +313,15 @@ class LoopEfficiencyObjective(SingleModelObjective):
         efficiency = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         loops = int(output.get("student_loops") or 0)
         correctness = float(output.get("correctness") or 0.0)
+        target_loops = self._target_loop_count()
         feedback_parts = []
-        if correctness < CORRECTNESS_PASS_FOR_FEEDBACK:
+        if correctness < self._correctness_pass():
             feedback_parts.append(
                 f"Incorrect answer (correctness={correctness:.2f}); do not reduce loops by skipping work."
             )
-        if loops > TARGET_LOOP_COUNT:
+        if loops > target_loops:
             feedback_parts.append(
-                f"Used {loops} loops; stay at or below {TARGET_LOOP_COUNT} by batching independent calls "
+                f"Used {loops} loops; stay at or below {target_loops} by batching independent calls "
                 "and stopping once the answer is grounded."
             )
         if not feedback_parts:
@@ -355,7 +367,11 @@ class LoopEfficiencyObjective(SingleModelObjective):
         return {eval_id: _serialize_eval_analysis(analysis) for eval_id, analysis in self._eval_analysis_cache.items()}
 
     def load_cache(self, raw_cache: Any) -> None:
-        self._eval_analysis_cache = _parse_eval_analysis_cache(raw_cache)
+        self._eval_analysis_cache = _parse_eval_analysis_cache(
+            raw_cache,
+            target_loops=self._target_loop_count(),
+            correctness_pass=self._correctness_pass(),
+        )
 
 
 register_telemetry_source("single_model", "loop_telemetry", LoopEfficiencyObjective)
@@ -363,5 +379,4 @@ register_telemetry_source("single_model", "loop_telemetry", LoopEfficiencyObject
 __all__ = [
     "EVAL_LOOP_CACHE_SCHEMA_VERSION",
     "LoopEfficiencyObjective",
-    "LoopTelemetryPendingError",
 ]

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.experiment_config import load_experiment_config
+from glean_gepa.experiment_config import experiment_objective_pack, load_experiment_config
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.citation_match_util import (
@@ -22,7 +22,6 @@ from glean_gepa.objectives.utils.citation_match_util import (
     require_compared_citation_entries,
     scored_citation_ids,
 )
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 
 
 def test_citation_set_scoring_dedupes_and_ignores_order():
@@ -153,20 +152,17 @@ def test_aggregate_and_empty_analysis():
         require_compared_citation_entries(empty)
 
 
-def test_select_citation_mismatch_groups():
-    keys = [("missing:a", "extra:(none)")] * 3 + [("missing:(none)", "extra:b")] * 2 + [None]
-    selected, groups = select_mismatch_groups(keys)
-    assert selected == [0, 1, 2, 3, 4]
-    assert groups[0] == ("missing:a", "extra:(none)", 3)
-
-
 def test_citations_pack_constructs_the_citation_match_objective(tmp_path):
     mode = tmp_path / "mode.yaml"
     mode.write_text("schema_version: 1\nmode: teacher_student\npacks: [citations]\n")
     config = load_experiment_config(mode)
-    objective = build_objective("teacher_student", config.signals, bigquery_client=MagicMock())
+    objective = build_objective(
+        "teacher_student", config.signals, bigquery_client=MagicMock(), pack=experiment_objective_pack(config)
+    )
     assert config.primary_objective == "citation_match"
     assert isinstance(objective, CitationMatchObjective)
+    assert objective.focused_bucket_type == "QUERY_CANONICAL"
+    assert "citationId" in objective.reflection_prompt("WRITING_CODE")
 
 
 def test_citation_match_objective_scores_and_flags_mismatches():

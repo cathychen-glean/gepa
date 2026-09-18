@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from glean_gepa.adapter_types import JudgingMode, PointwiseJudge
+from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
+from glean_gepa.judge_metrics_util import CUSTOMER_JUDGE_GATES
 from glean_gepa.objectives import (
     MODE_DEFAULT_PACK,
     is_registered_telemetry_source,
@@ -53,6 +56,7 @@ class ExperimentConfig:
     signals: tuple[dict[str, Any], ...]
     objective: dict[str, Any]
     screening: dict[str, Any]
+    reflection: dict[str, Any]
     search: dict[str, Any]
 
     @property
@@ -94,12 +98,15 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         raise ExperimentConfigError(f"mode must be one of {', '.join(sorted(SUPPORTED_MODES))}, got {mode!r}")
     pack_names, pack = _load_mode_packs(raw.get("packs"), mode=mode, mode_path=source_path)
     merged_signals = _merge_signals(pack.get("signals") or [], raw.get("signals") or [])
-    merged_objective = _overlay(pack.get("objective") or {}, raw.get("objective") or {})
+    merged_objective = _overlay_keeping(pack.get("objective") or {}, raw.get("objective") or {}, ("params",))
     merged_screening = _overlay(pack.get("screening") or {}, raw.get("screening") or {})
+    merged_reflection = _overlay_keeping(pack.get("reflection") or {}, raw.get("reflection") or {}, ("modules",))
     _require_mode_primary_objective(merged_objective.get("primary"), merged_signals, mode=mode)
     _require_scorable_composite_signals(merged_objective, merged_signals, mode=mode)
     _require_normalized_composite_weights(merged_objective.get("composite"))
     _require_unit_valued_weighted_constants(merged_objective, merged_signals)
+    _require_focused_bucket_type(merged_objective.get("focused_bucket_type"))
+    _parse_customer_validation(merged_objective.get("validation"))
     return ExperimentConfig(
         schema_version=schema_version,
         mode=mode,
@@ -111,6 +118,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         signals=tuple(merged_signals),
         objective=merged_objective,
         screening=merged_screening,
+        reflection=merged_reflection,
         search=dict(raw.get("search") or {}),
     )
 
@@ -127,8 +135,10 @@ def runner_arg_defaults(config: ExperimentConfig) -> dict[str, Any]:
         defaults["eval_run_timeout_sec"] = int(run["eval_run_timeout_sec"])
     if run.get("seed_candidate"):
         defaults["seed_candidate"] = Path(str(run["seed_candidate"]))
-    if run.get("editable_modules") is not None:
-        modules = run["editable_modules"]
+    modules = run.get("editable_modules")
+    if modules is None:
+        modules = config.reflection.get("editable_modules")
+    if modules is not None:
         defaults["editable_modules"] = (
             ",".join(str(module) for module in modules) if isinstance(modules, list) else str(modules)
         )
@@ -196,6 +206,48 @@ def screening_threshold(config: ExperimentConfig) -> float | None:
     return float(config.screening["threshold"])
 
 
+def experiment_objective_pack(config: ExperimentConfig) -> dict[str, Any]:
+    """Slice of the merged experiment that ``build_objective`` applies to the metric."""
+    return {"objective": config.objective, "reflection": config.reflection}
+
+
+def customer_validation_gates(config: ExperimentConfig | None) -> dict[str, float]:
+    """Judge floors the post-search customer eval enforces.
+
+    Omitted ``objective.validation`` (or no ``--config``) starts no judge
+    gates. List a metric to opt in; omit ``min`` to use that metric's default
+    floor. Unknown metrics and unreadable mins fail the load.
+    """
+    if config is None:
+        return {}
+    return _parse_customer_validation(config.objective.get("validation"))
+
+
+def _parse_customer_validation(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, list):
+        return {}
+    gates: dict[str, float] = {}
+    for entry in raw:
+        if not isinstance(entry, Mapping) or "metric" not in entry:
+            raise ExperimentConfigError("objective.validation entries must be mappings with a metric")
+        metric = str(entry["metric"])
+        gate = CUSTOMER_JUDGE_GATES.get(metric)
+        if gate is None:
+            allowed = ", ".join(sorted(CUSTOMER_JUDGE_GATES))
+            raise ExperimentConfigError(f"objective.validation metric must be one of {allowed}, got {metric!r}")
+        if "min" not in entry:
+            gates[gate.name] = gate.default_min
+            continue
+        raw_min = entry["min"]
+        if isinstance(raw_min, bool) or not isinstance(raw_min, int | float):
+            raise ExperimentConfigError(f"objective.validation min for {metric} must be a number, got {raw_min!r}")
+        floor = float(raw_min)
+        if not 0.0 <= floor <= 1.0:
+            raise ExperimentConfigError(f"objective.validation min for {metric} must be between 0 and 1, got {floor}")
+        gates[gate.name] = floor
+    return gates
+
+
 def agentspan_lookback_days(config: ExperimentConfig) -> int | None:
     lookbacks = [
         int(signal["lookback_days"])
@@ -242,6 +294,7 @@ def _load_mode_packs(raw_packs: Any, *, mode: JudgingMode, mode_path: Path) -> t
     merged_signals: list[Any] = []
     merged_objective: dict[str, Any] = {}
     merged_screening: dict[str, Any] = {}
+    merged_reflection: dict[str, Any] = {}
     for name in names:
         pack = _load_pack(name, mode_path=mode_path)
         for signal in pack.get("signals") or []:
@@ -255,14 +308,19 @@ def _load_mode_packs(raw_packs: Any, *, mode: JudgingMode, mode_path: Path) -> t
                     f"mode {mode} cannot score pack {name!r} (source {source!r} is not registered for this mode)"
                 )
         merged_signals.extend(pack.get("signals") or [])
-        merged_objective = _overlay(merged_objective, pack.get("objective") or {})
+        merged_objective = _overlay_keeping(merged_objective, pack.get("objective") or {}, ("params",))
         merged_screening = _overlay(merged_screening, pack.get("screening") or {})
-    return names, {"signals": merged_signals, "objective": merged_objective, "screening": merged_screening}
+        merged_reflection = _overlay_keeping(merged_reflection, pack.get("reflection") or {}, ("modules",))
+    return names, {
+        "signals": merged_signals,
+        "objective": merged_objective,
+        "screening": merged_screening,
+        "reflection": merged_reflection,
+    }
 
 
 def _pointwise_judges(signals: list[dict[str, Any]]) -> list[PointwiseJudge]:
-    """Pairwise signals are skipped: nothing scores them per entry. Same for
-    ``objective.validation``, which is carried on the config but never read."""
+    """Pairwise signals are skipped: nothing scores them per entry."""
     judges: list[PointwiseJudge] = []
     for signal in signals:
         if signal.get("source") != "cortex_judge" or signal.get("kind") != "pointwise":
@@ -445,3 +503,26 @@ def _overlay(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]
     weights sum past 1 without anyone noticing.
     """
     return {**base, **overlay}
+
+
+def _overlay_keeping(base: dict[str, Any], overlay: Mapping[str, Any], merged_keys: Sequence[str]) -> dict[str, Any]:
+    """Like ``_overlay``, but field-merge the named nested maps instead of replacing them.
+
+    ``objective.params`` and ``reflection.modules`` are knobs a mode YAML should be
+    able to retune one-at-a-time without restating the rest of the pack.
+    """
+    merged = _overlay(base, overlay)
+    for key in merged_keys:
+        left = base.get(key)
+        right = overlay.get(key)
+        if isinstance(left, Mapping) or isinstance(right, Mapping):
+            merged[key] = {**(left or {}), **(right or {})}
+    return merged
+
+
+def _require_focused_bucket_type(bucket: Any) -> None:
+    if bucket is None:
+        return
+    if str(bucket) not in FOCUSED_BUCKET_TYPES:
+        allowed = ", ".join(sorted(FOCUSED_BUCKET_TYPES))
+        raise ExperimentConfigError(f"objective.focused_bucket_type must be one of {allowed}, got {bucket!r}")

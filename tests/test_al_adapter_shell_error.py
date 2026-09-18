@@ -19,7 +19,7 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
     ShellToolErrorExample,
     ShellToolErrorMetrics,
 )
-from glean_gepa.single_model_adapter import ShellToolTelemetryPendingError, SingleModelAdapter
+from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPendingError
 
 
 def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[str]):
@@ -783,7 +783,7 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="run_pending_telemetry"),
         patch.object(adapter, "_get_or_fetch_analysis", return_value=provisional),
-        pytest.raises(ShellToolTelemetryPendingError, match="refusing to score 0/0"),
+        pytest.raises(TelemetryPendingError, match="refusing to score 0/0"),
     ):
         adapter.evaluate(batch, {"WRITING_CODE": "prompt"})
 

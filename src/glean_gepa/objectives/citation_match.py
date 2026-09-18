@@ -104,6 +104,7 @@ class CitationMatchObjective(TeacherStudentObjective):
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         self.bigquery_client = bigquery_client
         self.lookback_days = lookback_days
+        self.params: dict[str, Any] = {}
         self._paired_analysis_cache: dict[tuple[str, str], EvalRunCitationMatchAnalysis] = {}
 
     def analyze(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunCitationMatchAnalysis:
@@ -171,7 +172,7 @@ class CitationMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         citation_match = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(citation_match < 1.0),
+            int(citation_match < float(self.pack_param("failure_score_below", 1.0))),
             int(self._mismatch_key(output) is not None),
         )
 

@@ -10,8 +10,17 @@ objective:
   primary: shell_success_rate
   composite:
     shell_success_rate: 1.0
+  focused_bucket_type: SESSION
+  params:
+    failure_score_below: 0.9
 
 screening:
   kind: high_signal_fix_rate
   threshold: 0.5
   high_signal: shell_error_entries
+
+reflection:
+  editable_modules: [WRITING_CODE, CORE_TOOLS]
+  failure_label: HIGH-SIGNAL FAILURES
+  # Override module reflection prompts with modules.<KEY>.
+

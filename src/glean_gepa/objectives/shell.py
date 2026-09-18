@@ -41,10 +41,6 @@ WRITING_CODE_RESPONSIBILITY = (
 EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
 
 
-class ShellToolTelemetryPendingError(RuntimeError):
-    """Raised when an eval has not yet emitted shell telemetry."""
-
-
 def log_shell_tool_error_analysis(analysis: EvalRunShellToolErrorAnalysis) -> None:
     """Log the fetched shell-tool error rate and recent error details."""
     aggregate = analysis.aggregate
@@ -208,16 +204,15 @@ class ShellSuccessObjective(SingleModelObjective):
     telemetry_dimensions = (SHELL_SUCCESS_OBJECTIVE,)
     focused_bucket_type = SESSION_BUCKET_TYPE
     failure_label = "HIGH-SIGNAL FAILURES"
-    pending_error_type = ShellToolTelemetryPendingError
     pending_telemetry_label = "shell"
     module_responsibilities: ClassVar[Mapping[str, str]] = {WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY}
-    reflects_core_tools = True
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
         if bigquery_client is None:
             raise ValueError("bigquery_client is required")
         self.bigquery_client = bigquery_client
         self.lookback_days = lookback_days
+        self.params: dict[str, Any] = {}
         self._eval_analysis_cache: dict[str, EvalRunShellToolErrorAnalysis] = {}
 
     def analyze(
@@ -415,7 +410,7 @@ class ShellSuccessObjective(SingleModelObjective):
         output = trajectory["output"]
         shell_success_rate = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(shell_success_rate < 0.9),
+            int(shell_success_rate < float(self.pack_param("failure_score_below", 0.9))),
             int(output.get("student_tool_errors", 0) > 0),
             len(output.get("shell_error_messages", [])),
         )
@@ -480,7 +475,6 @@ register_telemetry_source("single_model", "shell_telemetry", ShellSuccessObjecti
 __all__ = [
     "EVAL_ANALYSIS_CACHE_SCHEMA_VERSION",
     "ShellSuccessObjective",
-    "ShellToolTelemetryPendingError",
     "enrich_shell_error_action_inputs",
     "log_shell_tool_error_analysis",
 ]

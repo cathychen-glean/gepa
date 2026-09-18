@@ -48,18 +48,64 @@ def module_responsibility(
     module_name: str,
     *,
     responsibilities: Mapping[str, str],
-    reflects_core_tools: bool,
 ) -> str:
     """Resolve the responsibility text the reflector gets for ``module_name``."""
     responsibility = responsibilities.get(module_name)
     if responsibility is not None:
         return responsibility
-    if reflects_core_tools and module_name in CORE_TOOL_KEYS:
+    if module_name in CORE_TOOL_KEYS:
         return core_tool_reflection_prompt(module_name)
     return DEFAULT_MODULE_RESPONSIBILITY
 
 
-class TeacherStudentObjective(ABC):
+class PackConfigurable:
+    """Pack YAML knobs overlaid onto an objective instance after construction."""
+
+    params: dict[str, Any]
+
+    def pack_param(self, key: str, default: Any) -> Any:
+        return (getattr(self, "params", None) or {}).get(key, default)
+
+    def reflection_prompt(self, module_name: str) -> str:
+        return module_responsibility(
+            module_name,
+            responsibilities=getattr(self, "module_responsibilities", {}) or {},
+        )
+
+
+def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
+    """Apply pack YAML knobs. Class attributes stay the unconfigured defaults."""
+    if not hasattr(objective, "params"):
+        objective.params = {}
+    if not pack:
+        return
+    objective_cfg = pack.get("objective") or {}
+    reflection = pack.get("reflection") or {}
+    bucket = objective_cfg.get("focused_bucket_type")
+    if bucket is not None:
+        from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
+
+        if str(bucket) not in FOCUSED_BUCKET_TYPES:
+            allowed = ", ".join(sorted(FOCUSED_BUCKET_TYPES))
+            raise ValueError(f"focused_bucket_type must be one of {allowed}, got {bucket!r}")
+        objective.focused_bucket_type = str(bucket)
+    params = objective_cfg.get("params")
+    if isinstance(params, Mapping):
+        objective.params = dict(params)
+    label = reflection.get("failure_label")
+    if label is not None:
+        objective.failure_label = str(label)
+    title = reflection.get("report_title")
+    if title is not None and hasattr(type(objective), "reflection_report_title"):
+        objective.reflection_report_title = str(title)
+    modules = reflection.get("modules")
+    if isinstance(modules, Mapping) and modules:
+        base = dict(getattr(type(objective), "module_responsibilities", {}) or {})
+        base.update({str(name): str(text) for name, text in modules.items()})
+        objective.module_responsibilities = base
+
+
+class TeacherStudentObjective(PackConfigurable, ABC):
     """Paired teacher-vs-student trace comparison."""
 
     name: str
@@ -71,7 +117,6 @@ class TeacherStudentObjective(ABC):
     student_compared_key: str
     mismatch_pair: Callable[[Any, Any], tuple[str, str] | None]
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
-    reflects_core_tools: bool = False
     bigquery_client: Any | None = None
     evalcli: Any | None = None
     lookback_days: int = 1
@@ -219,14 +264,6 @@ class TeacherStudentObjective(ABC):
         )
         return examples
 
-    @classmethod
-    def reflection_prompt(cls, module_name: str) -> str:
-        return module_responsibility(
-            module_name,
-            responsibilities=cls.module_responsibilities,
-            reflects_core_tools=cls.reflects_core_tools,
-        )
-
     @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...
 
@@ -246,20 +283,20 @@ class TeacherStudentObjective(ABC):
         return []
 
 
-class SingleModelObjective(ABC):
+class TelemetryPendingError(RuntimeError):
+    """Raised when an eval has no scorable telemetry yet; callers should retry, not score 0/0."""
+
+
+class SingleModelObjective(PackConfigurable, ABC):
     """Student-only BigQuery / agentspan metric."""
 
     name: str
     telemetry_dimensions: tuple[str, ...]
     focused_bucket_type: str
     failure_label: str = "HIGH-SIGNAL FAILURES"
-    # Raised when an eval has no scorable telemetry yet; concrete objectives
-    # override with a metric-specific error so callers can retry vs. fail.
-    pending_error_type: type[Exception] = RuntimeError
     # Human-readable telemetry name for pending/read logs; empty falls back to ``name``.
     pending_telemetry_label: str = ""
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
-    reflects_core_tools: bool = False
 
     @abstractmethod
     def analyze(
@@ -312,14 +349,6 @@ class SingleModelObjective(ABC):
         entry_ids: Sequence[str],
         deployment_ids: Sequence[str],
     ) -> list[dict[str, Any]] | None: ...
-
-    @classmethod
-    def reflection_prompt(cls, module_name: str) -> str:
-        return module_responsibility(
-            module_name,
-            responsibilities=cls.module_responsibilities,
-            reflects_core_tools=cls.reflects_core_tools,
-        )
 
     @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...
@@ -382,6 +411,7 @@ def build_objective(
     *,
     bigquery_client: Any | None = None,
     lookback_days: int = 1,
+    pack: Mapping[str, Any] | None = None,
 ) -> TeacherStudentObjective | SingleModelObjective:
     """Construct the telemetry objective registered for ``mode`` and the pack source."""
     _ensure_builtin_objectives_registered()
@@ -395,7 +425,9 @@ def build_objective(
                 source = candidate
                 break
     cls = TELEMETRY_SOURCES[(mode, source)]
-    return cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
+    objective = cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
+    configure_objective(objective, pack)
+    return objective
 
 
 __all__ = [
@@ -405,7 +437,9 @@ __all__ = [
     "SingleModelObjective",
     "TELEMETRY_SOURCES",
     "TeacherStudentObjective",
+    "TelemetryPendingError",
     "build_objective",
+    "configure_objective",
     "is_registered_telemetry_source",
     "is_telemetry_source",
     "register_telemetry_source",

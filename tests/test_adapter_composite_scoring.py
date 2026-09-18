@@ -8,10 +8,13 @@ import pytest
 
 from glean_gepa.adapter_types import PointwiseJudge
 from glean_gepa.al_adapter import ALRunner, Thresholds
+from glean_gepa.batch import GleanEvaluationBatch
+from glean_gepa.evolutionary_proposer import pick_modules_to_edit
 from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.utils.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
+from glean_gepa.prompt_constants import RULES_EXT_KEY
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
-from glean_gepa.objectives.utils.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
 
 THRESHOLDS = Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000)
 
@@ -80,3 +83,25 @@ def test_only_teacher_student_can_score_a_judge_dimension():
     assert "answer_quality" in teacher_student.scorable_dimensions()
     with pytest.raises(ValueError, match="cannot score: answer_quality"):
         _single_model(composite_weights={"answer_quality": 1.0}, constant_scores={})
+
+
+def test_concrete_adapters_own_screening_configuration():
+    single_adapter = _single_model()
+    single_rules_ext = _single_model(editable_modules=[RULES_EXT_KEY])
+    teacher_adapter = _teacher_student()
+    shell_eval = GleanEvaluationBatch(
+        outputs=[],
+        scores=[0.8],
+        summary={SHELL_SUCCESS_OBJECTIVE: 0.8, "completeness": 0.5},
+    )
+    tool_match_eval = GleanEvaluationBatch(
+        outputs=[],
+        scores=[0.85],
+        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "completeness": 1.0},
+    )
+
+    assert single_adapter.get_screening_score(shell_eval) == 0.8
+    assert teacher_adapter.get_screening_score(tool_match_eval) == 0.5
+    assert pick_modules_to_edit(single_rules_ext) == [RULES_EXT_KEY]
+    assert not hasattr(single_adapter, "judging_mode")
+    assert not hasattr(teacher_adapter, "judge")

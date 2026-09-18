@@ -38,6 +38,41 @@ CORRECTNESS_RUN_PARAMS = json.dumps({"Judge Type": "DIRECT_CORRECTNESS", "Llm mo
 COMPLETENESS_JUDGE_TYPE = "COMPLETENESS"
 COMPLETENESS_RUN_PARAMS = json.dumps({"Llm model": "default", "Use Cache": "true"})
 
+AGENTIC_JUDGE_TYPE = "AGENTIC_JUDGE"
+AGENTIC_JUDGE_NAME = "judge_pairwise_agentic_multi_dimension"
+AGENTIC_PREFERENCE_RATE_METRIC = "Preference rate (tie split)"
+AGENTIC_RUN_PARAMS = json.dumps(
+    {
+        "judge_name": AGENTIC_JUDGE_NAME,
+        "judge_skill_name": AGENTIC_JUDGE_NAME,
+        "scoring_mode": "randomized_single_0_10",
+        "dimension_skills": ",".join(
+            [
+                "judge_pairwise_agentic_correctness",
+                "judge_pairwise_agentic_task_completion",
+                "judge_pairwise_agentic_output_readiness",
+            ]
+        ),
+        "tool_allowlist": "Shell,Glean Search,Glean Document Reader",
+        "gatherer_max_turns": "4",
+        "scorer_max_turns": "3",
+        "eval_run_source_filter": "require_successful_trace",
+        "use_flex_tier": "false",
+    }
+)
+# The judge reads both responses from the eval runs; only the query comes from the eval set.
+AGENTIC_INPUT_MAPPINGS = json.dumps(
+    [
+        {"entryType": "TEST", "name": "Query", "path": "Query", "sourceType": "EVAL_SET_PROTO"},
+        {
+            "entryType": "TEST",
+            "name": "QueryTimestampMillis",
+            "path": "TimestampMillis",
+            "sourceType": "EVAL_SET_PROTO",
+        },
+    ]
+)
+
 TERMINAL_JUDGE_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
 TERMINAL_TASK_STATUSES = {

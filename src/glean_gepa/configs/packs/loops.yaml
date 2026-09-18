@@ -10,8 +10,18 @@ objective:
   primary: loop_efficiency
   composite:
     loop_efficiency: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  params:
+    target_loop_count: 2
+    correctness_pass: 0.5
+    failure_score_below: 1.0
 
 screening:
   kind: high_signal_fix_rate
   threshold: 0.333
   high_signal: extra_loops_or_incorrect
+
+reflection:
+  editable_modules: [WRITING_CODE]
+  failure_label: "HIGH-SIGNAL FAILURES (extra loops or incorrect)"
+  # Override module reflection prompts with modules.<KEY>.

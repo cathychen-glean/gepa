@@ -14,9 +14,11 @@ from glean_gepa.prompt_constants import (
     CORE_TOOL_DESCRIPTIONS,
     CORE_TOOL_KEYS,
     CORE_TOOLS,
+    DEFAULT_EXECUTION_DISCIPLINE,
     DEFAULT_FULL_PROMPT,
     DEFAULT_RULES_EXT,
     DEFAULT_WRITING_CODE,
+    EXECUTION_DISCIPLINE_KEY,
     FULL_PROMPT_KEY,
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
@@ -29,12 +31,12 @@ _RULES_EXT_SLOT = re.compile(r"\{RULES_EXT\}[ \t]*\n?")
 
 
 def materialize_system_prompt(candidate: dict[str, str]) -> str:
-    """Inject writing-code into one system prompt, leaving ``{RULES_EXT}`` for compile time.
+    """Inject writing-code into one system prompt, leaving the other slots for compile time.
 
     Used to freeze the system prompt for runs that do not edit ``WRITING_CODE``:
     after this there is no ``{WRITING_CODE}`` slot left to fill at compile time.
-    ``RULES_EXT`` stays a placeholder so children editing those bullets do not
-    re-materialize Writing Code.
+    ``RULES_EXT`` and ``EXECUTION_DISCIPLINE`` stay placeholders so children editing
+    those do not re-materialize Writing Code.
     """
     template = candidate.get(FULL_PROMPT_KEY, DEFAULT_FULL_PROMPT)
     writing_code = candidate.get(WRITING_CODE_KEY, DEFAULT_WRITING_CODE)
@@ -52,6 +54,9 @@ def compile_system_prompt(candidate: dict[str, str]) -> str:
     template = candidate.get(FULL_PROMPT_KEY, DEFAULT_FULL_PROMPT)
     if WRITING_CODE_KEY in candidate:
         template = template.replace("{WRITING_CODE}", candidate[WRITING_CODE_KEY])
+    if "{EXECUTION_DISCIPLINE}" in template:
+        execution_discipline = candidate.get(EXECUTION_DISCIPLINE_KEY, "").strip() or DEFAULT_EXECUTION_DISCIPLINE
+        template = template.replace("{EXECUTION_DISCIPLINE}", execution_discipline)
     if "{RULES_EXT}" in template:
         rules_ext = candidate.get(RULES_EXT_KEY, DEFAULT_RULES_EXT).strip()
         template = template.replace("{RULES_EXT}", rules_ext) if rules_ext else _RULES_EXT_SLOT.sub("", template)

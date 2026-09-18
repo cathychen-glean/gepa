@@ -38,12 +38,19 @@ class LoopCountEntryMetrics:
     correctness: float
     has_error: bool
     action_inputs: tuple[str, ...] = ()
+    target_loops: int = TARGET_LOOP_COUNT
+    correctness_pass: float = CORRECTNESS_PASS
 
     @property
     def loop_efficiency(self) -> float:
         if self.has_error:
             return 0.0
-        return loop_efficiency_score(self.loop_count, self.correctness)
+        return loop_efficiency_score(
+            self.loop_count,
+            self.correctness,
+            target_loops=self.target_loops,
+            correctness_pass=self.correctness_pass,
+        )
 
 
 @dataclass(frozen=True)
@@ -80,7 +87,12 @@ def loop_efficiency_score(
     return 1.0 / (1.0 + extra)
 
 
-def parse_loop_count_entry_metrics(row: dict[str, Any]) -> LoopCountEntryMetrics:
+def parse_loop_count_entry_metrics(
+    row: dict[str, Any],
+    *,
+    target_loops: int = TARGET_LOOP_COUNT,
+    correctness_pass: float = CORRECTNESS_PASS,
+) -> LoopCountEntryMetrics:
     loop_count = int(row.get("loop_count") or 0)
     has_error = bool(row.get("has_error"))
     raw_correctness = row.get("correctness")
@@ -95,6 +107,8 @@ def parse_loop_count_entry_metrics(row: dict[str, Any]) -> LoopCountEntryMetrics
         loop_count=loop_count,
         correctness=correctness,
         has_error=has_error,
+        target_loops=target_loops,
+        correctness_pass=correctness_pass,
     )
 
 
@@ -200,6 +214,8 @@ def fetch_eval_run_loop_count_analysis(
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     evalcli: Any | None = None,
     include_action_inputs: bool = True,
+    target_loops: int = TARGET_LOOP_COUNT,
+    correctness_pass: float = CORRECTNESS_PASS,
 ) -> EvalRunLoopCountAnalysis:
     result = run_windowed_per_entry_query(
         client,
@@ -225,11 +241,15 @@ def fetch_eval_run_loop_count_analysis(
     per_entry = {
         metrics.entry_id: metrics
         for row in per_entry_rows
-        for metrics in [parse_loop_count_entry_metrics(row)]
+        for metrics in [
+            parse_loop_count_entry_metrics(row, target_loops=target_loops, correctness_pass=correctness_pass)
+        ]
         if metrics.entry_id
     }
     if evalcli is not None:
-        per_entry = overlay_evalcli_loop_and_correctness(evalcli, eval_id, per_entry)
+        per_entry = overlay_evalcli_loop_and_correctness(
+            evalcli, eval_id, per_entry, target_loops=target_loops, correctness_pass=correctness_pass
+        )
     high_signal_entry_ids = tuple(
         sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
     )
@@ -293,6 +313,9 @@ def overlay_evalcli_loop_and_correctness(
     evalcli: Any,
     eval_id: str,
     per_entry: dict[str, LoopCountEntryMetrics],
+    *,
+    target_loops: int = TARGET_LOOP_COUNT,
+    correctness_pass: float = CORRECTNESS_PASS,
 ) -> dict[str, LoopCountEntryMetrics]:
     """Prefer eval ``loopCount`` and CORRECTNESS judge scores when the view has them."""
     get_view = getattr(evalcli, "get_analysis_view", None)
@@ -325,15 +348,18 @@ def overlay_evalcli_loop_and_correctness(
             correctness=float(correctness),
             has_error=has_error,
             action_inputs=current.action_inputs if current else (),
+            target_loops=target_loops,
+            correctness_pass=correctness_pass,
         )
     return updated
 
 
 def log_loop_count_analysis(analysis: EvalRunLoopCountAnalysis) -> None:
     aggregate = analysis.aggregate
+    target_loops = next(iter(analysis.per_entry.values())).target_loops if analysis.per_entry else TARGET_LOOP_COUNT
     print(
         f"[Loop Count] {analysis.eval_id}: efficiency={aggregate.loop_efficiency:.2%} "
-        f"({aggregate.matching_entries}/{aggregate.compared_entries} at <= {TARGET_LOOP_COUNT} loops), "
+        f"({aggregate.matching_entries}/{aggregate.compared_entries} at <= {target_loops} loops), "
         f"mean_loops={aggregate.mean_loop_count:.2f}, correctness={aggregate.mean_correctness:.2f}"
     )
     for entry_id in analysis.high_signal_entry_ids[:5]:

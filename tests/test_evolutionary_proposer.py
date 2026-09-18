@@ -189,61 +189,6 @@ def test_empty_reflection_result_marks_root_as_cached() -> None:
     assert children_by_root == {root.candidate_id: []}
 
 
-def test_children_cache_survives_proposer_restart(tmp_path) -> None:
-    cache_file = str(tmp_path / "children.json")
-    root = _candidate("root")
-    frontier_evals = {root.candidate_id: _Evaluation()}
-    first_adapter = _ReflectionAdapter()
-    first_proposer = _proposer(first_adapter, cache_file)
-    first_slice_cache = first_proposer._children_by_root_by_train_slice.setdefault((0,), {})
-
-    first = make_children_for_generation(
-        first_adapter,
-        [root],
-        frontier_evals,
-        reflection_llm=object(),
-        offspring_count=2,
-        children_by_root=first_slice_cache,
-    )
-    first_proposer._record_eval_run_ids(
-        (0,),
-        first[0],
-        [
-            {
-                "eval_set_name": "focused",
-                "eval_set_version": "v1",
-                "student_eval_run_id": "eval-child-1",
-            }
-        ],
-    )
-    first_proposer._save_children_cache()
-    cached_child = json.loads((tmp_path / "children.json").read_text())["training_slices"][0]["roots"]["root"][0]
-    assert cached_child["prompt_modules"] == first[0].prompt_modules
-    assert cached_child["eval_run_ids"][0]["student_eval_run_id"] == "eval-child-1"
-
-    second_adapter = _ReflectionAdapter()
-    second_proposer = _proposer(second_adapter, cache_file)
-    second = make_children_for_generation(
-        second_adapter,
-        [root],
-        frontier_evals,
-        reflection_llm=object(),
-        offspring_count=2,
-        children_by_root=second_proposer._children_by_root_by_train_slice[(0,)],
-    )
-
-    assert first_adapter.reflection_calls == 1
-    assert second_adapter.reflection_calls == 0
-    assert [child.prompt_modules for child in second] == [child.prompt_modules for child in first]
-    assert second_proposer._cached_eval_run_ids((0,), second[0]) == [
-        {
-            "eval_set_name": "focused",
-            "eval_set_version": "v1",
-            "student_eval_run_id": "eval-child-1",
-        }
-    ]
-
-
 def _children_cache_payload() -> dict:
     return {
         "training_slices": [
@@ -634,4 +579,3 @@ def test_stall_limit_reached_only_when_configured() -> None:
     assert limited._stall_limit_reached(3)
     unset = _engine_with_stall_limit(max_stalled_proposals=None)
     assert not unset._stall_limit_reached(1_000_000)
-

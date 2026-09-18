@@ -10,10 +10,22 @@ are unimplemented.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from glean_gepa.evalcli_client import EvalCliClient, EvalCliError
+from glean_gepa.evalcli_client import (
+    AGENTIC_INPUT_MAPPINGS,
+    AGENTIC_JUDGE_NAME,
+    AGENTIC_JUDGE_TYPE,
+    AGENTIC_PREFERENCE_RATE_METRIC,
+    AGENTIC_RUN_PARAMS,
+    CORRECTNESS_INPUT_MAPPINGS,
+    CORRECTNESS_JUDGE_TYPE,
+    CORRECTNESS_RUN_PARAMS,
+    EvalCliClient,
+    EvalCliError,
+)
 
 
 @dataclass(frozen=True)
@@ -101,3 +113,83 @@ def wait_for_judge_metrics(
     raise EvalCliError(
         f"{judge_type} metrics for {eval_id} were not ready after {timeout_sec}s (judge_run_id={judge_run_id})"
     )
+
+
+CUSTOMER_CORRECTNESS_METRIC = "correctness"
+CUSTOMER_AGENTIC_PREFERENCE_METRIC = "agentic_preference_rate"
+
+
+@dataclass(frozen=True)
+class CustomerJudgeGate:
+    """How the post-search customer eval starts a Cortex judge and reads its floor."""
+
+    name: str
+    default_min: float
+    judge_type: str
+    run_params: str
+    input_mappings: str
+    # True: score must be strictly above min. False: min is a passing tie.
+    strict: bool
+    category_aliases: tuple[str, ...]
+    metrics_label: str
+    score_source: str
+    label: str
+    judge_type_aliases: tuple[str, ...] = ()
+    row_metric: str | None = None
+    score_keys: tuple[str, ...] = ("test", "passRate", "pass_rate", "testValue", "test_value")
+
+    def matches_row(self, category: str, row: Mapping[str, Any]) -> bool:
+        metric = str(row.get("metric", ""))
+        in_category = category in self.category_aliases or metric.upper() in self.category_aliases
+        in_judge_type = str(row.get("judgeType", "")) in self.judge_type_aliases
+        if not (in_category or in_judge_type):
+            return False
+        return self.row_metric is None or metric == self.row_metric
+
+    def failure_message(self, score: float, floor: float) -> str | None:
+        if self.strict:
+            if score <= floor:
+                return f"{self.label} {score:.2%} is not above {floor:.0%}"
+            return None
+        if score < floor:
+            return f"{self.label} {score:.2%} is below {floor:.0%}"
+        return None
+
+    def report_line(self, score: float, floor: float) -> str:
+        required = f">{floor:.0%}" if self.strict else f">={floor:.0%}"
+        return f"{self.name}={score:.2%} (required {required})"
+
+
+CUSTOMER_JUDGE_GATES: dict[str, CustomerJudgeGate] = {
+    gate.name: gate
+    for gate in (
+        CustomerJudgeGate(
+            name=CUSTOMER_CORRECTNESS_METRIC,
+            default_min=0.80,
+            judge_type=CORRECTNESS_JUDGE_TYPE,
+            run_params=CORRECTNESS_RUN_PARAMS,
+            input_mappings=CORRECTNESS_INPUT_MAPPINGS,
+            strict=True,
+            category_aliases=(CORRECTNESS_JUDGE_TYPE,),
+            metrics_label=CORRECTNESS_JUDGE_TYPE,
+            score_source=CORRECTNESS_JUDGE_TYPE,
+            label="correctness",
+        ),
+        CustomerJudgeGate(
+            name=CUSTOMER_AGENTIC_PREFERENCE_METRIC,
+            default_min=0.50,
+            judge_type=AGENTIC_JUDGE_TYPE,
+            run_params=AGENTIC_RUN_PARAMS,
+            input_mappings=AGENTIC_INPUT_MAPPINGS,
+            strict=False,
+            category_aliases=(AGENTIC_JUDGE_NAME.upper(),),
+            judge_type_aliases=(AGENTIC_JUDGE_NAME,),
+            row_metric=AGENTIC_PREFERENCE_RATE_METRIC,
+            metrics_label=f"{AGENTIC_JUDGE_NAME} {AGENTIC_PREFERENCE_RATE_METRIC}",
+            score_source=AGENTIC_JUDGE_NAME,
+            label="agentic preference rate",
+        ),
+    )
+}
+CUSTOMER_VALIDATION_METRICS = frozenset(CUSTOMER_JUDGE_GATES)
+DEFAULT_CUSTOMER_VALIDATION_GATES = {name: gate.default_min for name, gate in CUSTOMER_JUDGE_GATES.items()}

@@ -127,8 +127,7 @@ def test_tool_match_queries_and_fetch():
     assert "agent_trace.trace_id" in sql
     assert "student_trace_id" in sql and "teacher_trace_id" in sql
     assert "student_deployment_id" in sql and "teacher_deployment_id" in sql
-    for skipped in SKIPPED_TOOL_NAMES:
-        assert skipped in sql
+    assert "UNNEST(@skipped_tools)" in sql
 
     client = MagicMock()
     client.query.side_effect = [
