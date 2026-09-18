@@ -10,8 +10,17 @@ objective:
   primary: citation_match
   composite:
     citation_match: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  params:
+    failure_score_below: 1.0
 
 screening:
   kind: high_signal_fix_rate
   threshold: 0.25
   high_signal: citation_set_mismatch
+
+reflection:
+  editable_modules: [WRITING_CODE, RULES_EXT]
+  failure_label: "HIGH-SIGNAL FAILURES (teacher vs student citation match)"
+  report_title: "REFLECTION: teacher vs student citation sets"
+  # Override module reflection prompts with modules.<KEY>.

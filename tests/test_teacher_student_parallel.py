@@ -10,6 +10,7 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
 from glean_gepa.objectives.utils.tool_match_util import (
+    SKIPPED_TOOL_NAMES,
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
     NoComparedEvalEntriesError,
@@ -256,6 +257,7 @@ def test_get_or_fetch_analysis_caches_fetch():
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
         evalcli=adapter.objective.evalcli,
+        skip_tools=SKIPPED_TOOL_NAMES,
     )
     assert first is fetched
     assert second is fetched
@@ -301,6 +303,7 @@ def test_validation_only_skips_action_input_evalcli():
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
         evalcli=None,
+        skip_tools=SKIPPED_TOOL_NAMES,
     )
 
 

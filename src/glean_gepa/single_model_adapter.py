@@ -17,8 +17,8 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
-from glean_gepa.objectives import SingleModelObjective
-from glean_gepa.objectives.shell import ShellSuccessObjective, ShellToolTelemetryPendingError
+from glean_gepa.objectives import SingleModelObjective, TelemetryPendingError
+from glean_gepa.objectives.shell import ShellSuccessObjective
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
@@ -274,7 +274,7 @@ class SingleModelAdapter(GleanAdapterBase):
             )
             if self.objective.is_pending(analysis):
                 label = self.objective.pending_telemetry_label or self.objective.name
-                raise self.objective.pending_error_type(
+                raise TelemetryPendingError(
                     f"No {label} telemetry is available yet for eval {student_eval_id}; "
                     "refusing to score 0/0 as success"
                 )
@@ -341,5 +341,5 @@ __all__ = [
     "SingleModelALRolloutOutput",
     "SingleModelALTrajectory",
     "SingleModelAdapter",
-    "ShellToolTelemetryPendingError",
+    "TelemetryPendingError",
 ]

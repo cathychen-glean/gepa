@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from glean_gepa.objectives.citation_match import CitationMatchObjective
@@ -25,26 +27,27 @@ from glean_gepa.reflection_prompts import (
 
 
 def test_reflection_prompts_route_by_module():
-    tool_match = FirstToolMatchObjective.reflection_prompt
+    tool_match = FirstToolMatchObjective().reflection_prompt
     assert tool_match(RULES_EXT_KEY) == FirstToolMatchObjective.module_responsibilities[RULES_EXT_KEY]
     assert "glean_search" in tool_match("glean_search")
     assert tool_match(WRITING_CODE_KEY) == DEFAULT_MODULE_RESPONSIBILITY
 
-    shell = ShellSuccessObjective.reflection_prompt
+    shell = ShellSuccessObjective(bigquery_client=MagicMock()).reflection_prompt
     assert shell(WRITING_CODE_KEY) == ShellSuccessObjective.module_responsibilities[WRITING_CODE_KEY]
     assert "<<<[[hitl_approval_instructions]]>>>" in shell(WRITING_CODE_KEY)
     assert "glean_search" in shell("glean_search")
 
-    citation_match = CitationMatchObjective.reflection_prompt
+    citation_match = CitationMatchObjective().reflection_prompt
     assert citation_match(RULES_EXT_KEY) == CitationMatchObjective.module_responsibilities[RULES_EXT_KEY]
     # The citations run edits Writing Code, so it needs citation-specific guidance there.
     assert citation_match(WRITING_CODE_KEY) == CitationMatchObjective.module_responsibilities[WRITING_CODE_KEY]
     assert "citationId" in citation_match(WRITING_CODE_KEY)
-    # Citation and loop metrics never route to core-tool descriptions.
-    assert citation_match("glean_search") == DEFAULT_MODULE_RESPONSIBILITY
-    assert LoopEfficiencyObjective.reflection_prompt("glean_search") == DEFAULT_MODULE_RESPONSIBILITY
+    # Core-tool keys always get the tool-description essay; packs that should not
+    # rewrite those descriptions omit CORE_TOOLS from editable_modules.
+    assert "glean_search" in citation_match("glean_search")
+    assert "glean_search" in LoopEfficiencyObjective(bigquery_client=MagicMock()).reflection_prompt("glean_search")
 
-    loop = LoopEfficiencyObjective.reflection_prompt
+    loop = LoopEfficiencyObjective(bigquery_client=MagicMock()).reflection_prompt
     assert loop(WRITING_CODE_KEY) == LoopEfficiencyObjective.module_responsibilities[WRITING_CODE_KEY]
 
     # FULL_PROMPT is the render template, so no objective may claim it as a module.
@@ -55,9 +58,9 @@ def test_reflection_prompts_route_by_module():
 @pytest.mark.parametrize(
     "prompt",
     [
-        FirstToolMatchObjective.reflection_prompt(RULES_EXT_KEY),
-        FirstToolMatchObjective.reflection_prompt("glean_search"),
-        CitationMatchObjective.reflection_prompt(RULES_EXT_KEY),
+        FirstToolMatchObjective().reflection_prompt(RULES_EXT_KEY),
+        FirstToolMatchObjective().reflection_prompt("glean_search"),
+        CitationMatchObjective().reflection_prompt(RULES_EXT_KEY),
     ],
 )
 def test_teacher_student_prompts_forbid_teacher_referential_edits(prompt: str):

@@ -31,25 +31,19 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
 )
 
 
-def test_is_shell_tool_error_detects_action_status_error():
+def test_is_shell_tool_error():
     assert is_shell_tool_error(
         action_status="ERROR",
         span_status="OK",
         output_status_code="OK",
         provider_status="success",
     )
-
-
-def test_is_shell_tool_error_detects_provider_failure():
     assert is_shell_tool_error(
         action_status="SUCCESS",
         span_status="OK",
         output_status_code="OK",
         provider_status="failed",
     )
-
-
-def test_is_shell_tool_error_returns_false_for_success():
     assert not is_shell_tool_error(
         action_status="SUCCESS",
         span_status="OK",
@@ -179,12 +173,9 @@ def test_build_eval_run_search_params_uses_lookback_window():
     assert param_map["search_end_date"] == "2026-08-12"
 
 
-def test_default_date_range_uses_utc_today_not_host_local():
+def test_default_date_range_uses_utc_today_and_pads_the_next_shard():
     with patch("glean_gepa.objectives.utils.agentspan_query.utc_today", return_value=date(2026, 9, 3)):
         assert default_date_range(lookback_days=7) == (date(2026, 8, 27), date(2026, 9, 4))
-
-
-def test_default_date_range_always_includes_next_utc_shard():
     with patch("glean_gepa.objectives.utils.agentspan_query.utc_today", return_value=date(2026, 9, 2)):
         assert default_date_range(lookback_days=7) == (date(2026, 8, 26), date(2026, 9, 3))
 

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.evalcli_client import EvalCliClient
-from glean_gepa.experiment_config import load_experiment_config
+from glean_gepa.experiment_config import experiment_objective_pack, load_experiment_config
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.loop import LoopEfficiencyObjective
@@ -185,10 +185,50 @@ def test_loops_pack_constructs_the_loop_efficiency_objective(tmp_path):
     mode = tmp_path / "mode.yaml"
     mode.write_text("schema_version: 1\nmode: single_model\npacks: [loops]\n")
     config = load_experiment_config(mode)
-    objective = build_objective("single_model", config.signals, bigquery_client=MagicMock())
+    objective = build_objective(
+        "single_model",
+        config.signals,
+        bigquery_client=MagicMock(),
+        pack=experiment_objective_pack(config),
+    )
     assert config.primary_objective == LOOP_EFFICIENCY_OBJECTIVE
     assert isinstance(objective, LoopEfficiencyObjective)
     assert objective.focused_bucket_type == QUERY_CANONICAL_BUCKET_TYPE
+    assert objective.pack_param("target_loop_count", None) == 2
+    assert "reduce extra agent loops" in objective.reflection_prompt("WRITING_CODE")
+
+
+def test_loop_cache_recomputes_high_signal_when_the_loop_cap_changes():
+    """Resume after retuning target_loop_count must not keep the old high-signal list."""
+    objective = LoopEfficiencyObjective(bigquery_client=MagicMock())
+    per_entry = {
+        "A": LoopCountEntryMetrics("A", 1, 1.0, False, target_loops=2),
+        "B": LoopCountEntryMetrics("B", 2, 1.0, False, target_loops=2),
+        "C": LoopCountEntryMetrics("C", 3, 1.0, False, target_loops=2),
+    }
+    objective._eval_analysis_cache["run"] = EvalRunLoopCountAnalysis(
+        eval_id="run",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 2),
+        aggregate=aggregate_loop_count_metrics("run", per_entry),
+        per_entry=per_entry,
+        high_signal_entry_ids=("C",),
+    )
+    payload = objective.cache_payload()
+
+    objective.params = {"target_loop_count": 1}
+    objective.load_cache(payload)
+    tightened = objective._eval_analysis_cache["run"]
+    assert tightened.high_signal_entry_ids == ("B", "C")
+    assert objective.entry_ids_to_score(tightened, None) == ("B", "C")
+    assert tightened.per_entry["B"].loop_efficiency == 0.5
+
+    objective.params = {"target_loop_count": 3}
+    objective.load_cache(payload)
+    loosened = objective._eval_analysis_cache["run"]
+    assert loosened.high_signal_entry_ids == ()
+    assert objective.entry_ids_to_score(loosened, None) == ()
+    assert loosened.per_entry["C"].loop_efficiency == 1.0
 
 
 def test_loop_objective_scores_incorrect_or_extra_loops_below_one():

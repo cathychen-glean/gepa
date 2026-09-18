@@ -7,7 +7,7 @@ import hashlib
 import json
 import random
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -24,12 +24,7 @@ from glean_gepa.al_adapter import (
 from glean_gepa.api import optimize
 from glean_gepa.bigquery_client import BigQueryClient
 from glean_gepa.debug import set_debug
-from glean_gepa.evalcli_client import (
-    CORRECTNESS_INPUT_MAPPINGS,
-    CORRECTNESS_JUDGE_TYPE,
-    CORRECTNESS_RUN_PARAMS,
-    EvalCliClient,
-)
+from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import EvolutionaryProposer
 from glean_gepa.experiment_config import (
@@ -39,7 +34,9 @@ from glean_gepa.experiment_config import (
     ExperimentConfigError,
     composite_weights,
     constant_scores,
+    customer_validation_gates,
     evalset_identity,
+    experiment_objective_pack,
     load_experiment_config,
     pointwise_judges,
     resolve_config_path,
@@ -47,6 +44,7 @@ from glean_gepa.experiment_config import (
     screening_threshold,
 )
 from glean_gepa.fake_flow import build_fake_flow_components
+from glean_gepa.judge_metrics_util import CUSTOMER_JUDGE_GATES
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.utils.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
@@ -54,7 +52,9 @@ from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt, ma
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
+    DEFAULT_FULL_PROMPT,
     EDITABLE_PROMPT_KEYS,
+    EXECUTION_DISCIPLINE_KEY,
     FULL_PROMPT_KEY,
     KNOWN_PROMPT_KEYS,
     MODULE_TOKEN_BUDGETS,
@@ -101,7 +101,6 @@ TEACHER_STUDENT_DEPLOYMENT_IDS = [
     "thoughtworks",
 ]
 CUSTOMER_EVAL_ALPHA = 0.05
-CUSTOMER_CORRECTNESS_MIN = 0.80
 # Cortex rejects an eval run with more than five deployments, so each run samples
 # this many from the customer pool above and keeps that sample for every eval.
 MAX_EVAL_RUN_DEPLOYMENTS = 5
@@ -158,7 +157,7 @@ def _parse_editable_modules(raw: str) -> list[str]:
         elif part == FULL_PROMPT_KEY:
             raise SystemExit(
                 f"{FULL_PROMPT_KEY} is not editable: it is the render template. Edit a scoped "
-                f"module ({WRITING_CODE_KEY}, RULES_EXT, or core tools) instead."
+                f"module ({WRITING_CODE_KEY}, {RULES_EXT_KEY}, {EXECUTION_DISCIPLINE_KEY}, or core tools) instead."
             )
         else:
             unknown.append(part)
@@ -181,6 +180,14 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
             f"{RULES_EXT_KEY} is editable but the seed prompt has no {{RULES_EXT}} slot. "
             f"Add {{RULES_EXT}} to {WRITING_CODE_KEY} in the seed file, or drop {RULES_EXT_KEY} "
             "from editable_modules."
+        )
+    template = seed.get(FULL_PROMPT_KEY, raw.get(FULL_PROMPT_KEY, DEFAULT_FULL_PROMPT))
+    if EXECUTION_DISCIPLINE_KEY in editable_modules and "{EXECUTION_DISCIPLINE}" not in template:
+        raise SystemExit(
+            f"{EXECUTION_DISCIPLINE_KEY} is editable but the seed prompt has no "
+            f"{{EXECUTION_DISCIPLINE}} slot. The seed file pins a {FULL_PROMPT_KEY} materialized "
+            f"before this slot existed: re-materialize it from stock text, or drop "
+            f"{EXECUTION_DISCIPLINE_KEY} from editable_modules."
         )
     return seed
 
@@ -493,6 +500,14 @@ def _unwrap_additional_properties(value: object) -> object:
     return value
 
 
+# Keys that name a category themselves. Rows nested under any other key are dropped
+# unless an ancestor carried an explicit "category" field.
+_SYSTEM_METRIC_CATEGORIES = frozenset({"COST", "LOOP_COUNT_PERCENTILE", "TOOL_INVOCATION_RATE"})
+_CATEGORY_KEYS = _SYSTEM_METRIC_CATEGORIES | {
+    alias for gate in CUSTOMER_JUDGE_GATES.values() for alias in gate.category_aliases
+}
+
+
 def _metric_rows(value: object, *, category: str | None = None) -> list[tuple[str, dict[str, Any]]]:
     """Flatten EvalCLI's map/list metric encodings while retaining category names."""
     value = _unwrap_additional_properties(value)
@@ -512,12 +527,7 @@ def _metric_rows(value: object, *, category: str | None = None) -> list[tuple[st
         if key in {"category", "metric"}:
             continue
         child_category = row_category
-        if isinstance(child, dict | list) and str(key).upper() in {
-            "COST",
-            "LOOP_COUNT_PERCENTILE",
-            "TOOL_INVOCATION_RATE",
-            CORRECTNESS_JUDGE_TYPE,
-        }:
+        if isinstance(child, dict | list) and str(key).upper() in _CATEGORY_KEYS:
             child_category = str(key).upper()
         rows.extend(_metric_rows(child, category=child_category))
     return rows
@@ -542,16 +552,17 @@ def _benjamini_hochberg(p_values: list[float]) -> list[float]:
     return adjusted
 
 
-def _verify_customer_eval_metrics(metrics: dict[str, Any]) -> str:
+def _verify_customer_eval_metrics(
+    metrics: dict[str, Any],
+    *,
+    gates: Mapping[str, float] | None = None,
+) -> str:
+    resolved_gates = dict(gates or {})
     system_rows = _metric_rows(metrics.get("systemMetrics"))
     judge_rows = _metric_rows(metrics.get("judgeMetrics"))
-    guarded = [
-        (category, row)
-        for category, row in system_rows
-        if category in {"COST", "LOOP_COUNT_PERCENTILE", "TOOL_INVOCATION_RATE"}
-    ]
+    guarded = [(category, row) for category, row in system_rows if category in _SYSTEM_METRIC_CATEGORIES]
     present_categories = {category for category, _row in guarded}
-    missing_categories = {"COST", "LOOP_COUNT_PERCENTILE", "TOOL_INVOCATION_RATE"} - present_categories
+    missing_categories = _SYSTEM_METRIC_CATEGORIES - present_categories
     if missing_categories:
         raise SystemExit("Customer eval metrics omitted required comparisons: " + ", ".join(sorted(missing_categories)))
 
@@ -574,27 +585,21 @@ def _verify_customer_eval_metrics(metrics: dict[str, Any]) -> str:
         if adjusted_p < CUSTOMER_EVAL_ALPHA:
             failures.append(f"{category}/{metric} differs significantly (BH p={adjusted_p:.4g})")
 
-    correctness_rows = [
-        row
-        for category, row in judge_rows
-        if category == CORRECTNESS_JUDGE_TYPE or str(row.get("metric", "")).upper() == CORRECTNESS_JUDGE_TYPE
-    ]
-    if not correctness_rows:
-        raise SystemExit("Customer eval metrics did not include CORRECTNESS.")
-    correctness = _number(correctness_rows[0], "test", "passRate", "pass_rate", "testValue", "test_value")
-    if correctness is None:
-        raise SystemExit("Customer eval CORRECTNESS did not include an optimized-run score.")
-    if correctness <= CUSTOMER_CORRECTNESS_MIN:
-        failures.append(f"correctness {correctness:.2%} is not above {CUSTOMER_CORRECTNESS_MIN:.0%}")
+    judge_lines: list[str] = []
+    for name, floor in resolved_gates.items():
+        gate = CUSTOMER_JUDGE_GATES[name]
+        rows = [row for category, row in judge_rows if gate.matches_row(category, row)]
+        if not rows:
+            raise SystemExit(f"Customer eval metrics did not include {gate.metrics_label}.")
+        score = _number(rows[0], *gate.score_keys)
+        if score is None:
+            raise SystemExit(f"Customer eval {gate.score_source} did not include an optimized-run score.")
+        if failure := gate.failure_message(score, floor):
+            failures.append(failure)
+        judge_lines.append(gate.report_line(score, floor))
 
     status = "PASS" if not failures else "FAIL"
-    report = "\n".join(
-        [
-            f"status={status}",
-            f"correctness={correctness:.2%} (required >{CUSTOMER_CORRECTNESS_MIN:.0%})",
-            *guardrail_lines,
-        ]
-    )
+    report = "\n".join([f"status={status}", *judge_lines, *guardrail_lines])
     if failures:
         raise SystemExit(f"Customer eval validation failed: {'; '.join(failures)}\n{report}")
     return report
@@ -608,10 +613,12 @@ def _validate_best_candidate_on_customer_eval(
     best_candidate: dict[str, str],
     evalcli: EvalCliClient,
     valset: list[ALDataInst],
+    experiment: ExperimentConfig | None = None,
 ) -> None:
     """Run paired customer evals on the GEPA valset and enforce metric gates."""
     if not valset:
         raise SystemExit("Customer eval requires a non-empty validation set.")
+    gates = customer_validation_gates(experiment)
     for item in valset:
         version = item["eval_set_version"]
         deployment_ids = list(item["deployment_ids"])
@@ -645,23 +652,35 @@ def _validate_best_candidate_on_customer_eval(
         if best_wait:
             runner.wait(best_eval_id)
 
-        judge_run_id = runner.ensure_judge_run(
-            eval_run_id=best_eval_id,
-            judge_type=CORRECTNESS_JUDGE_TYPE,
-            run_params=CORRECTNESS_RUN_PARAMS,
-            base_eval_run_id=baseline_eval_id,
-            input_mappings=CORRECTNESS_INPUT_MAPPINGS,
-        )
-        evalcli.wait_for_judge_run(judge_run_id, eval_run_id=best_eval_id)
+        # Start every configured judge before waiting so slower agentic scoring overlaps.
+        judge_run_details: list[str] = []
+        wait_ids: list[str] = []
+        started_types: set[str] = set()
+        for name in gates:
+            gate = CUSTOMER_JUDGE_GATES[name]
+            if gate.judge_type in started_types:
+                continue
+            started_types.add(gate.judge_type)
+            judge_run_id = runner.ensure_judge_run(
+                eval_run_id=best_eval_id,
+                judge_type=gate.judge_type,
+                run_params=gate.run_params,
+                base_eval_run_id=baseline_eval_id,
+                input_mappings=gate.input_mappings,
+            )
+            wait_ids.append(judge_run_id)
+            judge_run_details.append(f"{gate.name}_judge_run_id={judge_run_id}")
+        for wait_id in wait_ids:
+            evalcli.wait_for_judge_run(wait_id, eval_run_id=best_eval_id)
         metrics = evalcli.compare_eval_metrics(best_eval_id, baseline_eval_id)
         run_details = [
             f"eval_set_version={version}",
             f"baseline_eval_id={baseline_eval_id}",
             f"best_eval_id={best_eval_id}",
-            f"correctness_judge_run_id={judge_run_id}",
+            *judge_run_details,
         ]
         try:
-            report = _verify_customer_eval_metrics(metrics)
+            report = _verify_customer_eval_metrics(metrics, gates=gates)
         except SystemExit as exc:
             log_section("CUSTOMER EVAL RESULT", "\n".join([*run_details, str(exc)]))
             raise
@@ -805,7 +824,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--editable_modules",
         default=WRITING_CODE_KEY,
-        help="Comma-separated prompt keys to edit (WRITING_CODE, CORE_TOOLS, RULES_EXT, or individual core-tool keys).",
+        help=(
+            "Comma-separated prompt keys to edit (WRITING_CODE, CORE_TOOLS, RULES_EXT, "
+            "EXECUTION_DISCIPLINE, or individual core-tool keys)."
+        ),
     )
     parser.add_argument(
         "--fake_flow",
@@ -881,6 +903,7 @@ def _build_adapter(
         experiment.signals if experiment is not None else None,
         bigquery_client=kwargs.get("bigquery_client"),
         lookback_days=int(kwargs.get("agentspan_lookback_days") or 1),
+        pack=experiment_objective_pack(experiment) if experiment is not None else None,
     )
     kwargs["objective"] = objective
     if experiment is not None:
@@ -1031,6 +1054,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         best_candidate=best_candidate,
         evalcli=evalcli,
         valset=valset,
+        experiment=args.experiment,
     )
 
 

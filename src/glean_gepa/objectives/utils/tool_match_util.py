@@ -89,7 +89,6 @@ def build_tool_match_per_entry_query(
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
 ) -> str:
     """Build SQL that pairs teacher and student tool sequences per eval entry."""
-    skipped = ", ".join(f"'{name}'" for name in sorted(SKIPPED_TOOL_NAMES))
     return f"""
 WITH failed_runs AS (
   SELECT DISTINCT
@@ -123,7 +122,7 @@ tool_spans AS (
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
     AND {EXECUTE_ACTION_FILTER}
-    AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN ({skipped})
+    AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN UNNEST(@skipped_tools)
 ),
 per_role AS (
   SELECT
@@ -166,24 +165,26 @@ ORDER BY entry_id
 """.strip()
 
 
-def scored_tool_sequence(tools: Sequence[str] | None) -> tuple[str, ...]:
+def scored_tool_sequence(tools: Sequence[str] | None, skip_tools: frozenset[str] | None = None) -> tuple[str, ...]:
     """Return tool names used for sequence matching, dropping Shell and other skipped tools."""
-    return tuple(str(name) for name in (tools or []) if name and str(name) not in SKIPPED_TOOL_NAMES)
+    skipped = SKIPPED_TOOL_NAMES if skip_tools is None else skip_tools
+    return tuple(str(name) for name in (tools or []) if name and str(name) not in skipped)
 
 
-def first_tool_name(tools: Sequence[str] | None) -> str:
+def first_tool_name(tools: Sequence[str] | None, skip_tools: frozenset[str] | None = None) -> str:
     """Return the first scored tool name, or an empty string when none remain."""
-    scored = scored_tool_sequence(tools)
+    scored = scored_tool_sequence(tools, skip_tools=skip_tools)
     return scored[0] if scored else ""
 
 
 def first_tool_mismatch_pair(
     teacher_tools: Sequence[str] | None,
     student_tools: Sequence[str] | None,
+    skip_tools: frozenset[str] | None = None,
 ) -> tuple[str, str] | None:
     """Return ``(teacher_first, student_first)`` when they differ, else ``None``."""
-    teacher = first_tool_name(teacher_tools)
-    student = first_tool_name(student_tools)
+    teacher = first_tool_name(teacher_tools, skip_tools=skip_tools)
+    student = first_tool_name(student_tools, skip_tools=skip_tools)
     if teacher == student:
         return None
     return (teacher, student)
@@ -194,9 +195,11 @@ def entry_run_failed(row: dict[str, Any]) -> bool:
     return bool(row.get("run_failed"))
 
 
-def parse_tool_match_entry_metrics(row: dict[str, Any]) -> ToolMatchEntryMetrics:
-    student_tools = scored_tool_sequence(row.get("student_tools"))
-    teacher_tools = scored_tool_sequence(row.get("teacher_tools"))
+def parse_tool_match_entry_metrics(
+    row: dict[str, Any], skip_tools: frozenset[str] | None = None
+) -> ToolMatchEntryMetrics:
+    student_tools = scored_tool_sequence(row.get("student_tools"), skip_tools=skip_tools)
+    teacher_tools = scored_tool_sequence(row.get("teacher_tools"), skip_tools=skip_tools)
     return ToolMatchEntryMetrics(
         entry_id=str(row.get("entry_id") or ""),
         student_tools=student_tools,
@@ -252,8 +255,10 @@ def fetch_eval_run_tool_match_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     evalcli: Any | None = None,
+    skip_tools: frozenset[str] | None = None,
 ) -> EvalRunToolMatchAnalysis:
     eval_ids = [teacher_eval_id, student_eval_id]
+    skipped = list(SKIPPED_TOOL_NAMES if skip_tools is None else skip_tools)
     result = run_windowed_per_entry_query(
         client,
         bounds_query=build_tool_match_time_bounds_query(agentspan_table=agentspan_table),
@@ -269,6 +274,7 @@ def fetch_eval_run_tool_match_analysis(
             QueryParameter("teacher_eval_id", "STRING", teacher_eval_id),
             QueryParameter("start_date", "DATE", start_date.isoformat()),
             QueryParameter("end_date", "DATE", resolved_end.isoformat()),
+            QueryParameter("skipped_tools", "STRING", skipped),
         ],
         lookback_days=lookback_days,
         end_date=end_date,
@@ -287,14 +293,14 @@ def fetch_eval_run_tool_match_analysis(
     per_entry = {
         metrics.entry_id: metrics
         for row in scored_rows
-        for metrics in [parse_tool_match_entry_metrics(row)]
+        for metrics in [parse_tool_match_entry_metrics(row, skip_tools=skip_tools)]
         if metrics.entry_id
     }
     high_signal_entry_ids = tuple(
         sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.tools_match)
     )
     if evalcli is not None:
-        per_entry = _enrich_action_inputs(evalcli, per_entry, scored_rows, high_signal_entry_ids)
+        per_entry = _enrich_action_inputs(evalcli, per_entry, scored_rows, high_signal_entry_ids, skip_tools=skip_tools)
     return EvalRunToolMatchAnalysis(
         teacher_eval_id=teacher_eval_id,
         student_eval_id=student_eval_id,
@@ -316,6 +322,8 @@ def _enrich_action_inputs(
     per_entry: dict[str, ToolMatchEntryMetrics],
     per_entry_rows: list[dict[str, Any]],
     high_signal_entry_ids: tuple[str, ...],
+    *,
+    skip_tools: frozenset[str] | None = None,
 ) -> dict[str, ToolMatchEntryMetrics]:
     """Attach each role's first tool call to high-signal entries from traces.
 
@@ -341,16 +349,17 @@ def _enrich_action_inputs(
                 collected.append(locator)
         return collected
 
+    skipped = SKIPPED_TOOL_NAMES if skip_tools is None else skip_tools
     student_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
         _locators("student"),
-        skip_tools=SKIPPED_TOOL_NAMES,
+        skip_tools=skipped,
         role_label="student",
     )
     teacher_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
         _locators("teacher"),
-        skip_tools=SKIPPED_TOOL_NAMES,
+        skip_tools=skipped,
         role_label="teacher",
     )
     if not student_inputs and not teacher_inputs:

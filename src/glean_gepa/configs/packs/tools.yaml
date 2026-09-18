@@ -10,8 +10,23 @@ objective:
   primary: tool_alignment
   composite:
     tool_alignment: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  params:
+    skipped_tools:
+      - Personal Knowledge Vault Retrieve
+      - Shell
+      - Shell Tool
+      - find_skills_assistant
+    failure_score_below: 0.7
 
 screening:
   kind: high_signal_fix_rate
   threshold: 0.25
   high_signal: first_tool_mismatch
+
+reflection:
+  editable_modules: [CORE_TOOLS, RULES_EXT]
+  failure_label: "HIGH-SIGNAL FAILURES (teacher vs student tool match)"
+  report_title: "REFLECTION: teacher vs student tool sequences"
+  # Override module reflection prompts with modules.<KEY>.
+

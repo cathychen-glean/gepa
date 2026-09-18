@@ -6,6 +6,7 @@
 WRITING_CODE_KEY = "WRITING_CODE"
 FULL_PROMPT_KEY = "FULL_PROMPT"
 RULES_EXT_KEY = "RULES_EXT"
+EXECUTION_DISCIPLINE_KEY = "EXECUTION_DISCIPLINE"
 
 # Core-tool override keys match sanitize_identifier(name.lower()): glean_search,
 # not "Glean Search". An override replaces schema.description only
@@ -28,12 +29,21 @@ CORE_TOOLS_GROUP = "CORE_TOOLS"
 WRITING_CODE_TOKEN_BUDGET = 1024
 RULES_EXT_TOKEN_BUDGET = 128
 CORE_TOOL_TOKEN_BUDGET = 2048
+EXECUTION_DISCIPLINE_TOKEN_BUDGET = 512
 
 # --- Eval wiring ---
 TOOL_DESCRIPTION_OVERRIDES_PARAM = "co.pyagents_tool_description_overrides"
 
 # --- Stock module text ---
 DEFAULT_RULES_EXT = ""
+
+DEFAULT_EXECUTION_DISCIPLINE = """- Resolve the user's request in as few tool loops as possible while ensuring accuracy. Do not follow up for minor doubts. Use `ask_user_questions` when a missing shaping choice would materially change a content-creation or task-execution result — for example, the audience or tone of an email, the depth or format of a document, or which of several discovered targets (a project, account, or ticket) to act on.
+- Issue independent calls in parallel. For speculative searches toward one objective, cap at 2 diverse queries.
+- Do not chain tool calls to explore adjacent concepts unless explicitly requested. Stick to the core deliverable.
+- If a call fails or returns empty, try ONE materially different strategy. If that also fails, respond with partial context and a clear blocker statement.
+- For factual questions, always search first — don't rely solely on memorized knowledge.
+- Once your tool results answer the question, apply the citation instructions, perform a final citation check, and respond. Do not search solely for confirmation.
+- Only use skills when clearly relevant. Try direct reasoning before forcing a skill."""
 
 DEFAULT_WRITING_CODE = """All SDK functions are **asynchronous**; call them with `asyncio.run()`.
 A normal tool returns a **ToolResult**:
@@ -106,13 +116,7 @@ You operate in an agent loop. On each turn you either:
 <<<[[intermediary_updates_instructions]]>>>
 
 ### Execution Discipline
-- Resolve the user's request in as few tool loops as possible while ensuring accuracy. Do not follow up for minor doubts. Use `ask_user_questions` when a missing shaping choice would materially change a content-creation or task-execution result — for example, the audience or tone of an email, the depth or format of a document, or which of several discovered targets (a project, account, or ticket) to act on.
-- Issue independent calls in parallel. For speculative searches toward one objective, cap at 2 diverse queries.
-- Do not chain tool calls to explore adjacent concepts unless explicitly requested. Stick to the core deliverable.
-- If a call fails or returns empty, try ONE materially different strategy. If that also fails, respond with partial context and a clear blocker statement.
-- For factual questions, always search first — don't rely solely on memorized knowledge.
-- Once your tool results answer the question, apply the citation instructions, perform a final citation check, and respond. Do not search solely for confirmation.
-- Only use skills when clearly relevant. Try direct reasoning before forcing a skill.
+{EXECUTION_DISCIPLINE}
 
 <<<[[writing_quality_instructions]]>>>
 ## SDK Functions
@@ -317,6 +321,7 @@ PROMPT_MODULE_DEFAULTS = {
     WRITING_CODE_KEY: DEFAULT_WRITING_CODE,
     FULL_PROMPT_KEY: DEFAULT_FULL_PROMPT,
     RULES_EXT_KEY: DEFAULT_RULES_EXT,
+    EXECUTION_DISCIPLINE_KEY: DEFAULT_EXECUTION_DISCIPLINE,
     **CORE_TOOL_DESCRIPTIONS,
 }
 # Keys a seed file may override
@@ -325,5 +330,6 @@ EDITABLE_PROMPT_KEYS = KNOWN_PROMPT_KEYS - {FULL_PROMPT_KEY}
 MODULE_TOKEN_BUDGETS = {
     WRITING_CODE_KEY: WRITING_CODE_TOKEN_BUDGET,
     RULES_EXT_KEY: RULES_EXT_TOKEN_BUDGET,
+    EXECUTION_DISCIPLINE_KEY: EXECUTION_DISCIPLINE_TOKEN_BUDGET,
     **dict.fromkeys(CORE_TOOLS, CORE_TOOL_TOKEN_BUDGET),
 }
