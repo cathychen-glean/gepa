@@ -332,7 +332,7 @@ def test_finish_batch_evals_uses_tool_match_and_correctness():
         high_signal_entry_ids=("entry-1",),
     )
     adapter._analysis_cache[("teacher-1", "student-1")] = analysis
-    adapter._judge_cache[("student-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
+    adapter._judge_cache[("student-1", "teacher-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
         eval_id="student-1", aggregate=1.0, per_entry={"entry-1": 1.0}, judge_type=CORRECTNESS_JUDGE_TYPE
     )
     result = adapter._finish_batch_evals(
@@ -487,7 +487,7 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
         },
         high_signal_entry_ids=("entry-2",),
     )
-    adapter._judge_cache[("student-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
+    adapter._judge_cache[("student-1", "teacher-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
         eval_id="student-1",
         aggregate=1.0,
         # Per-entry scores differ from the aggregate, so the eval-set row must pick
@@ -709,6 +709,24 @@ def test_correctness_judge_runs_once_per_student_across_candidates():
     # One pairwise judge per student eval; the shared teacher is the baseline, not judged.
     assert len(judged_eval_ids) == 2
     assert len(set(judged_eval_ids)) == 2
+
+
+def test_pairwise_judge_cache_includes_the_teacher_baseline(tmp_path):
+    evalcli = MagicMock()
+    evalcli.find_judge_run_id.return_value = None
+    evalcli.create_judge_run.side_effect = lambda **kwargs: f"judge-{kwargs['base_eval_run_id']}"
+    cache_file = str(tmp_path / "adapter.json")
+    adapter = _teacher_student_adapter(evalcli, cache_file=cache_file, judge_correctness=True)
+    kwargs = {"judge_type": CORRECTNESS_JUDGE_TYPE, "run_params": "{}"}
+
+    assert adapter._ensure_judge("student-1", base_eval_run_id="teacher-1", **kwargs) == "judge-teacher-1"
+    assert adapter._ensure_judge("student-1", base_eval_run_id="teacher-2", **kwargs) == "judge-teacher-2"
+    assert evalcli.create_judge_run.call_count == 2
+    adapter._save_cache()
+
+    reloaded = _teacher_student_adapter(evalcli, cache_file=cache_file, judge_correctness=True)
+    assert reloaded._ensure_judge("student-1", base_eval_run_id="teacher-1", **kwargs) == "judge-teacher-1"
+    assert evalcli.create_judge_run.call_count == 2
 
 
 def test_high_signal_batch_keeps_every_first_tool_mismatch():

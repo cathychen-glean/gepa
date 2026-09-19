@@ -49,6 +49,22 @@ CORRECTNESS_JUDGE = PairwiseJudge(
 )
 POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = ()
 PAIRWISE_JUDGES: tuple[PairwiseJudge, ...] = ()
+_ANALYSIS_FIELDS = frozenset({"aggregate", "per_entry", "judge_run_id"})
+
+
+def _payloads_by_base(payload: Any) -> dict[str, Any]:
+    """Normalize cached judge payloads keyed by baseline eval id.
+
+    Older caches stored a run id or analysis dict directly under the judge type.
+    Pairwise results are nested ``{base_eval_id: payload}``; pointwise uses ``""``.
+    """
+    if isinstance(payload, str):
+        return {"": payload}
+    if not isinstance(payload, dict):
+        return {}
+    if _ANALYSIS_FIELDS & payload.keys():
+        return {"": payload}
+    return {str(base): inner for base, inner in payload.items()}
 
 
 def _entry_queries_from_listing(entries: Iterable[Mapping[str, Any]]) -> dict[str, str]:
@@ -134,8 +150,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
             lookback_days=agentspan_lookback_days,
         )
         self.telemetry_dimensions = self.objective.telemetry_dimensions
-        self._judge_runs: dict[tuple[str, str], str] = {}
-        self._judge_cache: dict[tuple[str, str], JudgeAnalysis] = {}
+        self._judge_runs: dict[tuple[str, str, str], str] = {}
+        self._judge_cache: dict[tuple[str, str, str], JudgeAnalysis] = {}
         self._entry_query_cache: dict[tuple[str, str], dict[str, str]] = {}
         super().__init__(
             runner=runner,
@@ -293,13 +309,17 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for judge in self.pointwise_judges:
                 self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
 
+    @staticmethod
+    def _judge_key(eval_id: str, judge_type: str, base_eval_run_id: str | None = None) -> tuple[str, str, str]:
+        return (eval_id, base_eval_run_id or "", judge_type)
+
     def _extra_cache_payload(self) -> dict[str, Any]:
-        judge_runs: dict[str, dict[str, str]] = {}
-        for (eval_id, judge_type), run_id in self._judge_runs.items():
-            judge_runs.setdefault(eval_id, {})[judge_type] = run_id
-        judge_cache: dict[str, dict[str, dict[str, Any]]] = {}
-        for (eval_id, judge_type), analysis in self._judge_cache.items():
-            judge_cache.setdefault(eval_id, {})[judge_type] = {
+        judge_runs: dict[str, dict[str, dict[str, str]]] = {}
+        for (eval_id, base_eval_id, judge_type), run_id in self._judge_runs.items():
+            judge_runs.setdefault(eval_id, {}).setdefault(judge_type, {})[base_eval_id] = run_id
+        judge_cache: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+        for (eval_id, base_eval_id, judge_type), analysis in self._judge_cache.items():
+            judge_cache.setdefault(eval_id, {}).setdefault(judge_type, {})[base_eval_id] = {
                 "aggregate": analysis.aggregate,
                 "per_entry": analysis.per_entry,
                 "judge_run_id": analysis.judge_run_id,
@@ -313,11 +333,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for eval_id, by_type in raw_runs.items():
                 if not isinstance(by_type, dict):
                     continue
-                for judge_type, run_id in by_type.items():
-                    self._judge_runs[(str(eval_id), str(judge_type))] = str(run_id)
+                for judge_type, payload in by_type.items():
+                    for base_eval_id, run_id in _payloads_by_base(payload).items():
+                        self._judge_runs[self._judge_key(str(eval_id), str(judge_type), base_eval_id)] = str(run_id)
         else:
             for eval_id, run_id in (data.get("completeness_judge_runs") or {}).items():
-                self._judge_runs[(str(eval_id), COMPLETENESS_JUDGE_TYPE)] = str(run_id)
+                self._judge_runs[self._judge_key(str(eval_id), COMPLETENESS_JUDGE_TYPE)] = str(run_id)
 
         raw_cache = data.get("judge_cache")
         if not isinstance(raw_cache, dict):
@@ -330,21 +351,24 @@ class TeacherStudentAdapter(GleanAdapterBase):
         for eval_id, by_type in raw_cache.items():
             if not isinstance(by_type, dict):
                 continue
-            for judge_type, raw in by_type.items():
-                if not isinstance(raw, dict):
-                    continue
-                per_entry = {str(entry_id): float(score) for entry_id, score in (raw.get("per_entry") or {}).items()}
-                aggregate_raw = raw.get("aggregate")
-                aggregate = 0.0 if aggregate_raw is None else float(aggregate_raw)
-                if per_entry and raw.get("aggregate") is None:
-                    aggregate = sum(per_entry.values()) / len(per_entry)
-                self._judge_cache[(str(eval_id), str(judge_type))] = JudgeAnalysis(
-                    eval_id=str(eval_id),
-                    aggregate=aggregate,
-                    per_entry=per_entry,
-                    judge_run_id=str(raw["judge_run_id"]) if raw.get("judge_run_id") else None,
-                    judge_type=str(judge_type),
-                )
+            for judge_type, payload in by_type.items():
+                for base_eval_id, raw in _payloads_by_base(payload).items():
+                    if not isinstance(raw, dict):
+                        continue
+                    per_entry = {
+                        str(entry_id): float(score) for entry_id, score in (raw.get("per_entry") or {}).items()
+                    }
+                    aggregate_raw = raw.get("aggregate")
+                    aggregate = 0.0 if aggregate_raw is None else float(aggregate_raw)
+                    if per_entry and raw.get("aggregate") is None:
+                        aggregate = sum(per_entry.values()) / len(per_entry)
+                    self._judge_cache[self._judge_key(str(eval_id), str(judge_type), base_eval_id)] = JudgeAnalysis(
+                        eval_id=str(eval_id),
+                        aggregate=aggregate,
+                        per_entry=per_entry,
+                        judge_run_id=str(raw["judge_run_id"]) if raw.get("judge_run_id") else None,
+                        judge_type=str(judge_type),
+                    )
 
     def _ensure_judge(
         self,
@@ -355,7 +379,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         base_eval_run_id: str | None = None,
         input_mappings: str | None = None,
     ) -> str:
-        cache_key = (eval_id, judge_type)
+        cache_key = self._judge_key(eval_id, judge_type, base_eval_run_id)
         judge_run_id = self._judge_runs.get(cache_key)
         if not judge_run_id:
             existing = self.runner.evalcli.find_judge_run_id(
@@ -383,10 +407,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _run_judges(self, started: list[_StartedPair]) -> None:
         """Trigger judges after evals finish; pairwise correctness uses the teacher as baseline."""
         pending: list[tuple[str, str, str, str | None]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for pair in started:
             for judge in self.pairwise_judges:
-                cache_key = (pair.student_eval_id, judge.judge_type)
+                cache_key = self._judge_key(pair.student_eval_id, judge.judge_type, pair.teacher_eval_id)
                 if cache_key in seen:
                     continue
                 seen.add(cache_key)
@@ -402,7 +426,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
                 for judge in self.pointwise_judges:
-                    cache_key = (eval_id, judge.judge_type)
+                    cache_key = self._judge_key(eval_id, judge.judge_type)
                     if cache_key in seen:
                         continue
                     seen.add(cache_key)
@@ -418,12 +442,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 judge_run_id=judge_run_id,
                 base_eval_id=base_eval_id,
             )
-            self._judge_cache[(eval_id, judge_type)] = analysis
+            self._judge_cache[self._judge_key(eval_id, judge_type, base_eval_id)] = analysis
         if pending:
             self._save_cache()
 
-    def _judge_for(self, eval_id: str, *, judge_type: str) -> JudgeAnalysis:
-        cached = self._judge_cache.get((eval_id, judge_type))
+    def _judge_for(self, eval_id: str, *, judge_type: str, base_eval_run_id: str | None = None) -> JudgeAnalysis:
+        cached = self._judge_cache.get(self._judge_key(eval_id, judge_type, base_eval_run_id))
         if cached is not None:
             return cached
         return JudgeAnalysis(eval_id=eval_id, aggregate=0.0, per_entry={}, judge_type=judge_type)
@@ -569,8 +593,18 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     self._entry_query_cache[cache_key] = cached
                 entry_queries = cached
             student_judges = {
-                judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
-                for judge in (*self.pointwise_judges, *self.pairwise_judges)
+                **{
+                    judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
+                    for judge in self.pointwise_judges
+                },
+                **{
+                    judge.name: self._judge_for(
+                        pair.student_eval_id,
+                        judge_type=judge.judge_type,
+                        base_eval_run_id=pair.teacher_eval_id,
+                    )
+                    for judge in self.pairwise_judges
+                },
             }
             for judge in self.pointwise_judges:
                 teacher_analysis = self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type)

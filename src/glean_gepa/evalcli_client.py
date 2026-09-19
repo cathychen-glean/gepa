@@ -600,7 +600,9 @@ class EvalCliClient:
                 last_exc = exc
                 if not _is_transient_evalcli_error(exc):
                     raise
-                existing = self._find_judge_run_id_after_create_error(eval_run_id, judge_type)
+                existing = self._find_judge_run_id_after_create_error(
+                    eval_run_id, judge_type, base_eval_run_id=base_eval_run_id
+                )
                 if existing:
                     print(f"[{judge_type}] Reusing judge run {existing} after create error for {eval_run_id}")
                     return existing
@@ -614,9 +616,11 @@ class EvalCliClient:
         assert last_exc is not None
         raise last_exc
 
-    def _find_judge_run_id_after_create_error(self, eval_run_id: str, judge_type: str) -> str | None:
+    def _find_judge_run_id_after_create_error(
+        self, eval_run_id: str, judge_type: str, *, base_eval_run_id: str | None = None
+    ) -> str | None:
         try:
-            return self.find_judge_run_id(eval_run_id, judge_type=judge_type)
+            return self.find_judge_run_id(eval_run_id, judge_type=judge_type, base_eval_run_id=base_eval_run_id)
         except EvalCliError:
             return None
 
