@@ -5,8 +5,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from glean_gepa.adapter_types import PointwiseJudge
-from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
 from glean_gepa.experiment_config import (
     ExperimentConfig,
     ExperimentConfigError,
@@ -47,35 +45,20 @@ def _mode_yaml(*, mode: str = "teacher_student", packs: str = "[tools]", signals
     return body
 
 
-def _packaged_teacher_student(*, enable_completeness: bool = False) -> str:
-    """The shipped teacher-student config with completeness weighted into the composite.
-
-    Weighting alone is half the re-enable path; `enable_completeness` supplies the
-    other half by clearing the judge's `enabled: false`.
-    """
-    body = resolve_config_path("teacher_student").read_text()
-    body = body.replace(
-        "  composite:\n    tool_alignment: 1.0", "  composite:\n    completeness: 0.5\n    tool_alignment: 0.5"
-    )
-    if enable_completeness:
-        body = body.replace("    enabled: false\n    run_params:\n      llm_model", "    run_params:\n      llm_model")
-    return body
-
-
 def _objective_yaml(snippet: str) -> str:
     return _mode_yaml() + f"objective:\n{snippet}"
 
 
-def test_completeness_can_be_switched_back_on(tmp_path):
-    """The documented re-enable path: flip `enabled` and add the composite weight."""
-    config = _load_mode(tmp_path, _packaged_teacher_student(enable_completeness=True))
-
-    # The signal name is what objective.composite weights, so it has to travel
-    # with the judge type the adapter uses to start the Cortex run.
-    assert pointwise_judges(config) == (
-        PointwiseJudge("completeness", COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS),
+def test_correctness_can_be_weighted_into_the_composite(tmp_path):
+    body = (
+        resolve_config_path("teacher_student")
+        .read_text()
+        .replace("  composite:\n    tool_alignment: 1.0", "  composite:\n    correctness: 0.5\n    tool_alignment: 0.5")
     )
-    assert composite_weights(config) == {"completeness": 0.5, "tool_alignment": 0.5}
+    config = _load_mode(tmp_path, body)
+
+    assert composite_weights(config) == {"correctness": 0.5, "tool_alignment": 0.5}
+    assert pointwise_judges(config) == ()
 
 
 def test_resolve_config_path_accepts_packaged_stem_and_file(tmp_path):
@@ -158,9 +141,9 @@ _INVALID_CONFIGS = {
         _objective_yaml(f"  primary: {SHELL_SUCCESS_OBJECTIVE}\n"),
     ),
     "unknown_focused_bucket": ("focused_bucket_type", _objective_yaml("  focused_bucket_type: NOT_A_BUCKET\n")),
-    "completeness_weighted_while_disabled": (
-        rf"completeness {_UNSCORABLE}",
-        _packaged_teacher_student(),
+    "correctness_weighted_while_disabled": (
+        rf"correctness {_UNSCORABLE}",
+        _mode_yaml(signals=f"{_PAIRWISE_CORRECTNESS}    enabled: false\n", composite="    correctness: 0.5\n"),
     ),
     "undeclared_name": (
         rf"typoed_signal {_UNDECLARED}",
@@ -169,10 +152,6 @@ _INVALID_CONFIGS = {
     "other_modes_signal": (
         rf"{SHELL_SUCCESS_OBJECTIVE} {_UNDECLARED}",
         _mode_yaml(composite=f"    {SHELL_SUCCESS_OBJECTIVE}: 0.5\n"),
-    ),
-    "pairwise_judge_has_no_per_entry_score": (
-        rf"correctness {_UNSCORABLE}",
-        _mode_yaml(signals=_PAIRWISE_CORRECTNESS, composite="    correctness: 0.5\n"),
     ),
     "disabled_judge": (
         rf"completeness {_UNSCORABLE}",

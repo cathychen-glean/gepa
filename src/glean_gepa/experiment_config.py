@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from glean_gepa.adapter_types import JudgingMode, PointwiseJudge
+from glean_gepa.adapter_types import JudgingMode, PairwiseJudge, PointwiseJudge
 from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
-from glean_gepa.judge_metrics_util import CUSTOMER_JUDGE_GATES
+from glean_gepa.judge_metrics_util import JUDGE_SPEC_NAMES, JUDGE_SPECS
 from glean_gepa.objectives import (
     MODE_DEFAULT_PACK,
     is_registered_telemetry_source,
@@ -31,7 +31,7 @@ SUPPORTED_MODES: tuple[JudgingMode, ...] = ("single_model", "teacher_student")
 _CONSTANT_SOURCE = "constant"
 
 # Only teacher_student has the judge plumbing to start, await, and cache a judge run.
-_MODES_WITH_POINTWISE_JUDGES = frozenset({"teacher_student"})
+_MODES_WITH_CORTEX_JUDGES = frozenset({"teacher_student"})
 
 _JUDGE_PARAM_KEYS = {
     "llm_model": "Llm model",
@@ -184,7 +184,22 @@ def evalset_identity(config: ExperimentConfig | None) -> tuple[str, list[str]]:
 
 
 def pointwise_judges(config: ExperimentConfig) -> tuple[PointwiseJudge, ...]:
-    return tuple(_pointwise_judges(list(config.signals)))
+    return tuple(
+        PointwiseJudge(str(signal["name"]), str(signal["type"]), judge_run_params_json(signal))
+        for signal in _enabled_cortex_judges(config.signals, "pointwise")
+    )
+
+
+def pairwise_judges(config: ExperimentConfig) -> tuple[PairwiseJudge, ...]:
+    return tuple(
+        PairwiseJudge(
+            str(signal["name"]),
+            str(signal["type"]),
+            judge_run_params_json(signal),
+            _pairwise_input_mappings(signal),
+        )
+        for signal in _enabled_cortex_judges(config.signals, "pairwise")
+    )
 
 
 def composite_weights(config: ExperimentConfig) -> dict[str, float]:
@@ -231,12 +246,12 @@ def _parse_customer_validation(raw: Any) -> dict[str, float]:
         if not isinstance(entry, Mapping) or "metric" not in entry:
             raise ExperimentConfigError("objective.validation entries must be mappings with a metric")
         metric = str(entry["metric"])
-        gate = CUSTOMER_JUDGE_GATES.get(metric)
-        if gate is None:
-            allowed = ", ".join(sorted(CUSTOMER_JUDGE_GATES))
+        spec = JUDGE_SPECS.get(metric)
+        if spec is None:
+            allowed = ", ".join(sorted(JUDGE_SPEC_NAMES))
             raise ExperimentConfigError(f"objective.validation metric must be one of {allowed}, got {metric!r}")
         if "min" not in entry:
-            gates[gate.name] = gate.default_min
+            gates[spec.name] = spec.default_min
             continue
         raw_min = entry["min"]
         if isinstance(raw_min, bool) or not isinstance(raw_min, int | float):
@@ -244,7 +259,7 @@ def _parse_customer_validation(raw: Any) -> dict[str, float]:
         floor = float(raw_min)
         if not 0.0 <= floor <= 1.0:
             raise ExperimentConfigError(f"objective.validation min for {metric} must be between 0 and 1, got {floor}")
-        gates[gate.name] = floor
+        gates[spec.name] = floor
     return gates
 
 
@@ -319,32 +334,47 @@ def _load_mode_packs(raw_packs: Any, *, mode: JudgingMode, mode_path: Path) -> t
     }
 
 
-def _pointwise_judges(signals: list[dict[str, Any]]) -> list[PointwiseJudge]:
-    """Pairwise signals are skipped: nothing scores them per entry."""
-    judges: list[PointwiseJudge] = []
+def _enabled_cortex_judges(signals: Sequence[Mapping[str, Any]], kind: str) -> list[Mapping[str, Any]]:
+    enabled: list[Mapping[str, Any]] = []
     for signal in signals:
-        if signal.get("source") != "cortex_judge" or signal.get("kind") != "pointwise":
+        if signal.get("source") != "cortex_judge" or signal.get("kind") != kind:
             continue
         # Before the enabled check, so flipping enabled on cannot surface a new error.
-        judge_type = signal.get("type")
-        if not judge_type:
-            raise ExperimentConfigError(f"pointwise cortex_judge signal {signal.get('name')!r} requires type")
+        if not signal.get("type"):
+            raise ExperimentConfigError(f"{kind} cortex_judge signal {signal.get('name')!r} requires type")
         if signal.get("enabled", True) is False:
             continue
-        judges.append(PointwiseJudge(str(signal["name"]), str(judge_type), judge_run_params_json(signal)))
-    return judges
+        enabled.append(signal)
+    return enabled
+
+
+def _pairwise_input_mappings(signal: Mapping[str, Any]) -> str:
+    raw = signal.get("input_mappings")
+    if raw is None:
+        judge_type = str(signal.get("type") or "")
+        matches = [spec for spec in JUDGE_SPECS.values() if spec.kind == "pairwise" and spec.judge_type == judge_type]
+        if len(matches) != 1:
+            raise ExperimentConfigError(f"pairwise cortex_judge signal {signal.get('name')!r} requires input_mappings")
+        return matches[0].input_mappings
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list | Mapping):
+        return json.dumps(raw)
+    raise ExperimentConfigError(
+        f"pairwise cortex_judge signal {signal.get('name')!r} input_mappings must be a mapping or list"
+    )
 
 
 def _scorable_signal_names(signals: list[dict[str, Any]], *, mode: JudgingMode) -> set[str]:
     """Signals the mode's adapter can turn into a composite dimension.
 
-    Everything else -- pairwise judges, disabled signals, judges in a mode with no
-    judge plumbing -- is collected for reporting or future use but never produces a
-    per-entry score.
+    Everything else -- disabled signals, judges in a mode with no judge plumbing --
+    is collected for reporting or future use but never produces a per-entry score.
     """
     names: set[str] = set()
-    if mode in _MODES_WITH_POINTWISE_JUDGES:
-        names.update(str(judge.name) for judge in _pointwise_judges(signals))
+    if mode in _MODES_WITH_CORTEX_JUDGES:
+        for kind in ("pointwise", "pairwise"):
+            names.update(str(signal["name"]) for signal in _enabled_cortex_judges(signals, kind))
     for signal in signals:
         if signal.get("enabled", True) is False:
             continue

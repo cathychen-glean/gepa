@@ -234,7 +234,7 @@ def test_tool_match_queries_and_fetch():
         {
             "data": {"eval_set_name": "set"},
             "score": 0.0,
-            "objective_scores": {"tool_alignment": 0.0, "completeness": 0.5},
+            "objective_scores": {"tool_alignment": 0.0, "correctness": 0.5},
             "output": output,
         },
         {},
@@ -372,24 +372,24 @@ def test_rules_ext_reflects_on_its_own_ranking_of_non_core_mismatches():
     assert [entry["entry_id"] for entry in core] == [f"core-{i}" for i in range(5)]
 
 
-def test_unscored_completeness_is_omitted_rather_than_reported_as_zero():
-    """The completeness judge ships disabled, so its score is absent, not 0.0."""
+def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
+    """Correctness vs the teacher is absent until the pairwise judge has scored."""
     objective = FirstToolMatchObjective()
 
     absent = _reflective_example(objective, {"tool_alignment": 0.0})
-    assert "completeness" not in absent["Metrics"]
-    assert "Completeness" not in absent["Feedback"]
+    assert "correctness" not in absent["Metrics"]
+    assert "Correctness" not in absent["Feedback"]
     assert objective.format_reflective_metrics(absent["Metrics"]) == "score=0.00, tool_alignment=0.00"
 
     # A real low score still reports, and a real passing score stays silent.
-    scored = _reflective_example(objective, {"tool_alignment": 0.0, "completeness": 0.5})
-    assert scored["Metrics"]["completeness"] == 0.5
-    assert "Completeness issue: score=0.50." in scored["Feedback"]
-    assert objective.format_reflective_metrics(scored["Metrics"]).endswith("completeness=0.50")
+    scored = _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.5})
+    assert scored["Metrics"]["correctness"] == 0.5
+    assert "Correctness issue: score=0.50." in scored["Feedback"]
+    assert objective.format_reflective_metrics(scored["Metrics"]).endswith("correctness=0.50")
 
-    passing = _reflective_example(objective, {"tool_alignment": 0.0, "completeness": 0.9})
-    assert "Completeness" not in passing["Feedback"]
-    assert passing["Metrics"]["completeness"] == 0.9
+    passing = _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.9})
+    assert "Correctness" not in passing["Feedback"]
+    assert passing["Metrics"]["correctness"] == 0.9
 
 
 def test_aggregate_and_empty_analysis():

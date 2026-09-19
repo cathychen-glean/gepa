@@ -11,6 +11,7 @@ from glean_gepa.adapter_types import (
     ALDataInst,
     ALRolloutOutput,
     ALTrajectory,
+    PairwiseJudge,
     PointwiseJudge,
     TeacherStudentALDataInst,
     TeacherStudentALRolloutOutput,
@@ -23,7 +24,12 @@ from glean_gepa.al_adapter import (
     Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS
+from glean_gepa.evalcli_client import (
+    COMPLETENESS_JUDGE_TYPE,
+    CORRECTNESS_INPUT_MAPPINGS,
+    CORRECTNESS_JUDGE_TYPE,
+    CORRECTNESS_RUN_PARAMS,
+)
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
@@ -34,10 +40,15 @@ from glean_gepa.objectives.tool_match import FirstToolMatchObjective
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
-COMPLETENESS_DIMENSION = "completeness"
-# Declared but shipped disabled in configs/teacher_student.yaml.
-COMPLETENESS_JUDGE = PointwiseJudge(COMPLETENESS_DIMENSION, COMPLETENESS_JUDGE_TYPE, COMPLETENESS_RUN_PARAMS)
+CORRECTNESS_DIMENSION = "correctness"
+CORRECTNESS_JUDGE = PairwiseJudge(
+    CORRECTNESS_DIMENSION,
+    CORRECTNESS_JUDGE_TYPE,
+    CORRECTNESS_RUN_PARAMS,
+    CORRECTNESS_INPUT_MAPPINGS,
+)
 POINTWISE_JUDGES: tuple[PointwiseJudge, ...] = ()
+PAIRWISE_JUDGES: tuple[PairwiseJudge, ...] = ()
 
 
 def _entry_queries_from_listing(entries: Iterable[Mapping[str, Any]]) -> dict[str, str]:
@@ -110,9 +121,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
         composite_weights: dict[str, float] | None = None,
         constant_scores: dict[str, float] | None = None,
         pointwise_judges: Sequence[PointwiseJudge] | None = None,
+        pairwise_judges: Sequence[PairwiseJudge] | None = None,
         objective: TeacherStudentObjective | None = None,
     ):
         self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
+        self.pairwise_judges = tuple(pairwise_judges) if pairwise_judges is not None else PAIRWISE_JUDGES
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
@@ -139,7 +152,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
             editable_modules=list(editable_modules) if editable_modules else [WRITING_CODE_KEY],
             composite_weights=dict({self.objective.name: 1.0} if composite_weights is None else composite_weights),
             constant_scores=dict(constant_scores or {}),
-            extra_scorable_dimensions={judge.name for judge in self.pointwise_judges},
+            extra_scorable_dimensions={
+                *(judge.name for judge in self.pointwise_judges),
+                *(judge.name for judge in self.pairwise_judges),
+            },
             cache_file=cache_file,
         )
 
@@ -330,11 +346,21 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     judge_type=str(judge_type),
                 )
 
-    def _ensure_judge(self, eval_id: str, *, judge_type: str, run_params: str) -> str:
+    def _ensure_judge(
+        self,
+        eval_id: str,
+        *,
+        judge_type: str,
+        run_params: str,
+        base_eval_run_id: str | None = None,
+        input_mappings: str | None = None,
+    ) -> str:
         cache_key = (eval_id, judge_type)
         judge_run_id = self._judge_runs.get(cache_key)
         if not judge_run_id:
-            existing = self.runner.evalcli.find_judge_run_id(eval_id, judge_type=judge_type)
+            existing = self.runner.evalcli.find_judge_run_id(
+                eval_id, judge_type=judge_type, base_eval_run_id=base_eval_run_id
+            )
             if isinstance(existing, str) and existing:
                 print(f"[{judge_type}] Reusing judge run {existing} for eval {eval_id}")
                 judge_run_id = existing
@@ -343,6 +369,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     eval_run_id=eval_id,
                     judge_type=judge_type,
                     run_params=run_params,
+                    base_eval_run_id=base_eval_run_id,
+                    input_mappings=input_mappings,
                 )
                 if not isinstance(judge_run_id, str) or not judge_run_id:
                     raise TypeError(f"{judge_type} judge create for {eval_id} returned {judge_run_id!r}")
@@ -353,10 +381,25 @@ class TeacherStudentAdapter(GleanAdapterBase):
         return judge_run_id
 
     def _run_judges(self, started: list[_StartedPair]) -> None:
-        """Trigger pointwise judges after evals finish; reuse cached teacher/seed runs."""
-        pending: list[tuple[str, str, str]] = []
+        """Trigger judges after evals finish; pairwise correctness uses the teacher as baseline."""
+        pending: list[tuple[str, str, str, str | None]] = []
         seen: set[tuple[str, str]] = set()
         for pair in started:
+            for judge in self.pairwise_judges:
+                cache_key = (pair.student_eval_id, judge.judge_type)
+                if cache_key in seen:
+                    continue
+                seen.add(cache_key)
+                if cache_key in self._judge_cache:
+                    continue
+                judge_run_id = self._ensure_judge(
+                    pair.student_eval_id,
+                    judge_type=judge.judge_type,
+                    run_params=judge.run_params,
+                    base_eval_run_id=pair.teacher_eval_id,
+                    input_mappings=judge.input_mappings,
+                )
+                pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
                 for judge in self.pointwise_judges:
                     cache_key = (eval_id, judge.judge_type)
@@ -366,13 +409,14 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     if cache_key in self._judge_cache:
                         continue
                     judge_run_id = self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
-                    pending.append((eval_id, judge.judge_type, judge_run_id))
-        for eval_id, judge_type, judge_run_id in pending:
+                    pending.append((eval_id, judge.judge_type, judge_run_id, None))
+        for eval_id, judge_type, judge_run_id, base_eval_id in pending:
             analysis = wait_for_judge_metrics(
                 self.runner.evalcli,
                 eval_id=eval_id,
                 judge_type=judge_type,
                 judge_run_id=judge_run_id,
+                base_eval_id=base_eval_id,
             )
             self._judge_cache[(eval_id, judge_type)] = analysis
         if pending:
@@ -526,7 +570,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 entry_queries = cached
             student_judges = {
                 judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
-                for judge in self.pointwise_judges
+                for judge in (*self.pointwise_judges, *self.pairwise_judges)
             }
             for judge in self.pointwise_judges:
                 teacher_analysis = self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type)
@@ -534,6 +578,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     f"[{judge.judge_type}] student {pair.student_eval_id}="
                     f"{student_judges[judge.name].aggregate:.2f} "
                     f"teacher {pair.teacher_eval_id}={teacher_analysis.aggregate:.2f}"
+                )
+            for judge in self.pairwise_judges:
+                print(
+                    f"[{judge.judge_type}] student {pair.student_eval_id} vs teacher "
+                    f"{pair.teacher_eval_id}={student_judges[judge.name].aggregate:.2f}"
                 )
 
             scored_rows = self.objective.scored_rows(
@@ -585,7 +634,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 summary[dim] = sum(values) / len(values) if values else 0.0
         if focused_alignment_rates:
             if summary is None:
-                summary = {judge.name: 0.0 for judge in self.pointwise_judges}
+                summary = {judge.name: 0.0 for judge in (*self.pointwise_judges, *self.pairwise_judges)}
                 summary.update(self.constant_scores)
             summary[self.objective.name] = sum(focused_alignment_rates) / len(focused_alignment_rates)
         if summary is not None and started:
