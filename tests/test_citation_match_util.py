@@ -189,7 +189,7 @@ def test_citation_match_objective_scores_and_flags_mismatches():
         {
             "data": {"eval_set_name": "set"},
             "score": 0.0,
-            "objective_scores": {"citation_match": 0.0, "completeness": 0.5},
+            "objective_scores": {"citation_match": 0.0, "correctness": 0.5},
             "output": by_entry["e1"].output,
         },
         {},

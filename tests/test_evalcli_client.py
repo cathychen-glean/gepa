@@ -358,24 +358,45 @@ def test_create_judge_run_retries_opaque_error():
     sleep.assert_called_once()
 
 
-def test_create_judge_run_reuses_existing_after_opaque_create_error():
+@pytest.mark.parametrize(
+    ("create_kwargs", "listing", "expected"),
+    [
+        (
+            {"judge_type": COMPLETENESS_JUDGE_TYPE, "run_params": COMPLETENESS_RUN_PARAMS},
+            {"judgeRuns": [{"id": "judge-existing", "config": {"judgeType": "COMPLETENESS"}}]},
+            "judge-existing",
+        ),
+        (
+            {
+                "judge_type": CORRECTNESS_JUDGE_TYPE,
+                "run_params": CORRECTNESS_RUN_PARAMS,
+                "base_eval_run_id": "teacher-run",
+            },
+            {
+                "judgeRuns": [
+                    {"id": "judge-old-teacher", "evalRunId": "student-run", "n": "other-teacher"},
+                    {"id": "judge-wanted", "evalRunId": "student-run", "n": "teacher-run"},
+                ]
+            },
+            "judge-wanted",
+        ),
+    ],
+    ids=["pointwise", "pairwise_baseline"],
+)
+def test_create_judge_run_reuses_existing_after_opaque_create_error(create_kwargs, listing, expected):
     client = EvalCliClient(binary="/fake/evalcli")
 
     def invoke(*args):
         if args[:2] == ("judge", "create"):
             raise OPAQUE_EVALCLI_ERROR
         if args[:2] == ("judge", "list"):
-            return {"judgeRuns": [{"id": "judge-existing", "config": {"judgeType": "COMPLETENESS"}}]}
+            return listing
         raise AssertionError(args)
 
     with patch.object(client, "_invoke_json", side_effect=invoke):
-        judge_id = client.create_judge_run(
-            eval_run_id="student-run",
-            judge_type=COMPLETENESS_JUDGE_TYPE,
-            run_params=COMPLETENESS_RUN_PARAMS,
-        )
+        judge_id = client.create_judge_run(eval_run_id="student-run", **create_kwargs)
 
-    assert judge_id == "judge-existing"
+    assert judge_id == expected
 
 
 def test_create_judge_run_raises_on_non_transient_errors():

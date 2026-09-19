@@ -11,6 +11,7 @@ from glean_gepa.adapter_types import (
 )
 from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
+from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
 from glean_gepa.objectives.utils.citation_match_util import (
     CITATION_MATCH_OBJECTIVE,
@@ -186,7 +187,7 @@ class CitationMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         citation_match = objective_scores.get(self.name, trajectory["score"])
-        completeness = objective_scores.get("completeness")
+        correctness = objective_scores.get("correctness")
         student_citations = list(output.get("student_citations") or [])
         teacher_citations = list(output.get("teacher_citations") or [])
         mismatch = self._mismatch_key(output)
@@ -196,8 +197,8 @@ class CitationMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"Citation-set mismatch: {missing}; {extra}.")
         if citation_match < 1.0:
             feedback_parts.append(f"Citation match issue: score={citation_match:.2f}.")
-        if completeness is not None and completeness < 0.7:
-            feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
+        if correctness is not None and correctness < JUDGE_SPECS["correctness"].default_min:
+            feedback_parts.append(f"Correctness issue: score={correctness:.2f}.")
 
         inputs: ReflectiveExampleInputs = {
             "eval_set": trajectory["data"]["eval_set_name"],
@@ -212,8 +213,8 @@ class CitationMatchObjective(TeacherStudentObjective):
             "score": trajectory["score"],
             "citation_match": citation_match,
         }
-        if completeness is not None:
-            metrics["completeness"] = completeness
+        if correctness is not None:
+            metrics["correctness"] = correctness
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -235,9 +236,9 @@ class CitationMatchObjective(TeacherStudentObjective):
             f"score={metrics['score']:.2f}",
             f"citation_match={metrics.get('citation_match', metrics['score']):.2f}",
         ]
-        completeness = metrics.get("completeness")
-        if completeness is not None:
-            parts.append(f"completeness={completeness:.2f}")
+        correctness = metrics.get("correctness")
+        if correctness is not None:
+            parts.append(f"correctness={correctness:.2f}")
         return ", ".join(parts)
 
 

@@ -38,13 +38,14 @@ from glean_gepa.experiment_config import (
     evalset_identity,
     experiment_objective_pack,
     load_experiment_config,
+    pairwise_judges,
     pointwise_judges,
     resolve_config_path,
     runner_arg_defaults,
     screening_threshold,
 )
 from glean_gepa.fake_flow import build_fake_flow_components
-from glean_gepa.judge_metrics_util import CUSTOMER_JUDGE_GATES
+from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.utils.shell_tool_error_util import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
@@ -503,9 +504,7 @@ def _unwrap_additional_properties(value: object) -> object:
 # Keys that name a category themselves. Rows nested under any other key are dropped
 # unless an ancestor carried an explicit "category" field.
 _SYSTEM_METRIC_CATEGORIES = frozenset({"COST", "LOOP_COUNT_PERCENTILE", "TOOL_INVOCATION_RATE"})
-_CATEGORY_KEYS = _SYSTEM_METRIC_CATEGORIES | {
-    alias for gate in CUSTOMER_JUDGE_GATES.values() for alias in gate.category_aliases
-}
+_CATEGORY_KEYS = _SYSTEM_METRIC_CATEGORIES | {alias for spec in JUDGE_SPECS.values() for alias in spec.category_aliases}
 
 
 def _metric_rows(value: object, *, category: str | None = None) -> list[tuple[str, dict[str, Any]]]:
@@ -587,16 +586,16 @@ def _verify_customer_eval_metrics(
 
     judge_lines: list[str] = []
     for name, floor in resolved_gates.items():
-        gate = CUSTOMER_JUDGE_GATES[name]
-        rows = [row for category, row in judge_rows if gate.matches_row(category, row)]
+        spec = JUDGE_SPECS[name]
+        rows = [row for category, row in judge_rows if spec.matches_row(category, row)]
         if not rows:
-            raise SystemExit(f"Customer eval metrics did not include {gate.metrics_label}.")
-        score = _number(rows[0], *gate.score_keys)
+            raise SystemExit(f"Customer eval metrics did not include {spec.metrics_label}.")
+        score = _number(rows[0], *spec.score_keys)
         if score is None:
-            raise SystemExit(f"Customer eval {gate.score_source} did not include an optimized-run score.")
-        if failure := gate.failure_message(score, floor):
+            raise SystemExit(f"Customer eval {spec.score_source} did not include an optimized-run score.")
+        if failure := spec.failure_message(score, floor):
             failures.append(failure)
-        judge_lines.append(gate.report_line(score, floor))
+        judge_lines.append(spec.report_line(score, floor))
 
     status = "PASS" if not failures else "FAIL"
     report = "\n".join([f"status={status}", *judge_lines, *guardrail_lines])
@@ -657,19 +656,19 @@ def _validate_best_candidate_on_customer_eval(
         wait_ids: list[str] = []
         started_types: set[str] = set()
         for name in gates:
-            gate = CUSTOMER_JUDGE_GATES[name]
-            if gate.judge_type in started_types:
+            spec = JUDGE_SPECS[name]
+            if spec.judge_type in started_types:
                 continue
-            started_types.add(gate.judge_type)
+            started_types.add(spec.judge_type)
             judge_run_id = runner.ensure_judge_run(
                 eval_run_id=best_eval_id,
-                judge_type=gate.judge_type,
-                run_params=gate.run_params,
-                base_eval_run_id=baseline_eval_id,
-                input_mappings=gate.input_mappings,
+                judge_type=spec.judge_type,
+                run_params=spec.run_params,
+                base_eval_run_id=baseline_eval_id if spec.kind == "pairwise" else None,
+                input_mappings=spec.input_mappings or None,
             )
             wait_ids.append(judge_run_id)
-            judge_run_details.append(f"{gate.name}_judge_run_id={judge_run_id}")
+            judge_run_details.append(f"{spec.name}_judge_run_id={judge_run_id}")
         for wait_id in wait_ids:
             evalcli.wait_for_judge_run(wait_id, eval_run_id=best_eval_id)
         metrics = evalcli.compare_eval_metrics(best_eval_id, baseline_eval_id)
@@ -916,6 +915,7 @@ def _build_adapter(
     if judging_mode == "teacher_student":
         if experiment is not None:
             kwargs["pointwise_judges"] = pointwise_judges(experiment)
+            kwargs["pairwise_judges"] = pairwise_judges(experiment)
         return TeacherStudentAdapter(**kwargs, teacher_model=args.teacher_model)
     return SingleModelAdapter(**kwargs)
 

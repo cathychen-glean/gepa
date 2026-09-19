@@ -10,8 +10,7 @@ mode: teacher_student
 packs: [tools] # or [citations]
 
 run:
-  dir: run_ts
-  # dir: run_ts_citations
+  dir: run_ts # or dir: run_ts_citations
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
   seed_candidate: data/seed_candidate.json
@@ -29,20 +28,10 @@ data:
   val_version_count: 2
 
 signals:
-  - name: completeness
-    source: cortex_judge
-    type: COMPLETENESS
-    kind: pointwise
-    enabled: false
-    run_params:
-      llm_model: default
-      use_cache: true
-
   - name: correctness
     source: cortex_judge
     type: CORRECTNESS
     kind: pairwise
-    enabled: false
     run_params:
       judge_type: DIRECT_CORRECTNESS
       llm_model: default
@@ -50,8 +39,6 @@ signals:
 
 objective:
   frontier_type: hybrid
-  # The blend to use if the completeness judge is re-enabled:
-  #   composite: {completeness: 0.5, tool_alignment: 0.5}
   composite:
     tool_alignment: 1.0 # or citation_match: 1.0
   validation:
@@ -65,6 +52,5 @@ search:
   # Set to `all` to reflect on every available example.
   reflection_samples: 8
   reflection_hamming_distance_k: null
-  # Total prompt-token ceiling a mutated candidate may reach. Raised at startup to
-  # fit the per-module budgets, so a value below those cannot starve a module.
+  # Total prompt-token ceiling a mutated candidate may reach.
   global_token_cap: 4096

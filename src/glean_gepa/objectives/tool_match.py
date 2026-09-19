@@ -11,6 +11,7 @@ from glean_gepa.adapter_types import (
 )
 from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
+from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
@@ -235,7 +236,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         tool_alignment = objective_scores.get(self.name, trajectory["score"])
-        completeness = objective_scores.get("completeness")
+        correctness = objective_scores.get("correctness")
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
         mismatch = self._mismatch_key(output)
@@ -251,8 +252,8 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"First-tool mismatch: teacher {teacher_phrase} and student {student_phrase}.")
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
-        if completeness is not None and completeness < 0.7:
-            feedback_parts.append(f"Completeness issue: score={completeness:.2f}.")
+        if correctness is not None and correctness < JUDGE_SPECS["correctness"].default_min:
+            feedback_parts.append(f"Correctness issue: score={correctness:.2f}.")
 
         inputs: ReflectiveExampleInputs = {
             "eval_set": trajectory["data"]["eval_set_name"],
@@ -264,8 +265,8 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             "score": trajectory["score"],
             "tool_alignment": tool_alignment,
         }
-        if completeness is not None:
-            metrics["completeness"] = completeness
+        if correctness is not None:
+            metrics["correctness"] = correctness
         action_inputs: list[str] = []
         for role in ("teacher", "student"):
             pair = output.get(f"{role}_first_tool_input")
@@ -295,9 +296,9 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             f"score={metrics['score']:.2f}",
             f"tool_alignment={metrics.get('tool_alignment', metrics['score']):.2f}",
         ]
-        completeness = metrics.get("completeness")
-        if completeness is not None:
-            parts.append(f"completeness={completeness:.2f}")
+        correctness = metrics.get("correctness")
+        if correctness is not None:
+            parts.append(f"correctness={correctness:.2f}")
         return ", ".join(parts)
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:

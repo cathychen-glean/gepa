@@ -7,7 +7,7 @@ import pytest
 
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.evalcli_client import COMPLETENESS_JUDGE_TYPE
+from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
 from glean_gepa.objectives.utils.tool_match_util import (
     SKIPPED_TOOL_NAMES,
@@ -19,12 +19,12 @@ from glean_gepa.objectives.utils.tool_match_util import (
 )
 from glean_gepa.prompt_constants import RULES_EXT_KEY
 from glean_gepa.teacher_student_adapter import (
-    COMPLETENESS_DIMENSION,
-    COMPLETENESS_JUDGE,
+    CORRECTNESS_DIMENSION,
+    CORRECTNESS_JUDGE,
     TeacherStudentAdapter,
-    _StartedPair,
     _entry_queries_from_listing,
     _fetch_entry_queries,
+    _StartedPair,
 )
 
 EVAL_SET = {
@@ -50,21 +50,21 @@ def _evalcli_with_ordered_events(events: list[str]) -> MagicMock:
     evalcli.wait_for_eval_run.side_effect = wait_for_eval_run
     evalcli.find_judge_run_id.return_value = None
     evalcli.create_judge_run.side_effect = lambda **kwargs: f"judge-{kwargs['eval_run_id']}"
-    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"COMPLETENESS": {"passRate": 0.0}}}
+    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"CORRECTNESS": {"passRate": 0.0}}}
     return evalcli
 
 
 def _teacher_student_adapter(
-    evalcli: MagicMock, cache_file: str | None = None, *, judge_completeness: bool = False
+    evalcli: MagicMock, cache_file: str | None = None, *, judge_correctness: bool = False
 ) -> TeacherStudentAdapter:
-    """Shipped defaults are tool_alignment only; judge-path tests opt into the
-    completeness blend that configs/teacher_student.yaml documents."""
+    """Shipped evaluate tests stay on tool_alignment; judge-path tests opt into
+    correctness vs the teacher."""
     judge_kwargs = (
         {
-            "pointwise_judges": [COMPLETENESS_JUDGE],
-            "composite_weights": {COMPLETENESS_DIMENSION: 0.5, TOOL_ALIGNMENT_OBJECTIVE: 0.5},
+            "pairwise_judges": [CORRECTNESS_JUDGE],
+            "composite_weights": {CORRECTNESS_DIMENSION: 0.5, TOOL_ALIGNMENT_OBJECTIVE: 0.5},
         }
-        if judge_completeness
+        if judge_correctness
         else {}
     )
     return TeacherStudentAdapter(
@@ -307,8 +307,8 @@ def test_validation_only_skips_action_input_evalcli():
     )
 
 
-def test_finish_batch_evals_uses_tool_match_and_completeness():
-    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
+def test_finish_batch_evals_uses_tool_match_and_correctness():
+    adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     analysis = EvalRunToolMatchAnalysis(
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
@@ -332,11 +332,8 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
         high_signal_entry_ids=("entry-1",),
     )
     adapter._analysis_cache[("teacher-1", "student-1")] = analysis
-    adapter._judge_cache[("student-1", COMPLETENESS_JUDGE_TYPE)] = JudgeAnalysis(
-        eval_id="student-1", aggregate=1.0, per_entry={"entry-1": 1.0}, judge_type=COMPLETENESS_JUDGE_TYPE
-    )
-    adapter._judge_cache[("teacher-1", COMPLETENESS_JUDGE_TYPE)] = JudgeAnalysis(
-        eval_id="teacher-1", aggregate=0.9, per_entry={"entry-1": 0.9}, judge_type=COMPLETENESS_JUDGE_TYPE
+    adapter._judge_cache[("student-1", "teacher-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
+        eval_id="student-1", aggregate=1.0, per_entry={"entry-1": 1.0}, judge_type=CORRECTNESS_JUDGE_TYPE
     )
     result = adapter._finish_batch_evals(
         [
@@ -350,13 +347,12 @@ def test_finish_batch_evals_uses_tool_match_and_completeness():
     )
 
     assert result.scores == pytest.approx([0.5])
-    assert result.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.0}]
+    assert result.objective_scores == [{"correctness": 1.0, "tool_alignment": 0.0}]
     assert result.outputs[0]["student_tool_events"] == ["search"]
     assert result.outputs[0]["teacher_tool_events"] == ["read"]
     assert result.summary == {
-        "completeness": 1.0,
+        "correctness": 1.0,
         "tool_alignment": 0.0,
-        "teacher_completeness": 0.9,
     }
     assert result.trajectories is not None
     assert result.trajectories[0]["score"] == pytest.approx(0.5)
@@ -466,7 +462,7 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
     ``strict=False``, so entry-level rows would record an arbitrary entry's 0/1
     outcome as the whole eval set's validation score.
     """
-    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
+    adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     adapter._analysis_cache[("teacher-1", "student-1")] = EvalRunToolMatchAnalysis(
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
@@ -491,21 +487,20 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
         },
         high_signal_entry_ids=("entry-2",),
     )
-    for eval_id, aggregate in (("student-1", 1.0), ("teacher-1", 0.9)):
+    adapter._judge_cache[("student-1", "teacher-1", CORRECTNESS_JUDGE_TYPE)] = JudgeAnalysis(
+        eval_id="student-1",
+        aggregate=1.0,
         # Per-entry scores differ from the aggregate, so the eval-set row must pick
         # the aggregate rather than fall through to it on a missed lookup.
-        adapter._judge_cache[(eval_id, COMPLETENESS_JUDGE_TYPE)] = JudgeAnalysis(
-            eval_id=eval_id,
-            aggregate=aggregate,
-            per_entry={"entry-1": 0.2, "entry-2": 0.3},
-            judge_type=COMPLETENESS_JUDGE_TYPE,
-        )
+        per_entry={"entry-1": 0.2, "entry-2": 0.3},
+        judge_type=CORRECTNESS_JUDGE_TYPE,
+    )
     started = [_StartedPair(al_data_inst=EVAL_SET, teacher_eval_id="teacher-1", student_eval_id="student-1")]
 
     validation = adapter._finish_batch_evals(started, capture_traces=False)
 
     assert len(validation.scores) == len(started)
-    assert validation.objective_scores == [{"completeness": 1.0, "tool_alignment": 0.75}]
+    assert validation.objective_scores == [{"correctness": 1.0, "tool_alignment": 0.75}]
     assert validation.scores == pytest.approx([0.5 * 1.0 + 0.5 * 0.75])
     assert validation.outputs[0]["entry_id"] == f"{EVAL_SET['eval_set_name']}:{EVAL_SET['eval_set_version']}"
 
@@ -588,7 +583,7 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
 
 
 def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
-    adapter = _teacher_student_adapter(MagicMock(), judge_completeness=True)
+    adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
     result = adapter._finish_batch_evals(
         [
@@ -603,9 +598,8 @@ def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
 
     assert result.outputs == []
     assert result.summary == {
-        "completeness": 0.0,
+        "correctness": 0.0,
         "tool_alignment": 0.0,
-        "teacher_completeness": 0.0,
     }
 
 
@@ -657,24 +651,23 @@ def test_in_flight_eval_ids_resume_wait_instead_of_recreating():
     assert adapter.runner._in_flight == {}
 
 
-def _stub_completeness_judge(evalcli: MagicMock, events: list[str], *, score: float = 0.8) -> None:
+def _stub_correctness_judge(evalcli: MagicMock, events: list[str], *, score: float = 0.8) -> None:
     evalcli.find_judge_run_id.return_value = None
 
-    def create_completeness(**kwargs):
+    def create_correctness(**kwargs):
         eval_run_id = kwargs["eval_run_id"]
-        judge_id = f"judge-{eval_run_id}"
-        events.append(f"judge-create:{eval_run_id}")
-        return judge_id
+        events.append(f"judge-create:{eval_run_id}:base={kwargs.get('base_eval_run_id')}")
+        return f"judge-{eval_run_id}"
 
-    evalcli.create_judge_run.side_effect = create_completeness
-    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"COMPLETENESS": {"passRate": score}}}
+    evalcli.create_judge_run.side_effect = create_correctness
+    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"CORRECTNESS": {"passRate": score}}}
 
 
-def test_completeness_judges_run_for_teacher_and_student_after_evals():
+def test_correctness_judge_scores_the_student_against_the_teacher():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
-    _stub_completeness_judge(evalcli, events)
-    adapter = _teacher_student_adapter(evalcli, judge_completeness=True)
+    _stub_correctness_judge(evalcli, events)
+    adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
 
     with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
         result = adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
@@ -683,22 +676,27 @@ def test_completeness_judges_run_for_teacher_and_student_after_evals():
     wait_idxs = [i for i, event in enumerate(events) if event.startswith("wait:")]
     assert max(create_idxs) < min(wait_idxs)
     eval_run_ids = [event.split(":", 1)[1] for event in events if event.startswith("create:")]
-    judged_eval_ids = [event.split(":", 1)[1] for event in events if event.startswith("judge-create:")]
-    assert sorted(judged_eval_ids) == sorted(eval_run_ids)
-    for eval_id in eval_run_ids:
-        assert events.index(f"wait:{eval_id}") < events.index(f"judge-create:{eval_id}")
+    judge_creates = [event for event in events if event.startswith("judge-create:")]
+    assert len(judge_creates) == 1
+    assert events.index(f"wait:{eval_run_ids[0]}") < events.index(judge_creates[0])
+    assert events.index(f"wait:{eval_run_ids[1]}") < events.index(judge_creates[0])
+    create_kwargs = evalcli.create_judge_run.call_args.kwargs
+    assert create_kwargs["eval_run_id"] != create_kwargs["base_eval_run_id"]
+    assert create_kwargs["judge_type"] == CORRECTNESS_JUDGE_TYPE
+    assert create_kwargs["base_eval_run_id"] in eval_run_ids
+    assert create_kwargs["eval_run_id"] in eval_run_ids
     assert result.summary is not None
-    assert result.summary["completeness"] == pytest.approx(0.8)
-    assert result.summary["teacher_completeness"] == pytest.approx(0.8)
-    assert result.objective_scores[0]["completeness"] == pytest.approx(0.8)
-    assert "correctness" not in result.objective_scores[0]
+    assert result.summary["correctness"] == pytest.approx(0.8)
+    assert "teacher_correctness" not in result.summary
+    assert result.objective_scores[0]["correctness"] == pytest.approx(0.8)
+    assert "completeness" not in result.objective_scores[0]
 
 
-def test_completeness_judge_for_teacher_is_created_once_across_candidates():
+def test_correctness_judge_runs_once_per_student_across_candidates():
     events: list[str] = []
     evalcli = _evalcli_with_ordered_events(events)
-    _stub_completeness_judge(evalcli, events)
-    adapter = _teacher_student_adapter(evalcli, judge_completeness=True)
+    _stub_correctness_judge(evalcli, events)
+    adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
 
     with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
         adapter.evaluate_many(
@@ -707,10 +705,28 @@ def test_completeness_judge_for_teacher_is_created_once_across_candidates():
             capture_traces=False,
         )
 
-    judged_eval_ids = [event.split(":", 1)[1] for event in events if event.startswith("judge-create:")]
-    # One shared teacher eval plus one student eval per candidate.
-    assert len(judged_eval_ids) == 3
-    assert len(set(judged_eval_ids)) == 3
+    judged_eval_ids = [event.split(":", 2)[1] for event in events if event.startswith("judge-create:")]
+    # One pairwise judge per student eval; the shared teacher is the baseline, not judged.
+    assert len(judged_eval_ids) == 2
+    assert len(set(judged_eval_ids)) == 2
+
+
+def test_pairwise_judge_cache_includes_the_teacher_baseline(tmp_path):
+    evalcli = MagicMock()
+    evalcli.find_judge_run_id.return_value = None
+    evalcli.create_judge_run.side_effect = lambda **kwargs: f"judge-{kwargs['base_eval_run_id']}"
+    cache_file = str(tmp_path / "adapter.json")
+    adapter = _teacher_student_adapter(evalcli, cache_file=cache_file, judge_correctness=True)
+    kwargs = {"judge_type": CORRECTNESS_JUDGE_TYPE, "run_params": "{}"}
+
+    assert adapter._ensure_judge("student-1", base_eval_run_id="teacher-1", **kwargs) == "judge-teacher-1"
+    assert adapter._ensure_judge("student-1", base_eval_run_id="teacher-2", **kwargs) == "judge-teacher-2"
+    assert evalcli.create_judge_run.call_count == 2
+    adapter._save_cache()
+
+    reloaded = _teacher_student_adapter(evalcli, cache_file=cache_file, judge_correctness=True)
+    assert reloaded._ensure_judge("student-1", base_eval_run_id="teacher-1", **kwargs) == "judge-teacher-1"
+    assert evalcli.create_judge_run.call_count == 2
 
 
 def test_high_signal_batch_keeps_every_first_tool_mismatch():

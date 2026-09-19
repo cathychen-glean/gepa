@@ -8,16 +8,16 @@ JudgingMode: TypeAlias = Literal["teacher_student", "single_model"]
 
 
 class PointwiseJudge(NamedTuple):
-    """A Cortex pointwise judge and the composite dimension its score feeds.
-
-    ``name`` is the config signal name, which is what ``objective.composite``
-    weights; ``judge_type`` is the Cortex-side identity used to start and read
-    the judge run.
-    """
-
     name: str
     judge_type: str
     run_params: str
+
+
+class PairwiseJudge(NamedTuple):
+    name: str
+    judge_type: str
+    run_params: str
+    input_mappings: str
 
 
 class EvalSetALDataInst(TypedDict):

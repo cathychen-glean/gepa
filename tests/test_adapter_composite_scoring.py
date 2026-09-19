@@ -92,12 +92,12 @@ def test_concrete_adapters_own_screening_configuration():
     shell_eval = GleanEvaluationBatch(
         outputs=[],
         scores=[0.8],
-        summary={SHELL_SUCCESS_OBJECTIVE: 0.8, "completeness": 0.5},
+        summary={SHELL_SUCCESS_OBJECTIVE: 0.8, "correctness": 0.5},
     )
     tool_match_eval = GleanEvaluationBatch(
         outputs=[],
         scores=[0.85],
-        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "completeness": 1.0},
+        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0},
     )
 
     assert single_adapter.get_screening_score(shell_eval) == 0.8

@@ -20,6 +20,8 @@ from glean_gepa.evalcli_client import (
     AGENTIC_JUDGE_TYPE,
     AGENTIC_PREFERENCE_RATE_METRIC,
     AGENTIC_RUN_PARAMS,
+    COMPLETENESS_JUDGE_TYPE,
+    COMPLETENESS_RUN_PARAMS,
     CORRECTNESS_INPUT_MAPPINGS,
     CORRECTNESS_JUDGE_TYPE,
     CORRECTNESS_RUN_PARAMS,
@@ -117,23 +119,25 @@ def wait_for_judge_metrics(
 
 CUSTOMER_CORRECTNESS_METRIC = "correctness"
 CUSTOMER_AGENTIC_PREFERENCE_METRIC = "agentic_preference_rate"
+COMPLETENESS_METRIC = "completeness"
 
 
 @dataclass(frozen=True)
-class CustomerJudgeGate:
-    """How the post-search customer eval starts a Cortex judge and reads its floor."""
+class JudgeSpec:
+    """How to start a Cortex judge and read its floor."""
 
     name: str
+    kind: str
     default_min: float
     judge_type: str
     run_params: str
-    input_mappings: str
     # True: score must be strictly above min. False: min is a passing tie.
     strict: bool
     category_aliases: tuple[str, ...]
     metrics_label: str
     score_source: str
     label: str
+    input_mappings: str = ""
     judge_type_aliases: tuple[str, ...] = ()
     row_metric: str | None = None
     score_keys: tuple[str, ...] = ("test", "passRate", "pass_rate", "testValue", "test_value")
@@ -160,11 +164,12 @@ class CustomerJudgeGate:
         return f"{self.name}={score:.2%} (required {required})"
 
 
-CUSTOMER_JUDGE_GATES: dict[str, CustomerJudgeGate] = {
-    gate.name: gate
-    for gate in (
-        CustomerJudgeGate(
+JUDGE_SPECS: dict[str, JudgeSpec] = {
+    spec.name: spec
+    for spec in (
+        JudgeSpec(
             name=CUSTOMER_CORRECTNESS_METRIC,
+            kind="pairwise",
             default_min=0.80,
             judge_type=CORRECTNESS_JUDGE_TYPE,
             run_params=CORRECTNESS_RUN_PARAMS,
@@ -175,8 +180,9 @@ CUSTOMER_JUDGE_GATES: dict[str, CustomerJudgeGate] = {
             score_source=CORRECTNESS_JUDGE_TYPE,
             label="correctness",
         ),
-        CustomerJudgeGate(
+        JudgeSpec(
             name=CUSTOMER_AGENTIC_PREFERENCE_METRIC,
+            kind="pairwise",
             default_min=0.50,
             judge_type=AGENTIC_JUDGE_TYPE,
             run_params=AGENTIC_RUN_PARAMS,
@@ -189,7 +195,21 @@ CUSTOMER_JUDGE_GATES: dict[str, CustomerJudgeGate] = {
             score_source=AGENTIC_JUDGE_NAME,
             label="agentic preference rate",
         ),
+        JudgeSpec(
+            name=COMPLETENESS_METRIC,
+            kind="pointwise",
+            default_min=0.7,
+            judge_type=COMPLETENESS_JUDGE_TYPE,
+            run_params=COMPLETENESS_RUN_PARAMS,
+            strict=True,
+            category_aliases=(COMPLETENESS_JUDGE_TYPE,),
+            metrics_label=COMPLETENESS_JUDGE_TYPE,
+            score_source=COMPLETENESS_JUDGE_TYPE,
+            label="completeness",
+        ),
     )
 }
-CUSTOMER_VALIDATION_METRICS = frozenset(CUSTOMER_JUDGE_GATES)
-DEFAULT_CUSTOMER_VALIDATION_GATES = {name: gate.default_min for name, gate in CUSTOMER_JUDGE_GATES.items()}
+JUDGE_SPEC_NAMES = frozenset(JUDGE_SPECS)
+DEFAULT_CUSTOMER_VALIDATION_GATES = {
+    name: spec.default_min for name, spec in JUDGE_SPECS.items() if spec.kind == "pairwise"
+}

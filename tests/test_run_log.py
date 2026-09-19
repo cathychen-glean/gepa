@@ -24,7 +24,7 @@ def test_format_run_log_reports():
                 "student_eval_run_id": "s1",
             },
             "score": 0.0,
-            "objective_scores": {"tool_alignment": 0.0, "completeness": 0.8},
+            "objective_scores": {"tool_alignment": 0.0, "correctness": 0.8},
         }
     ]
     report = format_eval_entry_report(trajectories)
@@ -32,7 +32,7 @@ def test_format_run_log_reports():
     assert "teacher tools: Glean Search > Glean Document Reader" in report
     assert "student tools: Discover" in report
     assert "first-tool: mismatch (teacher=Glean Search, student=Discover)" in report
-    assert "metrics: score=0.00, completeness=0.80, tool_alignment=0.00" in report
+    assert "metrics: score=0.00, correctness=0.80, tool_alignment=0.00" in report
 
     high_signal = format_high_signal_selection_report(
         selected_groups=[("Glean Search", "Discover", 12), ("Glean Document Reader", "todo_write", 8)],
