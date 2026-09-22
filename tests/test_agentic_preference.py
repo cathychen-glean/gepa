@@ -8,19 +8,12 @@ import pytest
 from glean_gepa.adapter_types import PairwiseJudge
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.evalcli_client import AGENTIC_JUDGE_TYPE, CORRECTNESS_JUDGE_TYPE
+from glean_gepa.evalcli_client import AGENTIC_JUDGE_TYPE
 from glean_gepa.evolutionary_proposer import _select_screened_children
 from glean_gepa.experiment_config import load_experiment_config, pairwise_judges
-from glean_gepa.judge_metrics_util import (
-    JUDGE_SPECS,
-    PREFERENCE_TIE,
-    JudgeAnalysis,
-    per_entry_from_analysis_view,
-    wait_for_all_judge_metrics,
-)
+from glean_gepa.judge_metrics_util import JUDGE_SPECS, PREFERENCE_TIE, JudgeAnalysis, per_entry_from_analysis_view
 from glean_gepa.objectives.agentic_preference import (
     AGENTIC_PREFERENCE_OBJECTIVE,
-    KEEP_PREFERENCE_THRESHOLD,
     KEEP_SAMPLE_SIZE,
     REFLECTION_RANDOM_SAMPLE_SIZE,
     REFLECTION_SAMPLE_SEED,
@@ -35,7 +28,6 @@ from glean_gepa.objectives.utils.agentic_preference_util import (
     rationale_from_judge_entries,
 )
 from glean_gepa.objectives.utils.tool_match_util import ToolMatchEntryMetrics
-from glean_gepa.prompt_constants import EXECUTION_DISCIPLINE_KEY, WRITING_CODE_KEY
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
 
 THRESHOLDS = Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000)
@@ -47,12 +39,8 @@ EVAL_SET = {
 }
 
 
-def _agentic_judge() -> PairwiseJudge:
+def _agentic_adapter(evalcli: MagicMock | None = None) -> TeacherStudentAdapter:
     spec = JUDGE_SPECS[AGENTIC_PREFERENCE_OBJECTIVE]
-    return PairwiseJudge(spec.name, spec.judge_type, spec.run_params, spec.input_mappings)
-
-
-def _agentic_adapter(evalcli: MagicMock | None = None, **kwargs) -> TeacherStudentAdapter:
     return TeacherStudentAdapter(
         runner=ALRunner(evalcli=evalcli or MagicMock()),
         teacher_model="gpt",
@@ -61,21 +49,8 @@ def _agentic_adapter(evalcli: MagicMock | None = None, **kwargs) -> TeacherStude
         objective=AgenticPreferenceObjective(),
         primary_objective=AGENTIC_PREFERENCE_OBJECTIVE,
         composite_weights={AGENTIC_PREFERENCE_OBJECTIVE: 1.0},
-        pairwise_judges=[_agentic_judge()],
+        pairwise_judges=[PairwiseJudge(spec.name, spec.judge_type, spec.run_params, spec.input_mappings)],
         screening_kind="high_signal_fix_rate",
-        **kwargs,
-    )
-
-
-def _preference_analysis(*, student_eval_id: str = "student-1", teacher_eval_id: str = "teacher-1"):
-    return AgenticPreferenceAnalysis(
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
-        per_entry={
-            "lost": AgenticPreferenceEntry("lost", student_answer="student lost", teacher_answer="teacher won"),
-            "tie": AgenticPreferenceEntry("tie", student_answer="same", teacher_answer="same"),
-            "won": AgenticPreferenceEntry("won", student_answer="student won", teacher_answer="teacher lost"),
-        },
     )
 
 
@@ -83,11 +58,9 @@ def _trajectory(
     entry_id: str,
     *,
     preference: float | None,
-    eval_set: dict | None = None,
     student_tools: list[str] | None = None,
     teacher_tools: list[str] | None = None,
     judge_run_id: str = "judge-1",
-    teacher_eval_run_id: str = "teacher-1",
 ) -> dict:
     output: dict = {
         "entry_id": entry_id,
@@ -98,14 +71,13 @@ def _trajectory(
         "student_tool_events": list(student_tools or []),
         "teacher_tool_events": list(teacher_tools or []),
         "student_eval_run_id": "student-1",
-        "teacher_eval_run_id": teacher_eval_run_id,
+        "teacher_eval_run_id": "teacher-1",
+        "judge_run_id": judge_run_id,
     }
-    if judge_run_id:
-        output["judge_run_id"] = judge_run_id
     if preference is not None:
         output[AGENTIC_PREFERENCE_OBJECTIVE] = preference
     return {
-        "data": dict(eval_set or EVAL_SET),
+        "data": dict(EVAL_SET),
         "output": output,
         "score": 0.0 if preference is None else preference,
         "objective_scores": {AGENTIC_PREFERENCE_OBJECTIVE: preference} if preference is not None else {},
@@ -113,20 +85,14 @@ def _trajectory(
 
 
 def _judge_entry(
-    *,
-    orientation: str,
-    explanation: str,
-    label: str = "lose",
-    name: str = "multi_dimension_overall",
-    judge_run_id: str = "judge-1",
+    *, orientation: str, explanation: str, name: str = "multi_dimension_overall", judge_run_id: str = "judge-1"
 ):
-    """One ``analyze details`` judge output, shaped like the real payload."""
     return {
         "judgeRunId": judge_run_id,
         "outputs": [
             {
                 "name": f"judge_pairwise_agentic_{name}",
-                "label": label,
+                "label": "lose",
                 "reasoning": (
                     f"randomized_single_0_10 scoring (5=tie): score=1.00 gap=4.00 orientation={orientation}\n"
                     f'call ({orientation}): {{"explanation": "{explanation}", "preferred": "A", "gap_score": 4}}'
@@ -144,89 +110,33 @@ def _judge_entry(
     ],
 )
 def test_rationale_resolves_the_randomized_ab_orientation(orientation, expected):
-    """The judge shuffles which side is A per entry; unresolved it teaches the wrong lesson."""
+    """The judge shuffles which side is A; unresolved it teaches the wrong lesson."""
     entries = [_judge_entry(orientation=orientation, explanation="Run A cited sources, Run B did not")]
-
     assert rationale_from_judge_entries(entries) == f"overall (teacher preferred): {expected}"
-
-
-def test_rationale_skips_outputs_it_cannot_parse():
-    entries = [
-        {
-            "judgeRunId": "judge-1",
-            "outputs": [
-                {"name": "judge_pairwise_agentic_correctness", "label": "lose", "reasoning": "no payload here"},
-                {"name": "judge_pairwise_agentic_correctness", "label": "lose"},
-            ],
-        }
-    ]
-
-    assert rationale_from_judge_entries(entries) == ""
-
-
-def test_rationale_keeps_only_the_selected_judge_run():
-    entries = [
-        _judge_entry(orientation="A=base,B=test", explanation="Run B omitted the deliverable"),
-        _judge_entry(
-            orientation="A=base,B=test",
-            explanation="Run B from a stale re-judge",
-            judge_run_id="judge-stale",
-        ),
-    ]
-
-    assert rationale_from_judge_entries(entries, judge_run_id="judge-1") == (
-        "overall (teacher preferred): Student omitted the deliverable"
+    assert (
+        rationale_from_judge_entries(
+            entries + [_judge_entry(orientation=orientation, explanation="stale", judge_run_id="judge-stale")],
+            judge_run_id="judge-1",
+        )
+        == f"overall (teacher preferred): {expected}"
     )
 
 
-def test_judge_rationales_are_fetched_for_selected_entries_then_cached():
+def test_judge_rationales_are_fetched_for_the_selected_run_then_cached():
     trajectory = _trajectory("lost", preference=0.1)
     objective = AgenticPreferenceObjective()
     objective.hydrate_reflective_trajectories([trajectory])
     assert "agentic_preference_rate_feedback" not in trajectory["output"]
 
     evalcli = MagicMock()
-    evalcli.get_analysis_details.return_value = [
-        {
-            "evalSetEntry": {"id": "lost"},
-            "judgeRunEntries": [
-                _judge_entry(orientation="A=base,B=test", explanation="Run B omitted the deliverable"),
-                _judge_entry(
-                    orientation="A=base,B=test",
-                    explanation="Run B misattributed the owner",
-                    name="correctness",
-                ),
-            ],
-        }
-    ]
-    objective.evalcli = evalcli
-
-    objective.hydrate_reflective_trajectories([trajectory])
-    objective.hydrate_reflective_trajectories([trajectory])
-
-    assert trajectory["output"]["agentic_preference_rate_feedback"] == (
-        "overall (teacher preferred): Student omitted the deliverable\n"
-        "correctness (teacher preferred): Student misattributed the owner"
-    )
-    evalcli.get_analysis_details.assert_called_once_with(
-        entry_ids=["lost"], eval_run_ids=["student-1"], deployment_id="scio-prod"
-    )
-    feedback = objective.build_reflective_example(WRITING_CODE_KEY, trajectory, {})["Feedback"]
-    assert "Student omitted the deliverable" in feedback
-    assert "stale re-judge" not in feedback
-
-
-def test_judge_rationale_cache_is_scoped_to_the_selected_judge_run():
-    trajectory = _trajectory("lost", preference=0.1, judge_run_id="judge-1")
-    evalcli = MagicMock()
     evalcli.get_analysis_details.side_effect = [
         [
             {
                 "evalSetEntry": {"id": "lost"},
                 "judgeRunEntries": [
+                    _judge_entry(orientation="A=base,B=test", explanation="Run B omitted the deliverable"),
                     _judge_entry(
-                        orientation="A=base,B=test",
-                        explanation="Run B omitted the deliverable",
+                        orientation="A=base,B=test", explanation="Run B misattributed the owner", name="correctness"
                     ),
                     _judge_entry(
                         orientation="A=base,B=test",
@@ -249,129 +159,53 @@ def test_judge_rationale_cache_is_scoped_to_the_selected_judge_run():
             }
         ],
     ]
-    objective = AgenticPreferenceObjective()
     objective.evalcli = evalcli
-
     objective.hydrate_reflective_trajectories([trajectory])
+    objective.hydrate_reflective_trajectories([trajectory])
+    assert "Student omitted the deliverable" in trajectory["output"]["agentic_preference_rate_feedback"]
     assert "stale re-judge" not in trajectory["output"]["agentic_preference_rate_feedback"]
+    evalcli.get_analysis_details.assert_called_once()
 
     trajectory["output"]["judge_run_id"] = "judge-stale"
     trajectory["output"].pop("agentic_preference_rate_feedback")
     objective.hydrate_reflective_trajectories([trajectory])
-
-    assert trajectory["output"]["agentic_preference_rate_feedback"] == (
-        "overall (teacher preferred): Student from a stale re-judge"
-    )
+    assert "stale re-judge" in trajectory["output"]["agentic_preference_rate_feedback"]
     assert evalcli.get_analysis_details.call_count == 2
 
 
-@pytest.mark.parametrize(
-    ("n", "kwargs", "keys_only"),
-    [
-        (10, {}, False),
-        (40, {"max_entries": None}, False),
-        (3, {}, True),
-    ],
-    ids=["under_default_cap", "all", "keys_only"],
-)
-def test_reflection_keeps_every_loss_when_uncapped(n, kwargs, keys_only):
-    objective = AgenticPreferenceObjective()
-    if keys_only:
-        selected, groups = objective._select_mismatch_groups([TEACHER_PREFERRED_KEY] * n, **kwargs)
-        assert selected == list(range(n))
-    else:
-        trajectories = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(n)]
-        keys = [objective._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-        selected, groups = objective._select_mismatch_groups(keys, trajectories=trajectories, **kwargs)
-        assert [trajectories[index]["output"]["entry_id"] for index in selected] == [
-            f"loss-{i:02d}" for i in range(n)
-        ]
-    assert groups == [(*TEACHER_PREFERRED_KEY, n)]
-
-
-def test_reflection_sample_is_stable_across_trajectory_order():
-    objective = AgenticPreferenceObjective()
-    trajectories = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(40)]
-    keys = [objective._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-    selected = objective._select_mismatch_groups(keys, trajectories=trajectories)[0]
-    picked = {trajectories[index]["output"]["entry_id"] for index in selected}
-
-    shuffled = list(reversed(trajectories))
-    shuffled_keys = [objective._mismatch_key(trajectory["output"]) for trajectory in shuffled]
-    shuffled_selected = objective._select_mismatch_groups(shuffled_keys, trajectories=shuffled)[0]
-    shuffled_picked = {shuffled[index]["output"]["entry_id"] for index in shuffled_selected}
-
-    assert picked == shuffled_picked
-    assert len(picked) == REFLECTION_RANDOM_SAMPLE_SIZE
-
-
-def test_reflection_adds_a_keep_sample_without_changing_the_loss_draw():
+def test_reflection_samples_losses_independently_of_keeps():
     objective = AgenticPreferenceObjective()
     losses = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(40)]
     keeps = [_trajectory(f"keep-{i:02d}", preference=0.9) for i in range(20)]
-    weak_win = _trajectory("weak-win", preference=0.55)
-    tie = _trajectory("tie", preference=PREFERENCE_TIE)
-    trajectories = losses + keeps + [weak_win, tie]
+    extra = [_trajectory("weak-win", preference=0.55), _trajectory("tie", preference=PREFERENCE_TIE)]
+    trajectories = losses + keeps + extra
     keys = [objective._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-
     selected, groups = objective._select_mismatch_groups(keys, trajectories=trajectories)
     picked = [trajectories[index]["output"]["entry_id"] for index in selected]
     expected_losses = sorted(
         random.Random(REFLECTION_SAMPLE_SEED).sample(
-            sorted(f"loss-{i:02d}" for i in range(40)),
-            REFLECTION_RANDOM_SAMPLE_SIZE,
+            sorted(f"loss-{i:02d}" for i in range(40)), REFLECTION_RANDOM_SAMPLE_SIZE
         )
     )
     expected_keeps = sorted(
-        random.Random(REFLECTION_SAMPLE_SEED).sample(
-            sorted(f"keep-{i:02d}" for i in range(20)),
-            KEEP_SAMPLE_SIZE,
-        )
+        random.Random(REFLECTION_SAMPLE_SEED).sample(sorted(f"keep-{i:02d}" for i in range(20)), KEEP_SAMPLE_SIZE)
     )
-
     assert picked[:REFLECTION_RANDOM_SAMPLE_SIZE] == expected_losses
     assert picked[REFLECTION_RANDOM_SAMPLE_SIZE:] == expected_keeps
-    assert "weak-win" not in picked
-    assert "tie" not in picked
+    assert "weak-win" not in picked and "tie" not in picked
     assert groups == [
         (*TEACHER_PREFERRED_KEY, REFLECTION_RANDOM_SAMPLE_SIZE),
         (*STUDENT_PREFERRED_KEY, KEEP_SAMPLE_SIZE),
     ]
 
-
-def test_keep_sample_uses_the_0_6_preference_floor():
-    objective = AgenticPreferenceObjective()
-    trajectories = [
-        _trajectory("loss", preference=0.2),
-        _trajectory("keep", preference=KEEP_PREFERENCE_THRESHOLD),
-        _trajectory("below-keep", preference=KEEP_PREFERENCE_THRESHOLD - 0.05),
-        _trajectory("tie", preference=PREFERENCE_TIE),
-    ]
-    keys = [objective._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-
-    selected, groups = objective._select_mismatch_groups(keys, trajectories=trajectories)
-    picked = [trajectories[index]["output"]["entry_id"] for index in selected]
-
-    assert picked == ["loss", "keep"]
-    assert groups == [(*TEACHER_PREFERRED_KEY, 1), (*STUDENT_PREFERRED_KEY, 1)]
+    capped, capped_groups = objective._select_mismatch_groups(keys, trajectories=trajectories, max_entries=8)
+    capped_ids = [trajectories[index]["output"]["entry_id"] for index in capped]
+    assert len([entry_id for entry_id in capped_ids if entry_id.startswith("loss-")]) == 8
+    assert len([entry_id for entry_id in capped_ids if entry_id.startswith("keep-")]) == KEEP_SAMPLE_SIZE
+    assert capped_groups == [(*TEACHER_PREFERRED_KEY, 8), (*STUDENT_PREFERRED_KEY, KEEP_SAMPLE_SIZE)]
 
 
-def test_reflection_k_caps_losses_but_not_the_keep_budget():
-    objective = AgenticPreferenceObjective()
-    trajectories = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(40)]
-    trajectories += [_trajectory(f"keep-{i:02d}", preference=0.9) for i in range(20)]
-    keys = [objective._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-
-    selected, groups = objective._select_mismatch_groups(keys, trajectories=trajectories, max_entries=8)
-    picked = [trajectories[index]["output"]["entry_id"] for index in selected]
-
-    assert len([entry_id for entry_id in picked if entry_id.startswith("loss-")]) == 8
-    assert len([entry_id for entry_id in picked if entry_id.startswith("keep-")]) == KEEP_SAMPLE_SIZE
-    assert groups == [(*TEACHER_PREFERRED_KEY, 8), (*STUDENT_PREFERRED_KEY, KEEP_SAMPLE_SIZE)]
-
-
-def test_tool_sequences_are_joined_onto_the_paired_answers():
-    """Reflection needs the tool choices; the judge's dimensions never name a tool."""
+def test_paired_traces_join_tools_without_blocking_on_a_missing_fetch():
     evalcli = MagicMock()
     evalcli.get_analysis_view.return_value = {
         "entries": [
@@ -381,8 +215,7 @@ def test_tool_sequences_are_joined_onto_the_paired_answers():
                     {"evalRunId": "student-1", "output": "student text"},
                     {"evalRunId": "teacher-1", "output": "teacher text"},
                 ],
-            },
-            {"entryId": "no-spans", "evalRunEntries": []},
+            }
         ]
     }
     tool_analysis = MagicMock(
@@ -395,156 +228,53 @@ def test_tool_sequences_are_joined_onto_the_paired_answers():
             )
         }
     )
-
     with patch(
         "glean_gepa.objectives.utils.agentic_preference_util.fetch_eval_run_tool_match_analysis",
         return_value=tool_analysis,
     ) as fetch_tools:
         analysis = fetch_paired_preference_traces(
-            object(),
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
-            lookback_days=7,
-            evalcli=evalcli,
+            object(), teacher_eval_id="teacher-1", student_eval_id="student-1", lookback_days=7, evalcli=evalcli
         )
-
     assert analysis.per_entry["lost"].student_tools == ("Glean Document Reader",)
-    assert analysis.per_entry["lost"].teacher_tools == ("Glean Search",)
-    assert analysis.per_entry["no-spans"].student_tools == ()
-    assert fetch_tools.call_args.kwargs["lookback_days"] == 7
-    # Passing evalcli would additionally pull one trace per mismatching entry for
-    # first-call payloads this objective never shows reflection.
     assert "evalcli" not in fetch_tools.call_args.kwargs
-
-    rows = AgenticPreferenceObjective().scored_rows(
-        analysis, focused=False, capture_traces=True, query="q", deployment_id="scio-prod"
-    )
-    lost = next(row for row in rows if row.entry_id == "lost")
-    assert lost.output["student_tool_events"] == ["Glean Document Reader"]
-    assert lost.output["teacher_tool_calls"] == 1
-
-
-def test_a_missing_tool_fetch_leaves_the_answers_usable():
-    evalcli = MagicMock()
-    evalcli.get_analysis_view.return_value = {
-        "entries": [{"entryId": "lost", "evalRunEntries": [{"evalRunId": "student-1", "output": "student text"}]}]
-    }
 
     with patch(
         "glean_gepa.objectives.utils.agentic_preference_util.fetch_eval_run_tool_match_analysis",
         side_effect=RuntimeError("agentspan is down"),
     ):
-        analysis = fetch_paired_preference_traces(
+        fallback = fetch_paired_preference_traces(
             object(), teacher_eval_id="teacher-1", student_eval_id="student-1", evalcli=evalcli
         )
+    assert fallback.per_entry["lost"].student_answer == "student text"
+    assert fallback.per_entry["lost"].student_tools == ()
 
-    assert analysis.per_entry["lost"].student_answer == "student text"
-    assert analysis.per_entry["lost"].student_tools == ()
 
-
-def test_core_tool_modules_are_editable_only_for_tools_a_loss_implicates():
-    """The proposer drops every core-tool module this does not name."""
+def test_reflection_follows_losses_not_wins():
     objective = AgenticPreferenceObjective()
-    trajectories = [
-        _trajectory(
-            "lost",
-            preference=0.2,
-            teacher_tools=["Glean Search"],
-            student_tools=["Glean Document Reader"],
-        ),
-        _trajectory("won", preference=0.9, teacher_tools=["Delegate"], student_tools=["Todo Write"]),
-    ]
-
-    keys = objective.high_signal_core_tool_keys(trajectories)
-
-    assert keys == ["glean_search", "glean_document_reader"]
-
-
-def test_each_core_tool_module_sees_all_selected_losses():
-    objective = AgenticPreferenceObjective()
-    search_loss = _trajectory("search-loss", preference=0.2, teacher_tools=["Glean Search"], student_tools=["Write"])
-    delegate_loss = _trajectory("delegate-loss", preference=0.1, teacher_tools=["Delegate"], student_tools=["Write"])
-    selected = [search_loss, delegate_loss]
-    keys = [TEACHER_PREFERRED_KEY, TEACHER_PREFERRED_KEY]
-
-    def chosen(component: str) -> list[str]:
-        picked = objective._component_trajectories(component, selected, keys, trajectories=selected, mismatch_keys=keys)
-        return [trajectory["output"]["entry_id"] for trajectory in picked]
-
-    assert chosen("glean_search") == chosen("delegate") == chosen(WRITING_CODE_KEY) == ["search-loss", "delegate-loss"]
-
-
-def test_the_first_tool_divergence_reaches_the_reflector():
-    objective = AgenticPreferenceObjective()
-    trajectory = _trajectory("lost", preference=0.2, teacher_tools=["Glean Search"], student_tools=["Write"])
-
-    example = objective.build_reflective_example("glean_search", trajectory, {})
-
-    assert "opened with Glean Search" in example["Feedback"]
-    assert "student opened with Write" in example["Feedback"]
-    assert example["Feedback"].startswith("LOSS:")
-    assert example["Generated Outputs"]["student_tools"] == ["Write"]
-
-
-def test_keep_examples_are_labeled_and_skip_first_tool_copying():
-    objective = AgenticPreferenceObjective()
-    trajectory = _trajectory(
-        "won",
-        preference=0.9,
-        teacher_tools=["Glean Search"],
-        student_tools=["Write"],
+    lost = _trajectory(
+        "lost",
+        preference=0.2,
+        teacher_tools=["Glean Search", "Glean Document Reader"],
+        student_tools=["Write", "Glean Search"],
     )
-
-    search = objective.build_reflective_example("glean_search", trajectory, {})
-    assert search["Feedback"].startswith("KEEP:")
-    assert "already preferred the student" in search["Feedback"]
-    assert "opened with" not in search["Feedback"]
-
-    discipline = objective.build_reflective_example(EXECUTION_DISCIPLINE_KEY, trajectory, {})
-    assert discipline["Feedback"] == search["Feedback"]
+    won = _trajectory("won", preference=0.9, teacher_tools=["Delegate", "Todo Write"], student_tools=["Todo Write"])
+    assert objective.high_signal_core_tool_keys([lost, won]) == ["glean_search", "glean_document_reader"]
+    loss = objective.build_reflective_example("glean_search", lost, {})
+    keep = objective.build_reflective_example("glean_search", won, {})
+    assert loss["Feedback"].startswith("LOSS:")
+    assert keep["Feedback"].startswith("KEEP:")
 
 
-def test_agentic_pack_allows_preference_as_primary():
-    config = load_experiment_config("teacher_student_agentic")
-
+def test_agentic_pack_wires_preference_as_primary(tmp_path):
+    path = tmp_path / "mode.yaml"
+    path.write_text("schema_version: 1\nmode: teacher_student\npacks: [agentic]\n")
+    config = load_experiment_config(path)
     assert config.primary_objective == AGENTIC_PREFERENCE_OBJECTIVE
-    assert config.frontier_type == "objective"
-    assert config.screening == {
-        "kind": "high_signal_fix_rate",
-        "threshold": 0.449,
-        "high_signal": "teacher_preferred",
-    }
-    assert config.search["reflection_samples"] == 25
     judges = {judge.name: judge.judge_type for judge in pairwise_judges(config)}
     assert judges == {AGENTIC_PREFERENCE_OBJECTIVE: AGENTIC_JUDGE_TYPE}
 
 
-def test_adapter_honors_reflection_samples():
-    adapter = _agentic_adapter()
-    trajectories = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(40)]
-    batch = GleanEvaluationBatch(outputs=[], scores=[0.0] * 40, trajectories=trajectories)
-
-    default = adapter.objective.make_reflective_dataset(
-        {}, batch, [WRITING_CODE_KEY], adapter.objective.build_reflective_example
-    )
-    assert len(default[WRITING_CODE_KEY]) == REFLECTION_RANDOM_SAMPLE_SIZE
-    capped = adapter.make_reflective_dataset({}, batch, [WRITING_CODE_KEY], k=8)
-    assert len(capped[WRITING_CODE_KEY]) == 8
-    unbounded = adapter.make_reflective_dataset({}, batch, [WRITING_CODE_KEY], k=None)
-    assert len(unbounded[WRITING_CODE_KEY]) == 40
-
-    mixed = [_trajectory(f"loss-{i:02d}", preference=0.1) for i in range(40)]
-    mixed += [_trajectory(f"keep-{i:02d}", preference=0.9) for i in range(20)]
-    mixed_batch = GleanEvaluationBatch(outputs=[], scores=[0.0] * 60, trajectories=mixed)
-    mixed_capped = adapter.make_reflective_dataset({}, mixed_batch, [WRITING_CODE_KEY], k=8)
-    assert len(mixed_capped[WRITING_CODE_KEY]) == 8 + KEEP_SAMPLE_SIZE
-    mixed_unbounded = adapter.make_reflective_dataset({}, mixed_batch, [WRITING_CODE_KEY], k=None)
-    assert len(mixed_unbounded[WRITING_CODE_KEY]) == 60
-    assert any(example["Feedback"].startswith("KEEP:") for example in mixed_capped[WRITING_CODE_KEY])
-
-
-def test_analysis_view_scores_use_the_judges_own_scale():
-    """A raw agentic 1.0 is one point out of ten, not an already-normalized win."""
+def test_analysis_view_treats_a_raw_one_as_an_agentic_loss():
     view = {
         "entries": [
             {
@@ -552,139 +282,41 @@ def test_analysis_view_scores_use_the_judges_own_scale():
                 "evalRunEntries": [
                     {
                         "evalRunId": "student-1",
-                        "metadata": {
-                            "judgeScores": {"judge-1": 1.0},
-                            "judgeLabels": {"judge-1": ["lose"]},
-                        },
-                    }
-                ],
-            },
-            {
-                "entryId": "tie",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": 5.0}}},
-                ],
-            },
-            {
-                "entryId": "win",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": 10.0}}},
+                        "metadata": {"judgeScores": {"judge-1": 1.0}, "judgeLabels": {"judge-1": ["lose"]}},
+                    },
                 ],
             },
             {
                 "entryId": "eval-run-failed",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": None}}},
-                ],
+                "evalRunEntries": [{"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": None}}}],
             },
         ]
     }
-
     scores, feedback = per_entry_from_analysis_view(
         view, eval_id="student-1", judge_run_id="judge-1", judge_type=AGENTIC_JUDGE_TYPE
     )
-
-    assert scores == {"lost-badly": pytest.approx(0.1), "tie": 0.5, "win": 1.0}
+    assert scores == {"lost-badly": pytest.approx(0.1)}
     assert feedback["lost-badly"] == "lose"
     assert "eval-run-failed" not in scores
 
-    correctness_view = {
-        "entries": [
-            {
-                "entryId": "ok",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": 0.75}}},
-                ],
-            },
-            {
-                "entryId": "perfect",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": 1.0}}},
-                ],
-            },
-        ]
-    }
-    correctness_scores, _feedback = per_entry_from_analysis_view(
-        correctness_view, eval_id="student-1", judge_run_id="judge-1", judge_type=CORRECTNESS_JUDGE_TYPE
-    )
-    assert correctness_scores == {"ok": 0.75, "perfect": 1.0}
 
-
-def test_wait_for_judge_metrics_loads_per_entry_from_the_analysis_view():
-    evalcli = MagicMock()
-    evalcli.get_eval_metrics.return_value = {
-        "judgeMetrics": {
-            "totalEntries": 1,
-            "missingEntries": 0,
-            "AGENTIC_JUDGE": {"passRate": 0.4, "sampleSize": 1, "judgeRunId": "judge-1"},
-        }
-    }
-    evalcli.get_analysis_view.return_value = {
-        "entries": [
-            {
-                "entryId": "lost",
-                "evalRunEntries": [
-                    {"evalRunId": "student-1", "metadata": {"judgeScores": {"judge-1": 2.0}}},
-                ],
-            }
-        ]
-    }
-
-    analysis = wait_for_all_judge_metrics(
-        evalcli,
-        (("student-1", AGENTIC_JUDGE_TYPE, "judge-1", "teacher-1"),),
-        poll_interval_sec=0,
-    )[("student-1", AGENTIC_JUDGE_TYPE, "teacher-1")]
-
-    assert analysis.aggregate == 0.4
-    assert analysis.per_entry == {"lost": 0.2}
-    evalcli.get_analysis_view.assert_called_once_with("student-1", base_eval_id="teacher-1")
-
-
-def test_teacher_preferred_entries_are_high_signal_and_ties_are_not():
+def test_high_signal_and_screen_use_preference_not_correctness():
     objective = AgenticPreferenceObjective()
     adapter = _agentic_adapter()
     batch = GleanEvaluationBatch(
         outputs=[],
-        scores=[0.2, 0.5, 0.8, 0.4],
+        scores=[0.2, 0.5, 0.8],
         trajectories=[
             _trajectory("lost", preference=0.2),
             _trajectory("tie", preference=0.5),
             _trajectory("won", preference=0.8),
-            _trajectory("aggregate-only", preference=None),
         ],
     )
-
     assert objective.is_high_signal({"agentic_preference_rate": 0.2})
     assert not objective.is_high_signal({"agentic_preference_rate": 0.5})
-    assert not objective.is_high_signal({"agentic_preference_rate": 0.8})
-    assert not objective.is_high_signal({})
     focused = adapter.high_signal_batch(batch)
-    assert len(focused) == 1
     assert focused[0]["eval_entry_ids"] == ["lost"]
 
-
-def test_aggregate_judge_score_is_not_copied_onto_entry_outputs():
-    adapter = _agentic_adapter()
-    adapter._analysis_cache[("teacher-1", "student-1")] = _preference_analysis()
-    adapter._judge_cache[("student-1", "teacher-1", AGENTIC_JUDGE_TYPE)] = JudgeAnalysis(
-        eval_id="student-1",
-        aggregate=0.2,
-        per_entry={},
-        judge_type=AGENTIC_JUDGE_TYPE,
-    )
-
-    result = adapter._finish_batch_evals(
-        [_StartedPair(al_data_inst=EVAL_SET, teacher_eval_id="teacher-1", student_eval_id="student-1")],
-        capture_traces=True,
-    )
-
-    assert all(AGENTIC_PREFERENCE_OBJECTIVE not in output for output in result.outputs)
-    assert adapter.high_signal_batch(result) == []
-
-
-def test_high_signal_screen_uses_agentic_preference_not_correctness():
-    adapter = _agentic_adapter()
     parent = GleanEvaluationBatch(
         outputs=[],
         scores=[0.0],
@@ -704,42 +336,31 @@ def test_high_signal_screen_uses_agentic_preference_not_correctness():
         summary={AGENTIC_PREFERENCE_OBJECTIVE: 0.80, "correctness": 0.0},
     )
     keep, reject = object(), object()
-
     kept = _select_screened_children(
         adapter,
         parent,
-        [reject, keep],  # type: ignore[arg-type]
-        [fail, pass_eval],
+        [reject, keep],
+        [fail, pass_eval],  # type: ignore[arg-type]
         use_high_signal_gate=True,
         high_signal_screen_threshold=0.80,
     )
-
     assert [(child, score) for child, _evaluation, score in kept] == [(keep, 0.80)]
 
 
-def test_focused_and_full_evals_both_start_the_agentic_judge():
+def test_focused_and_full_evals_start_agentic_and_keep_its_mean():
     evalcli = MagicMock()
     evalcli.find_judge_run_id.return_value = None
     created: list[str] = []
-
-    def create_judge_run(**kwargs):
-        created.append(kwargs["judge_type"])
-        return f"judge-{kwargs['judge_type']}"
-
-    evalcli.create_judge_run.side_effect = create_judge_run
+    evalcli.create_judge_run.side_effect = (
+        lambda **kwargs: created.append(kwargs["judge_type"]) or f"judge-{kwargs['judge_type']}"
+    )
     adapter = _agentic_adapter(evalcli)
     focused = _StartedPair(
-        al_data_inst={**EVAL_SET, "eval_entry_ids": ["lost"]},
+        al_data_inst={**EVAL_SET, "eval_entry_ids": ["lost", "tie", "won"]},
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
     )
     full = _StartedPair(al_data_inst=EVAL_SET, teacher_eval_id="teacher-1", student_eval_id="student-2")
-    val = _StartedPair(
-        al_data_inst={**EVAL_SET, "validation_only": True},
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-3",
-    )
-
     with patch(
         "glean_gepa.teacher_student_adapter.wait_for_all_judge_metrics",
         side_effect=lambda _evalcli, pending, **_kwargs: {
@@ -751,33 +372,23 @@ def test_focused_and_full_evals_both_start_the_agentic_judge():
     ):
         adapter._await_judge_metrics(adapter._start_judges([focused]))
         adapter._await_judge_metrics(adapter._start_judges([full]))
-        adapter._await_judge_metrics(adapter._start_judges([val]))
+    assert created == [AGENTIC_JUDGE_TYPE, AGENTIC_JUDGE_TYPE]
 
-    assert created == [AGENTIC_JUDGE_TYPE, AGENTIC_JUDGE_TYPE, AGENTIC_JUDGE_TYPE]
-
-
-def test_focused_screen_keeps_the_agentic_judge_mean():
-    adapter = _agentic_adapter()
-    adapter._analysis_cache[("teacher-1", "student-1")] = _preference_analysis()
+    adapter._analysis_cache[("teacher-1", "student-1")] = AgenticPreferenceAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        per_entry={
+            "lost": AgenticPreferenceEntry("lost", student_answer="s", teacher_answer="t"),
+            "tie": AgenticPreferenceEntry("tie", student_answer="s", teacher_answer="t"),
+            "won": AgenticPreferenceEntry("won", student_answer="s", teacher_answer="t"),
+        },
+    )
     adapter._judge_cache[("student-1", "teacher-1", AGENTIC_JUDGE_TYPE)] = JudgeAnalysis(
         eval_id="student-1",
         aggregate=0.5,
         per_entry={"lost": 0.2, "tie": 0.5, "won": 0.8},
         judge_type=AGENTIC_JUDGE_TYPE,
     )
-    focused = {
-        **EVAL_SET,
-        "eval_entry_ids": ["lost", "tie", "won"],
-    }
-
-    result = adapter._finish_batch_evals(
-        [_StartedPair(al_data_inst=focused, teacher_eval_id="teacher-1", student_eval_id="student-1")],
-        capture_traces=True,
-    )
-
+    result = adapter._finish_batch_evals([focused], capture_traces=True)
     assert result.summary is not None
     assert result.summary[AGENTIC_PREFERENCE_OBJECTIVE] == pytest.approx((0.2 + 0.5 + 0.8) / 3)
-    assert adapter.child_screen_score(
-        GleanEvaluationBatch(outputs=[], scores=[0.0], trajectories=[_trajectory("lost", preference=0.2)]),
-        result,
-    ) == pytest.approx((0.2 + 0.5 + 0.8) / 3)

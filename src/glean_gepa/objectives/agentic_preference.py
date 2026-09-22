@@ -23,9 +23,9 @@ from glean_gepa.objectives.utils.agentic_preference_util import (
     fetch_preference_rationales,
     log_agentic_preference_analysis,
 )
-from glean_gepa.objectives.utils.tool_match_util import first_tool_mismatch_pair
-from glean_gepa.prompt import high_signal_core_tool_keys
+from glean_gepa.prompt import tool_description_override_key
 from glean_gepa.prompt_constants import (
+    CORE_TOOL_KEYS,
     CORE_TOOLS,
     EXECUTION_DISCIPLINE_KEY,
     RULES_EXT_KEY,
@@ -45,11 +45,6 @@ KEEP_PRESERVE_RULE = (
     "Some supplied examples are student-preferred keep cases "
     f"(preference >= {KEEP_PREFERENCE_THRESHOLD}): the student "
     "already beat the teacher with a finished, forwardable output. Do not regress those."
-)
-
-KEEP_SEARCH_BUDGET_RULE = (
-    "Preserve search-then-cite and artifact polish; do not add a hard stop after a fixed number "
-    "of searches or drop factual search-first to fix other losses."
 )
 
 WRITING_CODE_RESPONSIBILITY = (
@@ -87,7 +82,7 @@ EXECUTION_DISCIPLINE_RESPONSIBILITY = (
     "searches. Do not tell the student to reason without tools as a default, or to keep "
     "searching until it is sure. This module governs effort and stopping conditions only: leave "
     "SDK syntax, the Writing Code **Rules:** list, and named-tool descriptions to other modules. "
-    f"{KEEP_PRESERVE_RULE} {KEEP_SEARCH_BUDGET_RULE} {NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+    f"{KEEP_PRESERVE_RULE} {NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
 )
 
 
@@ -98,9 +93,9 @@ def core_tool_responsibility(tool_name: str) -> str:
         "The override replaces description text only — not the tool signature, parameters, or Returns. "
         "Rewrite the description so the student uses this tool when it is the step that obtains or "
         "produces the requested deliverable, and does not use it as a substitute for that step "
-        "(searching again, asking instead of drafting, or discovering instead of acting). An "
-        "opening-tool difference is extra evidence only when it caused an unfinished artifact; do "
-        "not rewrite merely to copy the preferred run's first action. Do not add yield, "
+        "(searching again, asking instead of drafting, or discovering instead of acting). A "
+        "tool-sequence difference is extra evidence only when it caused an unfinished artifact; do "
+        "not rewrite merely to copy the preferred run's tool order. Do not add yield, "
         "search-budget, or stopping-condition rules — those belong in Execution Discipline. "
         f"{KEEP_PRESERVE_RULE} Keep the text operational and concise. "
         f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
@@ -333,14 +328,7 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         trajectories: Sequence[Any] = (),
         max_entries: int | None = REFLECTION_RANDOM_SAMPLE_SIZE,
     ) -> tuple[list[int], list[tuple[str, str, int]]]:
-        """Reflect on teacher-preferred losses plus a student-preferred keep set.
-
-        Losses are a seeded uniform sample of size ``max_entries`` (or every
-        loss when ``max_entries is None`` / YAML ``reflection_samples: all``).
-        Keeps are sampled independently with the same seed so adding them does
-        not change which 25 losses reflection already saw. Screening still
-        uses ``is_high_signal`` and stays loss-only.
-        """
+        """Reflect on teacher-preferred losses plus a student-preferred keep set."""
         if len(trajectories) != len(mismatch_keys):
             return super()._select_mismatch_groups(mismatch_keys, trajectories=trajectories, max_entries=max_entries)
 
@@ -358,19 +346,19 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         return selected, groups
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
-        """Core tools whose description a loss actually implicates.
-
-        The proposer drops every core-tool module that this does not name, so
-        returning nothing would leave them listed as editable but never edited.
-        Narrow to the judge's losses first: a first-tool divergence on an entry
-        the student won is not evidence that a description misled it.
-        """
-        losses = [
-            trajectory
-            for trajectory in trajectories or []
-            if isinstance(trajectory, Mapping) and self.is_high_signal(trajectory.get("output") or {})
-        ]
-        return high_signal_core_tool_keys(losses)
+        """Core tools that appear anywhere in a teacher-preferred loss sequence."""
+        found: list[str] = []
+        for trajectory in trajectories or []:
+            if not isinstance(trajectory, Mapping):
+                continue
+            output = trajectory.get("output") or {}
+            if not isinstance(output, Mapping) or not self.is_high_signal(output):
+                continue
+            for name in list(output.get("teacher_tool_events") or []) + list(output.get("student_tool_events") or []):
+                key = tool_description_override_key(str(name))
+                if key in CORE_TOOL_KEYS and key not in found:
+                    found.append(key)
+        return found
 
     def failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         del component_name
@@ -395,17 +383,14 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
                 "finished, forwardable output."
             ]
         else:
+            teacher_tools = [str(name) for name in output.get("teacher_tool_events") or [] if name]
+            student_tools = [str(name) for name in output.get("student_tool_events") or [] if name]
             feedback_parts = [
                 f"LOSS: the pairwise agentic judge preferred the teacher "
-                f"(preference={preference:.2f}; tie is {PREFERENCE_TIE:.2f})."
+                f"(preference={preference:.2f}; tie is {PREFERENCE_TIE:.2f}).",
+                f"Preferred run tools: {' -> '.join(teacher_tools) if teacher_tools else '(none)'}",
+                f"Student tools: {' -> '.join(student_tools) if student_tools else '(none)'}",
             ]
-            if (
-                pair := first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-            ) is not None:
-                teacher_first, student_first = pair
-                teacher_phrase = f"opened with {teacher_first}" if teacher_first else "called no scored tool"
-                student_phrase = f"opened with {student_first}" if student_first else "called no scored tool"
-                feedback_parts.append(f"The preferred run {teacher_phrase} and the student {student_phrase}.")
         rationale = output.get(f"{self.name}_feedback")
         if isinstance(rationale, str) and rationale.strip():
             feedback_parts.append(f"Judge verdict by dimension:\n{rationale.strip()}")

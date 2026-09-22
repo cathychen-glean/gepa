@@ -203,12 +203,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         trajectories: Sequence[Any] = (),
         max_entries: int | None = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
     ) -> tuple[list[int], list[tuple[str, str, int]]]:
-        """Pick the entries to reflect on, by descending mismatch-group frequency.
-
-        ``trajectories`` is positionally aligned with ``mismatch_keys`` for
-        objectives that rank by something the signature does not carry.
-        ``max_entries is None`` means no cap (YAML ``reflection_samples: all``).
-        """
+        """Pick the entries to reflect on, by descending mismatch-group frequency."""
         del trajectories
         if max_entries is None:
             max_entries = len(mismatch_keys)
@@ -228,11 +223,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return selected
 
     def hydrate_reflective_trajectories(self, selected: list[Any]) -> None:
-        """Add per-entry context to the trajectories reflection is about to read.
-
-        Runs after high-signal selection has narrowed the batch, so an objective
-        can afford a lookup it would not want to pay for on every scored entry.
-        """
+        """Add per-entry context to the trajectories reflection is about to read."""
         del selected
 
     def make_reflective_dataset(

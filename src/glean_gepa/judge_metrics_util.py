@@ -1,17 +1,4 @@
-"""Eval-level and per-entry judge scores from Cortex.
-
-After ``judge create``, eval-level rates come from ``POST /metrics/evalruns/pairwise``
-(evalcli ``metrics summary``). Per-entry scores live on ``analyze view`` under
-``metadata.judgeScores``, keyed by judge-run id. Judge-run status is listed with
-``GET /judgeruns?evalRunIds=`` (evalcli ``judge list``).
-``GET /judgeruns/{id}`` and ``list-for-run`` are not used; those Cortex routes
-are unimplemented.
-
-A first ``passRate`` is not enough: wait until that judge-run's coverage is complete
-before treating the aggregate as final, then load the analyze view. Pairwise judges
-declare a ``per_entry_scale`` on ``JudgeSpec``; AGENTIC is 0-10, CORRECTNESS is already
-on the unit interval. Raw per-entry values are divided by that scale onto 0-1.
-"""
+"""Eval-level and per-entry judge scores from Cortex."""
 
 from __future__ import annotations
 
@@ -211,13 +198,7 @@ class JudgeMetricsSnapshot:
 
     @property
     def coverage_complete(self) -> bool:
-        """True once Cortex has finished scoring this judge, not merely published a mean.
-
-        A non-null passRate appears as soon as the first rows land. Screening must wait
-        until missingEntries is 0 or sampleSize has caught totalEntries. AGENTIC
-        metrics summary often omits totals; a published sampleSize is then the
-        coverage signal, and a bare passRate still must not count as finished.
-        """
+        """True once Cortex has finished scoring this judge, not merely published a mean."""
         if self.rate is None:
             return False
         if self.missing_entries == 0:
@@ -327,13 +308,7 @@ def wait_for_all_judge_metrics(
     poll_interval_sec: int = 60,
     timeout_sec: int = 3600,
 ) -> dict[tuple[str, str, str | None], JudgeAnalysis]:
-    """Poll every pending judge, then read analyses only after all have finished.
-
-    Screening starts several child judges together. Reading the first child's
-    passRate as soon as it appears used to freeze a partial mean for later
-    children that were still scoring. Wait until every pending run has full
-    coverage, then load analyze-view rows for the whole set.
-    """
+    """Poll every pending judge, then read analyses only after all have finished."""
     unique = _dedupe_pending(pending)
     if not unique:
         return {}

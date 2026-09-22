@@ -89,13 +89,7 @@ def _tool_sequences_by_entry(
     student_eval_id: str,
     lookback_days: int,
 ) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
-    """Load each role's scored tool sequence per entry from agentspan.
-
-    Answers alone cannot tell reflection which tool choice produced the loss, and
-    the judge's dimensions never name a tool. ``evalcli`` is deliberately withheld
-    from the fetch: it would additionally pull one full trace per mismatching entry
-    to recover first-call payloads, which this objective does not show reflection.
-    """
+    """Load each role's scored tool sequence per entry from agentspan."""
     if client is None:
         return {}
     try:
@@ -186,13 +180,7 @@ def log_agentic_preference_analysis(analysis: AgenticPreferenceAnalysis) -> None
 
 
 def _rationale_line(judge_output: Mapping[str, Any]) -> str | None:
-    """Render one scored dimension of the judge's verdict.
-
-    ``reasoning`` is a header line followed by ``call (A=..,B=..): {json}``. The
-    judge randomizes which side is shown as A per entry, so the explanation's
-    "Run A"/"Run B" mean nothing until the header's orientation is applied —
-    left as-is they teach reflection the wrong lesson half the time.
-    """
+    """Render one scored dimension of the judge's verdict."""
     reasoning = judge_output.get("reasoning")
     if not isinstance(reasoning, str):
         return None
@@ -238,12 +226,7 @@ def fetch_preference_rationales(
     deployment_id: str,
     judge_run_id: str | None = None,
 ) -> dict[str, str]:
-    """Load the judge's prose verdicts for ``entry_ids`` via ``analyze details``.
-
-    The analysis view exposes only the score and a one-word label. The
-    explanation lives on ``judgeRunEntries``, which only ``analyze details``
-    returns, and which is empty in the view payload.
-    """
+    """Load the judge's prose verdicts for ``entry_ids`` via ``analyze details``."""
     get_details = getattr(evalcli, "get_analysis_details", None)
     if not entry_ids or not callable(get_details):
         return {}
