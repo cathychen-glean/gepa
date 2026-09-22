@@ -133,6 +133,8 @@ def runner_arg_defaults(config: ExperimentConfig) -> dict[str, Any]:
         defaults["max_metric_calls"] = int(run["max_metric_calls"])
     if run.get("eval_run_timeout_sec") is not None:
         defaults["eval_run_timeout_sec"] = int(run["eval_run_timeout_sec"])
+    if run.get("eval_run_grace_period_sec") is not None:
+        defaults["eval_run_grace_period_sec"] = int(run["eval_run_grace_period_sec"])
     if run.get("seed_candidate"):
         defaults["seed_candidate"] = Path(str(run["seed_candidate"]))
     modules = run.get("editable_modules")

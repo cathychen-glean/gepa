@@ -328,11 +328,13 @@ class ALRunner:
         deployment_ids: list[str] | None = None,
         cache_file: str | None = None,
         eval_run_timeout_sec: int | None = None,
+        eval_run_grace_period_sec: int | None = None,
     ):
         self.evalcli = evalcli
         self.deployment_ids = deployment_ids or ["scio-prod"]
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
         self.eval_run_timeout_sec = eval_run_timeout_sec
+        self.eval_run_grace_period_sec = eval_run_grace_period_sec
         self._cache_lock = threading.RLock()
 
         # Track eval run IDs: cache_key -> eval_run_id
@@ -632,10 +634,12 @@ class ALRunner:
         if cache_key is None and completed and verified:
             return
 
-        if self.eval_run_timeout_sec is None:
-            self.evalcli.wait_for_eval_run(eval_run_id)
-        else:
-            self.evalcli.wait_for_eval_run(eval_run_id, timeout_sec=self.eval_run_timeout_sec)
+        wait_kwargs: dict[str, int] = {}
+        if self.eval_run_timeout_sec is not None:
+            wait_kwargs["timeout_sec"] = self.eval_run_timeout_sec
+        if self.eval_run_grace_period_sec is not None:
+            wait_kwargs["grace_period_sec"] = self.eval_run_grace_period_sec
+        self.evalcli.wait_for_eval_run(eval_run_id, **wait_kwargs)
         if cache_key is not None:
             self._promote_completed(cache_key, eval_run_id)
         elif eval_run_id in self._in_flight:

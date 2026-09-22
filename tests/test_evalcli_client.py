@@ -770,6 +770,62 @@ def test_wait_for_eval_run_honors_timeout():
     mock_invoke.assert_not_called()
 
 
+def _task_status(*, finished: int, unfinished: int) -> list[dict[str, object]]:
+    counts: list[dict[str, object]] = []
+    if finished:
+        counts.append({"status": "TASK_SUCCEEDED", "count": finished})
+    if unfinished:
+        counts.append({"status": "TASK_SUBMITTED", "count": unfinished})
+    return [{"taskCountsByStatus": counts}]
+
+
+def _monotonic_clock(*times: float):
+    values = list(times)
+
+    def monotonic() -> float:
+        if len(values) > 1:
+            return values.pop(0)
+        return values[0]
+
+    return monotonic
+
+
+def test_wait_for_eval_run_grace_period(capsys: pytest.CaptureFixture[str]):
+    client = EvalCliClient(binary="/fake/evalcli")
+    trailing = _task_status(finished=118, unfinished=2)
+    done = _task_status(finished=120, unfinished=0)
+
+    with patch.object(client, "_invoke_json", return_value=trailing) as disabled:
+        assert client.wait_for_eval_run("run_123", poll_interval_sec=0, grace_period_sec=0) is trailing
+    disabled.assert_called_once()
+    assert "grace period" not in capsys.readouterr().out
+
+    with (
+        patch.object(client, "_invoke_json", side_effect=[trailing, done]) as settled,
+        patch("glean_gepa.evalcli_client.time.sleep"),
+        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=_monotonic_clock(0.0, 1.0, 2.0)),
+    ):
+        assert client.wait_for_eval_run("run_123", poll_interval_sec=0) is done
+    assert settled.call_count == 2
+
+    with (
+        patch.object(client, "_invoke_json", return_value=trailing) as expired,
+        patch("glean_gepa.evalcli_client.time.sleep"),
+        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=_monotonic_clock(0.0, 0.0, 0.0, 1800.0)),
+    ):
+        assert client.wait_for_eval_run("run_123", poll_interval_sec=0) is trailing
+    assert expired.call_count == 2
+    assert "grace period expired with 2 unfinished, proceeding" in capsys.readouterr().out
+
+    with (
+        patch.object(client, "_invoke_json", return_value=trailing),
+        patch("glean_gepa.evalcli_client.time.sleep"),
+        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=_monotonic_clock(0.0, 0.0, 0.0, 0.0, 10.0)),
+        pytest.raises(EvalCliError, match="timed out after 10s"),
+    ):
+        client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=10)
+
+
 def test_wait_for_eval_run_timeout_includes_last_status():
     client = EvalCliClient(binary="/fake/evalcli")
     in_progress = [{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}]
