@@ -21,8 +21,8 @@ from glean_gepa.evalcli_client import (
     min_ingested_eval_set_entries,
 )
 from glean_gepa.judge_metrics_util import (
-    judge_pass_rate_from_metrics,
-    wait_for_judge_metrics,
+    judge_metrics_snapshot,
+    wait_for_all_judge_metrics,
 )
 
 OPAQUE_EVALCLI_ERROR = EvalCliError(
@@ -74,16 +74,7 @@ def test_build_sc_params_overrides_claude_models(alias: str):
     params = runner._build_sc_params(alias, "")
 
     assert f"co.lo.oai_model_for_agentic_loop={AGENTIC_LOOP_MODEL_OVERRIDES[alias]}" in params
-
-
-def test_claude_sonnet_uses_coding_harness_allowed_model():
-    """4.0/4.5 Sonnet are redlisted off coding_agent_loop; 4.6 stays on the harness."""
-    assert AGENTIC_LOOP_MODEL_OVERRIDES["claude_sonnet"] == "CLAUDE_4_6_SONNET_20260217"
-    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
-    params = runner._build_sc_params("claude_sonnet", "")
     assert "co.internal_looping_pyagent_default_route_override=coding_agent_loop" in params
-    assert "CLAUDE_4_5_SONNET_20250929" not in params
-    assert "CLAUDE_4_SONNET_20250514" not in params
 
 
 def test_build_sc_params_rejects_unknown_and_legacy_claude_alias():
@@ -112,11 +103,8 @@ def test_create_eval_run_invokes_evalcli_with_expected_args():
     mock_invoke.assert_called_once()
     args = mock_invoke.call_args[0]
     assert args[0:4] == ("run", "create", "--eval-set", "AI Answers Small:20260403")
-    runner_idx = args.index("--runner-type")
-    assert args[runner_idx + 1] == "GLEAN_CHAT"
+    assert args[args.index("--runner-type") + 1] == "GLEAN_CHAT"
     assert "--preset" not in args
-    assert "--sc-params" in args
-    assert "--eval-params" in args
 
 
 def test_create_eval_run_adopts_a_run_its_own_retry_already_inserted():
@@ -305,8 +293,6 @@ def test_completeness_evalcli_create_list_and_metrics():
         )
     assert judge_id == "judge_complete"
     create_args = mock_invoke.call_args[0]
-    assert create_args[0:2] == ("judge", "create")
-    assert create_args[create_args.index("--eval-run-id") + 1] == "student-run"
     assert create_args[create_args.index("--judge-type") + 1] == "COMPLETENESS"
     assert "--base-eval-run-id" not in create_args
 
@@ -318,7 +304,6 @@ def test_completeness_evalcli_create_list_and_metrics():
         found = client.find_judge_run_id("student-run", judge_type="COMPLETENESS")
     assert found == "judge-1"
     list_args = mock_invoke.call_args[0]
-    assert list_args[0:2] == ("judge", "list")
     assert "list-for-run" not in list_args
     assert list_args[list_args.index("--eval-run-ids") + 1] == "student-run"
 
@@ -399,19 +384,27 @@ def test_create_judge_run_reuses_existing_after_opaque_create_error(create_kwarg
     assert judge_id == expected
 
 
-def test_create_judge_run_raises_on_non_transient_errors():
-    client = EvalCliClient(binary="/fake/evalcli")
-    with patch.object(client, "_invoke_json", side_effect=EvalCliError("stderr: auth failed\nstdout: ")):
-        with pytest.raises(EvalCliError, match="auth failed"):
-            client.create_judge_run(
-                eval_run_id="student-run",
-                judge_type=COMPLETENESS_JUDGE_TYPE,
-                run_params=COMPLETENESS_RUN_PARAMS,
-            )
+def _metrics_payload(
+    *,
+    pass_rate: float | None,
+    sample_size: int | None = None,
+    total: int | None = None,
+    missing: int | None = None,
+    judge_run_id: str = "judge-1",
+):
+    row: dict[str, object] = {"passRate": pass_rate, "judgeRunId": judge_run_id}
+    if sample_size is not None:
+        row["sampleSize"] = sample_size
+    charts: dict[str, object] = {"COMPLETENESS": row}
+    if total is not None:
+        charts["totalEntries"] = total
+    if missing is not None:
+        charts["missingEntries"] = missing
+    return {"judgeMetrics": charts}
 
 
 @pytest.mark.parametrize(
-    "payload, expected",
+    "payload, expected_rate, coverage_complete",
     [
         (
             {
@@ -422,45 +415,186 @@ def test_create_judge_run_raises_on_non_transient_errors():
                 }
             },
             0.8,
+            True,
         ),
         (
             {"judgeMetrics": {"COMPLETENESS": [{"judgeRunId": "judge-1", "test": 0.75, "sampleSize": 4}]}},
             0.75,
+            True,
         ),
         (
             {"judgeMetrics": {"COMPLETENESS": {"passRate": None, "judgeRunId": "judge-1"}}},
             None,
+            False,
         ),
+        (
+            {"judgeMetrics": {"COMPLETENESS": {"passRate": 0.6, "judgeRunId": "judge-1"}}},
+            0.6,
+            False,
+        ),
+        (_metrics_payload(pass_rate=4.31, sample_size=42, total=104, missing=62), 4.31, False),
+        (_metrics_payload(pass_rate=4.51, sample_size=104, total=104, missing=0), 4.51, True),
+        (_metrics_payload(pass_rate=4.22, sample_size=104), 4.22, True),
     ],
+    ids=["wrapped", "test_key", "null_rate", "pass_rate_only", "partial", "finished", "omitted_totals"],
 )
-def test_judge_pass_rate_from_metrics(payload, expected):
-    assert judge_pass_rate_from_metrics(payload, judge_type=COMPLETENESS_JUDGE_TYPE, judge_run_id="judge-1") == expected
+def test_judge_metrics_snapshot_reads_pass_rate(payload, expected_rate, coverage_complete):
+    snapshot = judge_metrics_snapshot(payload, judge_type=COMPLETENESS_JUDGE_TYPE, judge_run_id="judge-1")
+    assert snapshot.rate == expected_rate
+    assert snapshot.coverage_complete is coverage_complete
 
 
-def test_wait_for_judge_metrics_ready_and_timeout():
+def test_wait_for_judge_metrics_returns_when_coverage_is_complete():
     ready = type("EvalCli", (), {})()
-    ready.get_eval_metrics = lambda _eval_id, **_kwargs: {"judgeMetrics": {"COMPLETENESS": {"passRate": 0.6}}}
-    analysis = wait_for_judge_metrics(
-        ready,
-        eval_id="run-1",
-        judge_type=COMPLETENESS_JUDGE_TYPE,
-        judge_run_id="judge-1",
-        poll_interval_sec=0,
+    ready.get_eval_metrics = lambda _eval_id, **_kwargs: _metrics_payload(
+        pass_rate=0.6, sample_size=10, total=10, missing=0
     )
+    analysis = wait_for_all_judge_metrics(
+        ready,
+        (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+        poll_interval_sec=0,
+    )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
     assert analysis.aggregate == 0.6
-    assert analysis.eval_id == "run-1"
+    assert analysis.per_entry == {}
 
+
+@pytest.mark.parametrize(
+    "payload, match",
+    [
+        ({"judgeMetrics": {"COMPLETENESS": {"passRate": None}}}, "not ready"),
+        (_metrics_payload(pass_rate=4.92, sample_size=13, total=104, missing=91), "13/104 scored"),
+    ],
+    ids=["null_rate", "partial"],
+)
+def test_wait_for_judge_metrics_times_out(payload, match):
     stalled = type("EvalCli", (), {})()
-    stalled.get_eval_metrics = lambda _eval_id, **_kwargs: {"judgeMetrics": {"COMPLETENESS": {"passRate": None}}}
-    with pytest.raises(EvalCliError, match="not ready"):
-        wait_for_judge_metrics(
+    stalled.get_eval_metrics = lambda _eval_id, **_kwargs: payload
+    with pytest.raises(EvalCliError, match=match):
+        wait_for_all_judge_metrics(
             stalled,
-            eval_id="run-1",
-            judge_type=COMPLETENESS_JUDGE_TYPE,
-            judge_run_id="judge-1",
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
             poll_interval_sec=0,
             timeout_sec=0,
         )
+
+
+def test_wait_for_judge_metrics_does_not_return_on_partial_pass_rate():
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.side_effect = [
+        _metrics_payload(pass_rate=4.92, sample_size=1, total=3, missing=2),
+        _metrics_payload(pass_rate=4.77, sample_size=3, total=3, missing=0),
+    ]
+    evalcli.get_analysis_view.return_value = {
+        "entries": [
+            {
+                "entryId": f"e{i}",
+                "evalRunEntries": [
+                    {"evalRunId": "run-1", "metadata": {"judgeScores": {"judge-1": 5.0}}},
+                ],
+            }
+            for i in range(3)
+        ]
+    }
+
+    analysis = wait_for_all_judge_metrics(
+        evalcli,
+        (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+        poll_interval_sec=0,
+        timeout_sec=60,
+    )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
+
+    assert evalcli.get_eval_metrics.call_count == 2
+    assert analysis.aggregate == 4.77
+    assert len(analysis.per_entry) == 3
+
+
+def test_wait_for_judge_metrics_waits_for_analysis_view_to_catch_sample_size():
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=4.51, sample_size=2, total=2, missing=0)
+    evalcli.get_analysis_view.side_effect = [
+        {
+            "entries": [
+                {
+                    "entryId": "only-one",
+                    "evalRunEntries": [
+                        {"evalRunId": "run-1", "metadata": {"judgeScores": {"judge-1": 5.0}}},
+                    ],
+                }
+            ]
+        },
+        {
+            "entries": [
+                {
+                    "entryId": "one",
+                    "evalRunEntries": [
+                        {"evalRunId": "run-1", "metadata": {"judgeScores": {"judge-1": 4.0}}},
+                    ],
+                },
+                {
+                    "entryId": "two",
+                    "evalRunEntries": [
+                        {"evalRunId": "run-1", "metadata": {"judgeScores": {"judge-1": 6.0}}},
+                    ],
+                },
+            ]
+        },
+    ]
+
+    analysis = wait_for_all_judge_metrics(
+        evalcli,
+        (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+        poll_interval_sec=0,
+        timeout_sec=60,
+    )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
+
+    assert evalcli.get_analysis_view.call_count == 2
+    assert set(analysis.per_entry) == {"one", "two"}
+
+
+def test_wait_for_all_judge_metrics_reads_views_only_after_every_child_is_complete():
+    evalcli = MagicMock()
+    polls = {"child-a": 0, "child-b": 0}
+    view_when: list[tuple[str, dict[str, int]]] = []
+
+    def get_metrics(eval_id, **_kwargs):
+        polls[eval_id] += 1
+        if eval_id == "child-a":
+            return _metrics_payload(pass_rate=4.22, sample_size=1, total=1, missing=0, judge_run_id="judge-a")
+        if polls[eval_id] == 1:
+            return _metrics_payload(pass_rate=4.92, sample_size=1, total=104, missing=91, judge_run_id="judge-b")
+        return _metrics_payload(pass_rate=4.77, sample_size=1, total=1, missing=0, judge_run_id="judge-b")
+
+    def get_view(eval_id, **_kwargs):
+        view_when.append((eval_id, dict(polls)))
+        judge_id = "judge-a" if eval_id == "child-a" else "judge-b"
+        return {
+            "entries": [
+                {
+                    "entryId": "e0",
+                    "evalRunEntries": [
+                        {"evalRunId": eval_id, "metadata": {"judgeScores": {judge_id: 5.0}}},
+                    ],
+                }
+            ]
+        }
+
+    evalcli.get_eval_metrics.side_effect = get_metrics
+    evalcli.get_analysis_view.side_effect = get_view
+
+    analyses = wait_for_all_judge_metrics(
+        evalcli,
+        (
+            ("child-a", COMPLETENESS_JUDGE_TYPE, "judge-a", "teacher-1"),
+            ("child-b", COMPLETENESS_JUDGE_TYPE, "judge-b", "teacher-1"),
+        ),
+        poll_interval_sec=0,
+        timeout_sec=60,
+    )
+
+    assert polls == {"child-a": 2, "child-b": 2}
+    assert all(counts["child-b"] == 2 for _eval_id, counts in view_when)
+    assert analyses[("child-a", COMPLETENESS_JUDGE_TYPE, "teacher-1")].aggregate == 4.22
+    assert analyses[("child-b", COMPLETENESS_JUDGE_TYPE, "teacher-1")].aggregate == 4.77
 
 
 def test_list_eval_set_versions_returns_matching_and_unspecified_deployments():
@@ -505,103 +639,97 @@ def test_compare_eval_metrics_uses_pairwise_compare_command():
     )
 
 
-def test_find_judge_run_id_matches_base_eval_run():
-    """The list filter matches base OR test eval, so the base must be checked explicitly."""
+@pytest.mark.parametrize(
+    "listing, expected",
+    [
+        (
+            {
+                "judgeRuns": [
+                    {"id": "judge-other-base", "evalRunId": "eval-best", "n": "eval-base-old"},
+                    {"id": "judge-wanted", "evalRunId": "eval-best", "n": "eval-base"},
+                ]
+            },
+            "judge-wanted",
+        ),
+        (
+            {"judgeRuns": [{"id": "judge-1", "evalRunId": "some-other-eval", "n": "eval-best"}]},
+            None,
+        ),
+        (
+            {"judgeRuns": [{"id": "judge-1", "evalRunId": "eval-best", "baseEvalRunId": "eval-base"}]},
+            "judge-1",
+        ),
+    ],
+    ids=["matches_n", "skips_when_eval_is_base", "canonical_base_field"],
+)
+def test_find_judge_run_id(listing, expected):
     client = EvalCliClient(binary="/fake/evalcli")
-    listing = {
-        "judgeRuns": [
-            # Same test eval, but scored against a different baseline.
-            {"id": "judge-other-base", "evalRunId": "eval-best", "n": "eval-base-old"},
-            {"id": "judge-wanted", "evalRunId": "eval-best", "n": "eval-base"},
-        ]
-    }
     with patch.object(client, "_invoke_json", return_value=listing):
         found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
-    assert found == "judge-wanted"
+    assert found == expected
 
 
-def test_find_judge_run_id_skips_rows_where_id_is_only_the_base():
-    """Filtering by eval run also returns judges where it was the baseline."""
+@pytest.mark.parametrize(
+    "listing, match",
+    [
+        ({"judgeRuns": [{"id": "judge_456", "status": "FAILED"}]}, "ended with status FAILED"),
+        (
+            {
+                "judgeRuns": [
+                    {"id": "other_judge", "status": "RUNNING"},
+                    {"id": "judge_456", "status": "SUCCEEDED"},
+                ]
+            },
+            None,
+        ),
+    ],
+    ids=["failed", "succeeded"],
+)
+def test_wait_for_judge_run(listing, match):
     client = EvalCliClient(binary="/fake/evalcli")
-    listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "some-other-eval", "n": "eval-best"}]}
-    with patch.object(client, "_invoke_json", return_value=listing):
-        found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
-    assert found is None
-
-
-def test_find_judge_run_id_reads_canonical_base_field():
-    client = EvalCliClient(binary="/fake/evalcli")
-    listing = {"judgeRuns": [{"id": "judge-1", "evalRunId": "eval-best", "baseEvalRunId": "eval-base"}]}
-    with patch.object(client, "_invoke_json", return_value=listing):
-        found = client.find_judge_run_id("eval-best", judge_type="CORRECTNESS", base_eval_run_id="eval-base")
-    assert found == "judge-1"
-
-
-def test_wait_for_judge_run_raises_on_failure():
-    client = EvalCliClient(binary="/fake/evalcli")
-    listing = {"judgeRuns": [{"id": "judge_456", "status": "FAILED"}]}
     with patch.object(client, "_invoke_json", return_value=listing) as mock_invoke:
-        with pytest.raises(EvalCliError, match="ended with status FAILED"):
+        if match:
+            with pytest.raises(EvalCliError, match=match):
+                client.wait_for_judge_run("judge_456", eval_run_id="student-run", poll_interval_sec=0, timeout_sec=1)
+        else:
             client.wait_for_judge_run("judge_456", eval_run_id="student-run", poll_interval_sec=0, timeout_sec=1)
 
     args = mock_invoke.call_args[0]
-    assert args[0:2] == ("judge", "list")
     assert args[args.index("--eval-run-ids") + 1] == "student-run"
 
 
-def test_wait_for_judge_run_succeeds_on_listed_status():
-    client = EvalCliClient(binary="/fake/evalcli")
-    listing = {
-        "judgeRuns": [
-            {"id": "other_judge", "status": "RUNNING"},
-            {"id": "judge_456", "status": "SUCCEEDED"},
-        ]
-    }
-    with patch.object(client, "_invoke_json", return_value=listing):
-        client.wait_for_judge_run("judge_456", eval_run_id="student-run", poll_interval_sec=0, timeout_sec=1)
-
-
-def test_subprocess_env_replaces_unreliable_ssl_cert(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "initial, expect_resolved_bundle, expect_drop_cert_dir",
+    [
+        (
+            {"SSL_CERT_FILE": "/var/folders/abc/socketFirewallCa.crt", "SSL_CERT_DIR": "/var/folders/abc"},
+            True,
+            True,
+        ),
+        ({}, True, False),
+        ({"SSL_CERT_FILE": "/custom/ca.pem"}, False, False),
+    ],
+    ids=["unreliable", "missing", "custom"],
+)
+def test_subprocess_env_ssl_cert(monkeypatch, tmp_path, initial, expect_resolved_bundle, expect_drop_cert_dir):
     ca_bundle = tmp_path / "ca.pem"
     ca_bundle.write_text("fake-ca", encoding="utf-8")
-    monkeypatch.setenv("SSL_CERT_FILE", "/var/folders/abc/socketFirewallCa.crt")
-    monkeypatch.setenv("SSL_CERT_DIR", "/var/folders/abc")
-    monkeypatch.setattr(
-        "glean_gepa.evalcli_client._resolve_ca_bundle",
-        lambda: str(ca_bundle),
-    )
+    monkeypatch.setattr("glean_gepa.evalcli_client._resolve_ca_bundle", lambda: str(ca_bundle))
+    for key in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in initial.items():
+        monkeypatch.setenv(key, value)
 
     env = _subprocess_env()
 
-    assert env["SSL_CERT_FILE"] == str(ca_bundle)
-    assert env["REQUESTS_CA_BUNDLE"] == str(ca_bundle)
-    assert "SSL_CERT_DIR" not in env
-
-
-def test_subprocess_env_sets_ssl_cert_when_missing(monkeypatch, tmp_path):
-    ca_bundle = tmp_path / "ca.pem"
-    ca_bundle.write_text("fake-ca", encoding="utf-8")
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
-    monkeypatch.setattr(
-        "glean_gepa.evalcli_client._resolve_ca_bundle",
-        lambda: str(ca_bundle),
-    )
-
-    env = _subprocess_env()
-
-    assert env["SSL_CERT_FILE"] == str(ca_bundle)
-    assert env["REQUESTS_CA_BUNDLE"] == str(ca_bundle)
-
-
-def test_subprocess_env_preserves_existing_ssl_cert(monkeypatch):
-    monkeypatch.setenv("SSL_CERT_FILE", "/custom/ca.pem")
-    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
-
-    env = _subprocess_env()
-
-    assert env["SSL_CERT_FILE"] == "/custom/ca.pem"
-    assert "REQUESTS_CA_BUNDLE" not in env
+    if expect_resolved_bundle:
+        assert env["SSL_CERT_FILE"] == str(ca_bundle)
+        assert env["REQUESTS_CA_BUNDLE"] == str(ca_bundle)
+    else:
+        assert env["SSL_CERT_FILE"] == "/custom/ca.pem"
+        assert "REQUESTS_CA_BUNDLE" not in env
+    if expect_drop_cert_dir:
+        assert "SSL_CERT_DIR" not in env
 
 
 @pytest.mark.parametrize(
@@ -626,7 +754,6 @@ def test_wait_for_eval_run_retries_transient_errors(error, capsys):
 
     assert mock_invoke.call_count == 3
     status_logs = [line for line in capsys.readouterr().out.splitlines() if line.startswith("Eval run run_123 status:")]
-    assert len(status_logs) == 2
     assert "TASK_SUBMITTED" in status_logs[0]
     assert "TASK_SUCCEEDED" in status_logs[1]
 

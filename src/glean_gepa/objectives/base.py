@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from glean_gepa.adapter_types import JudgingMode
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import DEFAULT_MODULE_RESPONSIBILITY, core_tool_reflection_prompt
 
@@ -22,6 +22,10 @@ if TYPE_CHECKING:
     from gepa.core.adapter import EvaluationBatch
     from glean_gepa.adapter_types import ALRolloutOutput, ALTrajectory
     from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleMetrics
+
+# ``make_reflective_dataset(k=None)`` means YAML ``all``; omitting ``k`` uses the
+# objective's ``reflection_entry_limit``.
+_REFLECTION_K_DEFAULT = object()
 
 TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = {}
 MODE_DEFAULT_PACK: dict[JudgingMode, str] = {
@@ -117,6 +121,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
     student_compared_key: str
     mismatch_pair: Callable[[Any, Any], tuple[str, str] | None]
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
+    reflection_entry_limit: ClassVar[int] = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
     bigquery_client: Any | None = None
     evalcli: Any | None = None
     lookback_days: int = 1
@@ -192,9 +197,17 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         )
 
     def _select_mismatch_groups(
-        self, mismatch_keys: Sequence[tuple[str, str] | None]
+        self,
+        mismatch_keys: Sequence[tuple[str, str] | None],
+        *,
+        trajectories: Sequence[Any] = (),
+        max_entries: int | None = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
     ) -> tuple[list[int], list[tuple[str, str, int]]]:
-        return select_mismatch_groups(mismatch_keys)
+        """Pick the entries to reflect on, by descending mismatch-group frequency."""
+        del trajectories
+        if max_entries is None:
+            max_entries = len(mismatch_keys)
+        return select_mismatch_groups(mismatch_keys, max_entries=max_entries)
 
     def _component_trajectories(
         self,
@@ -209,14 +222,23 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         del component_name, selected_keys, trajectories, mismatch_keys
         return selected
 
+    def hydrate_reflective_trajectories(self, selected: list[Any]) -> None:
+        """Add per-entry context to the trajectories reflection is about to read."""
+        del selected
+
     def make_reflective_dataset(
         self,
         candidate: dict[str, str],
         eval_batch: EvaluationBatch[ALTrajectory, ALRolloutOutput],
         components_to_update: list[str],
         build_example: Callable[[str, Any, dict[str, str]], ReflectiveExample],
+        k: Any = _REFLECTION_K_DEFAULT,
     ) -> dict[str, list[ReflectiveExample]]:
-        """Reflect on the most frequent teacher/student mismatch groups in the batch."""
+        """Reflect on high-signal teacher/student mismatches in the batch.
+
+        ``k`` is ``search.reflection_samples``: an integer caps the set, ``None``
+        (YAML ``all``) keeps every mismatch. Omit it to use ``reflection_entry_limit``.
+        """
         from glean_gepa.run_log import (
             format_eval_entry_report,
             format_high_signal_selection_report,
@@ -227,11 +249,20 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         if not eval_batch.trajectories:
             return {comp: [] for comp in components_to_update}
 
+        if k is _REFLECTION_K_DEFAULT:
+            max_entries: int | None = getattr(type(self), "reflection_entry_limit", REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT)
+        else:
+            max_entries = k
         trajectories = list(eval_batch.trajectories)
         mismatch_keys = [self._mismatch_key(trajectory["output"]) for trajectory in trajectories]
-        selected_indices, selected_groups = self._select_mismatch_groups(mismatch_keys)
+        selected_indices, selected_groups = self._select_mismatch_groups(
+            mismatch_keys,
+            trajectories=trajectories,
+            max_entries=max_entries,
+        )
         selected = [trajectories[index] for index in selected_indices]
         selected_keys = [mismatch_keys[index] for index in selected_indices]
+        self.hydrate_reflective_trajectories(selected)
         examples: dict[str, list[ReflectiveExample]] = {}
         for component_name in components_to_update:
             chosen = self._component_trajectories(
@@ -260,6 +291,8 @@ class TeacherStudentObjective(PackConfigurable, ABC):
                     module: selected_entry_ids_from_examples(module_examples)
                     for module, module_examples in examples.items()
                 },
+                cap=max_entries if max_entries is not None else mismatch_count,
+                justification=getattr(self, "reflection_selection_justification", None),
             ),
         )
         return examples
@@ -380,6 +413,7 @@ def unregister_telemetry_source(mode: JudgingMode, source: str) -> None:
 
 
 def _ensure_builtin_objectives_registered() -> None:
+    from glean_gepa.objectives.agentic_preference import AgenticPreferenceObjective
     from glean_gepa.objectives.citation_match import CitationMatchObjective
     from glean_gepa.objectives.loop import LoopEfficiencyObjective
     from glean_gepa.objectives.shell import ShellSuccessObjective
@@ -387,6 +421,7 @@ def _ensure_builtin_objectives_registered() -> None:
 
     TELEMETRY_SOURCES.setdefault(("teacher_student", "tool_match"), FirstToolMatchObjective)
     TELEMETRY_SOURCES.setdefault(("teacher_student", "citation_match"), CitationMatchObjective)
+    TELEMETRY_SOURCES.setdefault(("teacher_student", "agentic_preference"), AgenticPreferenceObjective)
     TELEMETRY_SOURCES.setdefault(("single_model", "shell_telemetry"), ShellSuccessObjective)
     TELEMETRY_SOURCES.setdefault(("single_model", "loop_telemetry"), LoopEfficiencyObjective)
 

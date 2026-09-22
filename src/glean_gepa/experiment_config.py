@@ -10,7 +10,7 @@ from typing import Any
 
 from glean_gepa.adapter_types import JudgingMode, PairwiseJudge, PointwiseJudge
 from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
-from glean_gepa.judge_metrics_util import JUDGE_SPEC_NAMES, JUDGE_SPECS
+from glean_gepa.judge_metrics_util import CUSTOMER_AGENTIC_PREFERENCE_METRIC, JUDGE_SPEC_NAMES, JUDGE_SPECS
 from glean_gepa.objectives import (
     MODE_DEFAULT_PACK,
     is_registered_telemetry_source,
@@ -191,7 +191,7 @@ def pointwise_judges(config: ExperimentConfig) -> tuple[PointwiseJudge, ...]:
 
 
 def pairwise_judges(config: ExperimentConfig) -> tuple[PairwiseJudge, ...]:
-    return tuple(
+    judges = tuple(
         PairwiseJudge(
             str(signal["name"]),
             str(signal["type"]),
@@ -199,6 +199,15 @@ def pairwise_judges(config: ExperimentConfig) -> tuple[PairwiseJudge, ...]:
             _pairwise_input_mappings(signal),
         )
         for signal in _enabled_cortex_judges(config.signals, "pairwise")
+    )
+    if config.primary_objective != CUSTOMER_AGENTIC_PREFERENCE_METRIC:
+        return judges
+    spec = JUDGE_SPECS[CUSTOMER_AGENTIC_PREFERENCE_METRIC]
+    if any(judge.name == spec.name for judge in judges):
+        return judges
+    return (
+        *judges,
+        PairwiseJudge(spec.name, spec.judge_type, spec.run_params, spec.input_mappings),
     )
 
 
@@ -468,19 +477,18 @@ def _require_unit_valued_weighted_constants(objective: Mapping[str, Any], signal
 
 
 def _require_mode_primary_objective(primary: Any, signals: list[dict[str, Any]], *, mode: JudgingMode) -> None:
-    telemetry_names = {
-        str(signal["name"])
-        for signal in signals
-        if signal.get("enabled", True) is not False
-        and is_registered_telemetry_source(mode, signal.get("source"))
-        and signal.get("name")
-    }
+    """Reject a primary the adapter cannot put in ``eval_batch.summary``.
+
+    Screening reads ``summary[primary]``. Telemetry names always qualify; so does
+    an enabled Cortex judge in a mode that starts judge runs.
+    """
     if primary is None:
         return
-    if str(primary) not in telemetry_names:
-        scorable = ", ".join(sorted(telemetry_names)) or "(none)"
+    scorable = _scorable_signal_names(signals, mode=mode)
+    if str(primary) not in scorable:
+        names = ", ".join(sorted(scorable)) or "(none)"
         raise ExperimentConfigError(
-            f"mode {mode} cannot score objective.primary={str(primary)!r}; scorable telemetry signals are {scorable}"
+            f"mode {mode} cannot score objective.primary={str(primary)!r}; scorable signals are {names}"
         )
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import keyword
 import re
-from base64 import b64encode, urlsafe_b64encode
+from base64 import urlsafe_b64encode
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -68,8 +68,12 @@ def compile_encoded_prompt(candidate: dict[str, str]) -> str:
 
     Always includes the coding-agent system prompt. Core-tool description
     overrides are appended when the candidate has those modules.
+
+    The system prompt must be URL-safe base64. QE parses ``sc=`` with
+    ``url.QueryUnescape``, which turns ``+`` into space; standard base64 then
+    fails to decode and the override is dropped.
     """
-    encoded_system_prompt = b64encode(compile_system_prompt(candidate).encode("utf-8")).decode("ascii")
+    encoded_system_prompt = urlsafe_b64encode(compile_system_prompt(candidate).encode("utf-8")).decode("ascii")
     parts = ["llmo.per_prompt_overrides.coding_agent_loop_system=" + encoded_system_prompt]
     tool_overrides = compile_tool_description_overrides(candidate)
     if tool_overrides:

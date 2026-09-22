@@ -53,10 +53,14 @@ def test_correctness_can_be_weighted_into_the_composite(tmp_path):
     body = (
         resolve_config_path("teacher_student")
         .read_text()
-        .replace("  composite:\n    tool_alignment: 1.0", "  composite:\n    correctness: 0.5\n    tool_alignment: 0.5")
+        .replace(
+            "  composite:\n    tool_alignment: 1.0",
+            "  primary: correctness\n  composite:\n    correctness: 0.5\n    tool_alignment: 0.5",
+        )
     )
     config = _load_mode(tmp_path, body)
 
+    assert config.primary_objective == "correctness"
     assert composite_weights(config) == {"correctness": 0.5, "tool_alignment": 0.5}
     assert pointwise_judges(config) == ()
 
@@ -133,12 +137,22 @@ _INVALID_CONFIGS = {
     "teacher_student_tools_and_shell": ("cannot score pack", _mode_yaml(packs="[tools, shell]")),
     "teacher_student_loops_pack": ("cannot score pack", _mode_yaml(packs="[loops]")),
     "single_model_tools_pack": ("cannot score pack", _mode_yaml(mode="single_model", packs="[tools]")),
+    "single_model_agentic_pack": ("cannot score pack", _mode_yaml(mode="single_model", packs="[agentic]")),
     "single_model_shell_and_tools": ("cannot score pack", _mode_yaml(mode="single_model", packs="[shell, tools]")),
     "unknown_pack": ("unknown pack", _mode_yaml(packs="[nope]")),
     "empty_packs": ("at least one pack", _mode_yaml(packs="[]")),
     "primary_wrong_mode": (
         "cannot score objective.primary",
         _objective_yaml(f"  primary: {SHELL_SUCCESS_OBJECTIVE}\n"),
+    ),
+    "primary_disabled_judge": (
+        "cannot score objective.primary",
+        _mode_yaml(signals=f"{_PAIRWISE_CORRECTNESS}    enabled: false\n") + "objective:\n  primary: correctness\n",
+    ),
+    "single_model_primary_judge": (
+        "cannot score objective.primary",
+        _mode_yaml(mode="single_model", packs="[shell]", signals=_PAIRWISE_CORRECTNESS)
+        + "objective:\n  primary: correctness\n",
     ),
     "unknown_focused_bucket": ("focused_bucket_type", _objective_yaml("  focused_bucket_type: NOT_A_BUCKET\n")),
     "correctness_weighted_while_disabled": (

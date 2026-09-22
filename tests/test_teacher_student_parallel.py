@@ -50,7 +50,9 @@ def _evalcli_with_ordered_events(events: list[str]) -> MagicMock:
     evalcli.wait_for_eval_run.side_effect = wait_for_eval_run
     evalcli.find_judge_run_id.return_value = None
     evalcli.create_judge_run.side_effect = lambda **kwargs: f"judge-{kwargs['eval_run_id']}"
-    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"CORRECTNESS": {"passRate": 0.0}}}
+    evalcli.get_eval_metrics.return_value = {
+        "judgeMetrics": {"totalEntries": 1, "missingEntries": 0, "CORRECTNESS": {"passRate": 0.0, "sampleSize": 1}}
+    }
     return evalcli
 
 
@@ -193,6 +195,29 @@ def test_batch_evaluate_shares_teacher_run_across_children():
     student_creates = [event for event in events if event.startswith("create:") and "_claude_sonnet_" in event]
     assert len(teacher_creates) == 1
     assert len(student_creates) == 2
+
+
+def test_batch_evaluate_overlaps_children_that_only_differ_by_cached_eval_ids():
+    events: list[str] = []
+    evalcli = _evalcli_with_ordered_events(events)
+    adapter = _teacher_student_adapter(evalcli)
+    base = {
+        **EVAL_SET,
+        "eval_entry_ids": ["source-entry"],
+        "focused_eval_set_name": "gepa-high-signal-glean-chat-v2-medium",
+        "focused_eval_set_version": "20260806_hs_abc",
+    }
+
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+        adapter.batch_evaluate(
+            [
+                ({"WRITING_CODE": "prompt a"}, [{**base, "cached_student_eval_run_id": "child-a"}]),
+                ({"WRITING_CODE": "prompt b"}, [{**base, "cached_student_eval_run_id": "child-b"}]),
+            ],
+            capture_traces=True,
+        )
+
+    _assert_all_creates_before_waits(events, n_creates=1, n_waits=1)
 
 
 def test_al_runner_run_still_waits_before_returning():
@@ -660,7 +685,13 @@ def _stub_correctness_judge(evalcli: MagicMock, events: list[str], *, score: flo
         return f"judge-{eval_run_id}"
 
     evalcli.create_judge_run.side_effect = create_correctness
-    evalcli.get_eval_metrics.return_value = {"judgeMetrics": {"CORRECTNESS": {"passRate": score}}}
+    evalcli.get_eval_metrics.return_value = {
+        "judgeMetrics": {
+            "totalEntries": 1,
+            "missingEntries": 0,
+            "CORRECTNESS": {"passRate": score, "sampleSize": 1},
+        }
+    }
 
 
 def test_correctness_judge_scores_the_student_against_the_teacher():
@@ -709,6 +740,42 @@ def test_correctness_judge_runs_once_per_student_across_candidates():
     # One pairwise judge per student eval; the shared teacher is the baseline, not judged.
     assert len(judged_eval_ids) == 2
     assert len(set(judged_eval_ids)) == 2
+
+
+def test_evaluate_many_starts_each_pairwise_judge_when_that_pair_finishes():
+    events: list[str] = []
+    evalcli = _evalcli_with_ordered_events(events)
+    _stub_correctness_judge(evalcli, events)
+
+    def get_eval_metrics(eval_id, **_kwargs):
+        events.append(f"metrics:{eval_id}")
+        return {
+            "judgeMetrics": {
+                "totalEntries": 1,
+                "missingEntries": 0,
+                "CORRECTNESS": {"passRate": 0.8, "sampleSize": 1},
+            }
+        }
+
+    evalcli.get_eval_metrics.side_effect = get_eval_metrics
+    adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
+
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+        adapter.evaluate_many(
+            [EVAL_SET],
+            [{"WRITING_CODE": "prompt a"}, {"WRITING_CODE": "prompt b"}],
+            capture_traces=False,
+        )
+
+    wait_ids = [event.split(":", 1)[1] for event in events if event.startswith("wait:")]
+    teacher_id = next(eval_id for eval_id in wait_ids if "_gpt_" in eval_id)
+    student_waits = [eval_id for eval_id in wait_ids if "_claude_sonnet_" in eval_id]
+    assert len(student_waits) == 2
+    first_student, second_student = student_waits
+    assert events.index(f"judge-create:{first_student}:base={teacher_id}") < events.index(f"wait:{second_student}")
+    last_judge = max(i for i, event in enumerate(events) if event.startswith("judge-create:"))
+    first_metrics = min(i for i, event in enumerate(events) if event.startswith("metrics:"))
+    assert last_judge < first_metrics
 
 
 def test_pairwise_judge_cache_includes_the_teacher_baseline(tmp_path):
@@ -808,7 +875,7 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
         {"WRITING_CODE": "prompt"},
         GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[]),
         ["WRITING_CODE"],
-        k=8,
+        k=20,
         error_hamming_distance_k=1,
     )["WRITING_CODE"]
     entry_ids = [example["Inputs"]["entry_id"] for example in examples]
@@ -817,6 +884,14 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
     assert "match" not in entry_ids
     assert not any(entry_id.startswith(("ab-", "cd-")) for entry_id in entry_ids)
     assert examples[0]["Feedback"].startswith("First-tool mismatch: teacher used x and student used y.")
+
+    capped = adapter.make_reflective_dataset(
+        {"WRITING_CODE": "prompt"},
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=trajectories, objective_scores=[]),
+        ["WRITING_CODE"],
+        k=8,
+    )["WRITING_CODE"]
+    assert [example["Inputs"]["entry_id"] for example in capped] == [f"xy-{i}" for i in range(12)]
 
     oversized = adapter.make_reflective_dataset(
         {"WRITING_CODE": "prompt"},
@@ -843,7 +918,7 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
         {"WRITING_CODE": "prompt"},
         eval_batch,
         ["WRITING_CODE", "glean_search", "discover", "glean_document_reader"],
-        k=8,
+        k=20,
     )
 
     assert len(examples["WRITING_CODE"]) == 20

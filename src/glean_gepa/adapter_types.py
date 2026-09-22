@@ -100,12 +100,15 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_output_tokens: int
     student_eval_run_id: NotRequired[str]
     teacher_eval_run_id: NotRequired[str]
+    judge_run_id: NotRequired[str]
     student_citations: NotRequired[list[str]]
     teacher_citations: NotRequired[list[str]]
     student_action_inputs: NotRequired[list[str]]
     teacher_action_inputs: NotRequired[list[str]]
     student_first_tool_input: NotRequired[list[str]]
     teacher_first_tool_input: NotRequired[list[str]]
+    agentic_preference_rate: NotRequired[float]
+    agentic_preference_rate_feedback: NotRequired[str]
 
 
 class SingleModelALTrajectory(TypedDict):

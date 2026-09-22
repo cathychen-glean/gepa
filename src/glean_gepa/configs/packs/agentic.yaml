@@ -1,0 +1,29 @@
+# Pack: pairwise agentic preference vs the teacher.
+# Scorable only by teacher_student mode, which requires `packs: [agentic]`.
+# Do not declare a same-named cortex_judge for agentic_preference_rate: merge-by-name
+# would clobber source: agentic_preference. The adapter unions AGENTIC_JUDGE from
+# JUDGE_SPECS when this objective is selected. Screening reuses that judge on the
+# teacher-preferred high-signal slice.
+
+signals:
+  - name: agentic_preference_rate
+    source: agentic_preference
+    lookback_days: 7
+
+objective:
+  primary: agentic_preference_rate
+  frontier_type: objective
+  composite:
+    agentic_preference_rate: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.449
+  high_signal: teacher_preferred
+
+reflection:
+  editable_modules: [RULES_EXT, EXECUTION_DISCIPLINE, CORE_TOOLS]
+  failure_label: "REFLECTION EXAMPLES (teacher-preferred LOSS and student-preferred KEEP)"
+  report_title: "REFLECTION: teacher vs student agentic preference"
+  # Override module reflection prompts with modules.<KEY>.

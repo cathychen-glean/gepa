@@ -1,8 +1,8 @@
 """Eval-topology-agnostic scoring plugins for the Glean adapters.
 
 The base contracts and registry live in :mod:`glean_gepa.objectives.base`; each
-concrete metric is a sibling module (``tool_match``, ``citation_match``,
-``loop``, ``shell``) that self-registers on import. This package re-exports the
+concrete metric is a sibling module (e.g. ``tool_match``, ``shell``) that
+self-registers on import. This package re-exports the
 base API so ``from glean_gepa.objectives import build_objective`` keeps working.
 """
 

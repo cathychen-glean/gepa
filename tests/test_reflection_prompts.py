@@ -11,6 +11,7 @@ from glean_gepa.prompt_constants import (
     DEFAULT_WRITING_CODE,
     FULL_PROMPT_KEY,
     RULES_EXT_KEY,
+    RULES_EXT_TOKEN_BUDGET,
     WRITING_CODE_KEY,
 )
 from glean_gepa.reflection_prompts import (
@@ -126,3 +127,10 @@ def test_length_rule_states_a_character_count():
     assert str(budget) in rule
     assert str(len(tool_text)) in rule
     assert "1.1" not in rule
+
+
+def test_empty_rules_ext_char_budget_fits_consolidated_bullets():
+    """128 tokens capped empty RULES_EXT at 512 chars and dropped the 869-char rewrite."""
+    dropped_chars = 869
+    assert module_char_budget("", 128) < dropped_chars
+    assert module_char_budget("", RULES_EXT_TOKEN_BUDGET) >= dropped_chars

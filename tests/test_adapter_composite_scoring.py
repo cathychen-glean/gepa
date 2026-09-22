@@ -100,8 +100,18 @@ def test_concrete_adapters_own_screening_configuration():
         summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0},
     )
 
+    correctness_adapter = _teacher_student(primary_objective="correctness")
+
     assert single_adapter.get_screening_score(shell_eval) == 0.8
     assert teacher_adapter.get_screening_score(tool_match_eval) == 0.5
+    assert correctness_adapter.get_screening_score(tool_match_eval) == 1.0
+    assert (
+        correctness_adapter.high_signal_fix_rate(
+            GleanEvaluationBatch(outputs=[], scores=[0.0], trajectories=[{"score": 0.0}]),
+            tool_match_eval,
+        )
+        == 1.0
+    )
     assert pick_modules_to_edit(single_rules_ext) == [RULES_EXT_KEY]
     assert not hasattr(single_adapter, "judging_mode")
     assert not hasattr(teacher_adapter, "judge")

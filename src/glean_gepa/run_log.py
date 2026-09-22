@@ -119,19 +119,16 @@ def format_high_signal_selection_report(
     selected_count: int,
     total_mismatch_count: int,
     module_entry_ids: Mapping[str, Sequence[str]] | None = None,
+    cap: int | None = None,
+    justification: str | None = None,
 ) -> str:
-    """Explain which first-tool mismatch groups made the reflection set."""
-    lines = [
-        "Justification: most-frequent first-tool mismatch groups.",
-        f"The most frequent group is always included in full, even if it exceeds "
-        f"{REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT} entries. Later whole groups are added only while they "
-        f"still fit in that cap. Shell / Personal Knowledge Vault Retrieve are stripped before the "
-        f"first-tool comparison.",
-        f"Selected {selected_count} of {total_mismatch_count} first-tool mismatch entries "
-        f"(cap {REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT}).",
-        "",
-        "Groups (most frequent first):",
-    ]
+    """Explain which high-signal entries made the reflection set."""
+    limit = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT if cap is None else cap
+    lines = []
+    if justification:
+        lines.append(justification)
+    lines.append(f"Selected {selected_count} of {total_mismatch_count} high-signal entries (cap {limit}).")
+    lines.extend(["", "Groups (most frequent first):"])
     if not selected_groups:
         lines.append("  (none — every compared entry already matched on first tool)")
     for index, (teacher_tool, student_tool, count) in enumerate(selected_groups, start=1):
@@ -140,7 +137,7 @@ def format_high_signal_selection_report(
     lines.append("Selected entry_ids: " + (", ".join(selected_entry_ids) if selected_entry_ids else "(none)"))
     if module_entry_ids:
         lines.append("")
-        lines.append("Per-module reflection examples (core-tool modules keep only mismatches involving that tool):")
+        lines.append("Per-module reflection examples:")
         for module, entry_ids in module_entry_ids.items():
             lines.append(f"  {module}: {', '.join(entry_ids) if entry_ids else '(none)'}")
     return "\n".join(lines)

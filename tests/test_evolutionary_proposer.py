@@ -369,6 +369,40 @@ def test_replaying_a_fully_cached_slice_skips_root_error_example_fetches(tmp_pat
     assert replay_adapter.screen_evaluation_calls == 0
 
 
+def test_screening_kind_none_sends_every_child_to_validation(tmp_path) -> None:
+    root = _candidate("root")
+    cache_file = str(tmp_path / "children.json")
+
+    class _State:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [root.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 1
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0}}
+
+    class _SkipAdapter(_HighSignalProposerAdapter):
+        screening_kind = "none"
+
+        def high_signal_batch(self, _parent_eval: object) -> list[dict[str, object]]:
+            raise AssertionError("skip screening must not build a high-signal batch")
+
+    adapter = _SkipAdapter()
+    proposer = _proposer(adapter, cache_file)
+    proposer.trainset = _OneSliceLoader()
+    proposals = proposer.propose(_State())
+
+    assert adapter.screen_evaluation_calls == 0
+    assert adapter.reflection_calls == 1
+    assert proposals
+    assert all(proposal.metadata["screening_kind"] == "none" for proposal in proposals)
+    assert all(proposal.subsample_scores_before == [0.0] for proposal in proposals)
+    assert all(proposal.subsample_scores_after == [1.0] for proposal in proposals)
+
+
 def test_resume_skips_slices_whose_passing_children_are_already_in_the_pool(tmp_path) -> None:
     cache_file = str(tmp_path / "children.json")
     root = _candidate("root")

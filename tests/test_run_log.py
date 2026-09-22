@@ -41,7 +41,7 @@ def test_format_run_log_reports():
         total_mismatch_count=31,
         module_entry_ids={"glean_search": ["e1"], "WRITING_CODE": ["e1", "e2"]},
     )
-    assert "most-frequent first-tool mismatch groups" in high_signal
+    assert "Selected 20 of 31 high-signal entries" in high_signal
     assert "teacher=Glean Search  student=Discover  n=12" in high_signal
     assert "Selected entry_ids: e1, e2" in high_signal
     assert "glean_search: e1" in high_signal

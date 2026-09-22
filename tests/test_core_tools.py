@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from base64 import urlsafe_b64decode
+from urllib.parse import unquote_plus
 
 from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, approx_token_len, total_prompt_tokens
 from glean_gepa.batch import GleanEvaluationBatch
@@ -61,6 +62,19 @@ def test_compile_tool_description_overrides():
     assert compiled.startswith("llmo.per_prompt_overrides.coding_agent_loop_system=")
     _system_fragment, tool_fragment = compiled.split(",", 1)
     assert tool_fragment == compile_tool_description_overrides({"FULL_PROMPT": "hello", "glean_search": "Search less."})
+
+
+def test_compile_encoded_prompt_survives_qe_query_unescape():
+    # Standard base64 of this payload contains both '+' and '/'; QE QueryUnescape
+    # would turn '+' into space and drop the override if we used b64encode.
+    payload = "a+b/c?x=1"
+    compiled = compile_encoded_prompt({"FULL_PROMPT": payload})
+    fragment = compiled.split(",", 1)[0]
+    key, b64 = fragment.split("=", 1)
+    assert key == "llmo.per_prompt_overrides.coding_agent_loop_system"
+    assert "+" not in b64
+    assert "/" not in b64
+    assert urlsafe_b64decode(unquote_plus(b64).encode("ascii")).decode("utf-8") == payload
 
 
 def test_high_signal_core_tool_keys():

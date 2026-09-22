@@ -1,16 +1,17 @@
-# Teacher-student experiment
+# Teacher-student experiment with pairwise agentic preference as the primary.
 #
-# The pack (e.g. configs/packs/tools.yaml) supplies the scored signal,
-# objective.primary, and the screening gate. Signals below are merged with the
-# pack's by name; objective/screening keys below override the pack's.
+# The agentic pack supplies the scored signal, objective.primary, and the
+# high-signal screen (AGENTIC_JUDGE on teacher-preferred rows). Signals below
+# are merged with the pack's by name; objective/screening keys below override
+# the pack's.
 
 
 schema_version: 1
 mode: teacher_student
-packs: [tools] # or [citations]
+packs: [agentic]
 
 run:
-  dir: run_ts # or dir: run_ts_citations
+  dir: run_ts_agentic
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
   seed_candidate: data/seed_candidate.json
@@ -27,30 +28,17 @@ data:
   days_back: 0
   val_version_count: 2
 
-signals:
-  - name: correctness
-    source: cortex_judge
-    type: CORRECTNESS
-    kind: pairwise
-    run_params:
-      judge_type: DIRECT_CORRECTNESS
-      llm_model: default
-      use_cache: true
-
 objective:
-  frontier_type: hybrid
+  frontier_type: objective
   composite:
-    tool_alignment: 1.0 # or citation_match: 1.0
+    agentic_preference_rate: 1.0
   validation:
-    - metric: correctness
-      min: 0.80
     - metric: agentic_preference_rate
       min: 0.50
 
 search:
   offspring_count: 5
-  # Set to `all` to reflect on every available example.
-  reflection_samples: 8
+  reflection_samples: 25
   reflection_hamming_distance_k: null
   # Total prompt-token ceiling a mutated candidate may reach.
   global_token_cap: 4096
