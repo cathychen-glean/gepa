@@ -798,7 +798,7 @@ def test_wait_for_eval_run_grace_period(capsys: pytest.CaptureFixture[str]):
     with patch.object(client, "_invoke_json", return_value=trailing) as disabled:
         assert client.wait_for_eval_run("run_123", poll_interval_sec=0, grace_period_sec=0) is trailing
     disabled.assert_called_once()
-    assert "grace period" not in capsys.readouterr().out
+    assert "usable with 2 unfinished, proceeding" in capsys.readouterr().out
 
     with (
         patch.object(client, "_invoke_json", side_effect=[trailing, done]) as settled,

@@ -364,7 +364,9 @@ class EvalCliClient:
             if isinstance(statuses, list) and statuses and classify_eval_run_status(statuses[0]) == "usable":
                 unfinished = _unfinished_task_count(statuses[0])
                 if unfinished == 0 or grace_period_sec == 0:
-                    if usable_since is None:
+                    if unfinished > 0:
+                        print(f"Eval run {eval_run_id} is usable with {unfinished} unfinished, proceeding")
+                    elif usable_since is None:
                         print(f"Eval run {eval_run_id} completed successfully")
                     else:
                         print(f"Eval run {eval_run_id} completed")
