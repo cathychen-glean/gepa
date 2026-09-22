@@ -724,10 +724,14 @@ class TeacherStudentAdapter(GleanAdapterBase):
             if not scored_rows:
                 continue
 
+            primary_judge = student_judges.get(self.objective.name)
+            primary_judge_run_id = primary_judge.judge_run_id if primary_judge is not None else None
             for row in scored_rows:
                 output = cast(TeacherStudentALRolloutOutput, dict(row.output))
                 if row.entry_id and (entry_query := entry_queries.get(row.entry_id)):
                     output["query"] = entry_query
+                if primary_judge_run_id:
+                    output["judge_run_id"] = primary_judge_run_id
                 judge_scores: dict[str, float] = {}
                 for name, judge_analysis in student_judges.items():
                     score = _per_entry_or_aggregate(judge_analysis, row.entry_id)

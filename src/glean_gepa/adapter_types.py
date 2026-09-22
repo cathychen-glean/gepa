@@ -100,6 +100,7 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_output_tokens: int
     student_eval_run_id: NotRequired[str]
     teacher_eval_run_id: NotRequired[str]
+    judge_run_id: NotRequired[str]
     student_citations: NotRequired[list[str]]
     teacher_citations: NotRequired[list[str]]
     student_action_inputs: NotRequired[list[str]]

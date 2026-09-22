@@ -86,6 +86,8 @@ def _trajectory(
     eval_set: dict | None = None,
     student_tools: list[str] | None = None,
     teacher_tools: list[str] | None = None,
+    judge_run_id: str = "judge-1",
+    teacher_eval_run_id: str = "teacher-1",
 ) -> dict:
     output: dict = {
         "entry_id": entry_id,
@@ -96,8 +98,10 @@ def _trajectory(
         "student_tool_events": list(student_tools or []),
         "teacher_tool_events": list(teacher_tools or []),
         "student_eval_run_id": "student-1",
-        "teacher_eval_run_id": "teacher-1",
+        "teacher_eval_run_id": teacher_eval_run_id,
     }
+    if judge_run_id:
+        output["judge_run_id"] = judge_run_id
     if preference is not None:
         output[AGENTIC_PREFERENCE_OBJECTIVE] = preference
     return {
@@ -108,10 +112,17 @@ def _trajectory(
     }
 
 
-def _judge_entry(*, orientation: str, explanation: str, label: str = "lose", name: str = "multi_dimension_overall"):
+def _judge_entry(
+    *,
+    orientation: str,
+    explanation: str,
+    label: str = "lose",
+    name: str = "multi_dimension_overall",
+    judge_run_id: str = "judge-1",
+):
     """One ``analyze details`` judge output, shaped like the real payload."""
     return {
-        "judgeRunId": "judge-1",
+        "judgeRunId": judge_run_id,
         "outputs": [
             {
                 "name": f"judge_pairwise_agentic_{name}",
@@ -153,6 +164,21 @@ def test_rationale_skips_outputs_it_cannot_parse():
     assert rationale_from_judge_entries(entries) == ""
 
 
+def test_rationale_keeps_only_the_selected_judge_run():
+    entries = [
+        _judge_entry(orientation="A=base,B=test", explanation="Run B omitted the deliverable"),
+        _judge_entry(
+            orientation="A=base,B=test",
+            explanation="Run B from a stale re-judge",
+            judge_run_id="judge-stale",
+        ),
+    ]
+
+    assert rationale_from_judge_entries(entries, judge_run_id="judge-1") == (
+        "overall (teacher preferred): Student omitted the deliverable"
+    )
+
+
 def test_judge_rationales_are_fetched_for_selected_entries_then_cached():
     trajectory = _trajectory("lost", preference=0.1)
     objective = AgenticPreferenceObjective()
@@ -187,6 +213,56 @@ def test_judge_rationales_are_fetched_for_selected_entries_then_cached():
     )
     feedback = objective.build_reflective_example(WRITING_CODE_KEY, trajectory, {})["Feedback"]
     assert "Student omitted the deliverable" in feedback
+    assert "stale re-judge" not in feedback
+
+
+def test_judge_rationale_cache_is_scoped_to_the_selected_judge_run():
+    trajectory = _trajectory("lost", preference=0.1, judge_run_id="judge-1")
+    evalcli = MagicMock()
+    evalcli.get_analysis_details.side_effect = [
+        [
+            {
+                "evalSetEntry": {"id": "lost"},
+                "judgeRunEntries": [
+                    _judge_entry(
+                        orientation="A=base,B=test",
+                        explanation="Run B omitted the deliverable",
+                    ),
+                    _judge_entry(
+                        orientation="A=base,B=test",
+                        explanation="Run B from a stale re-judge",
+                        judge_run_id="judge-stale",
+                    ),
+                ],
+            }
+        ],
+        [
+            {
+                "evalSetEntry": {"id": "lost"},
+                "judgeRunEntries": [
+                    _judge_entry(
+                        orientation="A=base,B=test",
+                        explanation="Run B from a stale re-judge",
+                        judge_run_id="judge-stale",
+                    ),
+                ],
+            }
+        ],
+    ]
+    objective = AgenticPreferenceObjective()
+    objective.evalcli = evalcli
+
+    objective.hydrate_reflective_trajectories([trajectory])
+    assert "stale re-judge" not in trajectory["output"]["agentic_preference_rate_feedback"]
+
+    trajectory["output"]["judge_run_id"] = "judge-stale"
+    trajectory["output"].pop("agentic_preference_rate_feedback")
+    objective.hydrate_reflective_trajectories([trajectory])
+
+    assert trajectory["output"]["agentic_preference_rate_feedback"] == (
+        "overall (teacher preferred): Student from a stale re-judge"
+    )
+    assert evalcli.get_analysis_details.call_count == 2
 
 
 @pytest.mark.parametrize(

@@ -152,6 +152,15 @@ def _preference_score(output: Mapping[str, Any]) -> float | None:
         return None
 
 
+def _rationale_cache_key(output: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Scope cached rationales to the judge run (or teacher eval) that produced the score."""
+    return (
+        str(output.get("student_eval_run_id") or ""),
+        str(output.get("entry_id") or ""),
+        str(output.get("judge_run_id") or output.get("teacher_eval_run_id") or ""),
+    )
+
+
 def _sample_reflection_indices(
     indices: Sequence[int],
     *,
@@ -205,7 +214,7 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         self.lookback_days = lookback_days
         self.params: dict[str, Any] = {}
         self._paired_analysis_cache: dict[tuple[str, str], AgenticPreferenceAnalysis] = {}
-        self._rationale_cache: dict[tuple[str, str], str] = {}
+        self._rationale_cache: dict[tuple[str, str, str], str] = {}
 
     def analyze(self, teacher_eval_id: str, student_eval_id: str) -> AgenticPreferenceAnalysis:
         return self.cached_paired_analysis(
@@ -274,24 +283,28 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         if self.evalcli is None:
             return
         feedback_key = f"{self.name}_feedback"
-        pending: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        pending: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
         for trajectory in selected:
             output = trajectory["output"]
+            output.pop(feedback_key, None)
             entry_id = str(output.get("entry_id") or "")
             student_eval_id = str(output.get("student_eval_run_id") or "")
             deployment_id = str(output.get("deployment_id") or "")
             if not entry_id or not student_eval_id or not deployment_id:
                 continue
-            if cached := self._rationale_cache.get((student_eval_id, entry_id)):
+            cache_key = _rationale_cache_key(output)
+            if cached := self._rationale_cache.get(cache_key):
                 output[feedback_key] = cached
                 continue
-            pending[(student_eval_id, deployment_id)].append(trajectory)
-        for (student_eval_id, deployment_id), trajectories in pending.items():
+            pending[(student_eval_id, deployment_id, cache_key[2])].append(trajectory)
+        for (student_eval_id, deployment_id, cache_scope), trajectories in pending.items():
+            judge_run_id = str(trajectories[0]["output"].get("judge_run_id") or "") or None
             rationales = fetch_preference_rationales(
                 self.evalcli,
                 entry_ids=[str(trajectory["output"]["entry_id"]) for trajectory in trajectories],
                 student_eval_id=student_eval_id,
                 deployment_id=deployment_id,
+                judge_run_id=judge_run_id,
             )
             print(f"[agentic preference] Loaded {len(rationales)}/{len(trajectories)} judge rationales")
             for trajectory in trajectories:
@@ -299,7 +312,7 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
                 entry_id = str(output.get("entry_id") or "")
                 if rationale := rationales.get(entry_id):
                     output[feedback_key] = rationale
-                    self._rationale_cache[(student_eval_id, entry_id)] = rationale
+                    self._rationale_cache[(student_eval_id, entry_id, cache_scope)] = rationale
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
         score = _preference_score(output)
