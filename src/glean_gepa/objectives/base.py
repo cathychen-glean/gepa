@@ -397,12 +397,6 @@ class SingleModelObjective(PackConfigurable, ABC):
     def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
         return None
 
-    def cache_payload(self) -> dict[str, Any]:
-        return {}
-
-    def load_cache(self, raw_cache: Any) -> None:
-        del raw_cache
-
 
 def register_telemetry_source(mode: JudgingMode, source: str, cls: type) -> None:
     TELEMETRY_SOURCES[(mode, source)] = cls

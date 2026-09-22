@@ -159,8 +159,10 @@ class SingleModelAdapter(GleanAdapterBase):
         *,
         include_action_inputs: bool = True,
     ):
-        # Every fetch asks for per-entry rows and shell error text. A validation
-        # result can then satisfy a later trace call in this process.
+        # Every fetch asks for per-entry rows and shell error text, so a validation
+        # result can satisfy a later trace call in this process. include_action_inputs
+        # is the only difference between the two call sites: validation leaves it
+        # false, and shell and loop then skip action-input enrichment.
         return self.objective.analyze(
             eval_id,
             include_error_examples=True,

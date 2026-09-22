@@ -21,16 +21,89 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
 from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPendingError
 
 
+def _adapter(evalcli=None, *, runner: ALRunner | None = None, cache_file: str | None = None) -> SingleModelAdapter:
+    if runner is None:
+        runner = ALRunner(evalcli=evalcli if evalcli is not None else EvalCliClient(binary="/fake/evalcli"))
+    return SingleModelAdapter(
+        runner=runner,
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        cache_file=cache_file,
+    )
+
+
+def _shell_error_example(**overrides: str | None) -> ShellToolErrorExample:
+    fields: dict[str, str | None] = {
+        "started_at": "2026-08-11T12:00:00Z",
+        "project_id": "project-1",
+        "entry_id": "entry-1",
+        "eval_id": "run_123",
+        "run_id": "execution-1",
+        "trace_id": "trace-1",
+        "span_id": "span-1",
+        "span_name": "Execute Action: Shell",
+        "action_id": "Shell",
+        "action_status": "error",
+        "span_status": "error",
+        "provider_status": "failed",
+        "output_status_code": "1",
+        "error_str": "command exited with status 1",
+        "action_run_id": None,
+    }
+    fields.update(overrides)
+    return ShellToolErrorExample(**fields)
+
+
+def _shell_action_trace(action_run_id: str, action_input: str) -> dict:
+    return {
+        "trace": {
+            "spans": [
+                {
+                    "name": "Execute Action: Shell",
+                    "attributes": {
+                        "input": {"strValue": json.dumps({"action_input": action_input})},
+                        "span.gle": {"strValue": json.dumps({"action": {"action_run_id": action_run_id}})},
+                    },
+                }
+            ]
+        }
+    }
+
+
+def _one_error_analysis(eval_id: str, error: ShellToolErrorExample) -> EvalRunShellToolErrorAnalysis:
+    entry_id = error.entry_id or "entry-1"
+    return EvalRunShellToolErrorAnalysis(
+        eval_id=eval_id,
+        start_date=date(2026, 8, 11),
+        end_date=date(2026, 8, 11),
+        aggregate=ShellToolErrorMetrics(
+            eval_id=eval_id,
+            shell_executions=1,
+            shell_errors=1,
+            shell_error_rate=1.0,
+            shell_error_pct=100.0,
+            recent_error_examples=(error,),
+        ),
+        per_entry={
+            entry_id: ShellToolErrorEntryMetrics(
+                entry_id=entry_id,
+                shell_executions=1,
+                shell_errors=1,
+                shell_error_rate=1.0,
+                shell_error_pct=100.0,
+                recent_error_examples=(error,),
+                trace_ids=(error.trace_id or "trace-1",),
+            )
+        },
+        high_signal_entry_ids=(entry_id,),
+    )
+
+
 def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[str]):
     evalcli = EvalCliClient(binary="/fake/evalcli")
     runner = ALRunner(evalcli=evalcli)
-    bigquery_client = MagicMock()
-    adapter = SingleModelAdapter(
-        runner=runner,
-        bigquery_client=bigquery_client,
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(runner=runner)
 
     batch = [
         {
@@ -60,25 +133,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
                 shell_errors=2,
                 shell_error_rate=0.5,
                 shell_error_pct=50.0,
-                recent_error_examples=(
-                    ShellToolErrorExample(
-                        started_at="2026-08-11T12:00:00Z",
-                        project_id="project-1",
-                        entry_id="entry-1",
-                        eval_id="run_123",
-                        run_id="execution-1",
-                        trace_id="trace-student-1",
-                        span_id="span-1",
-                        span_name="Execute Action: Shell",
-                        action_id="Shell",
-                        action_run_id="call-1",
-                        action_status="error",
-                        span_status="error",
-                        provider_status="failed",
-                        output_status_code="1",
-                        error_str="command exited with status 1",
-                    ),
-                ),
+                recent_error_examples=(_shell_error_example(trace_id="trace-student-1", action_run_id="call-1"),),
                 trace_ids=("trace-student-1",),
             )
         },
@@ -90,23 +145,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         patch.object(
             adapter.runner.evalcli,
             "get_analysis_trace",
-            return_value={
-                "trace": {
-                    "spans": [
-                        {
-                            "name": "Execute Action: Shell",
-                            "attributes": {
-                                "input": {
-                                    "strValue": json.dumps(
-                                        {"action_input": json.dumps({"command": "python3 broken.py"})}
-                                    )
-                                },
-                                "span.gle": {"strValue": json.dumps({"action": {"action_run_id": "call-1"}})},
-                            },
-                        }
-                    ]
-                }
-            },
+            return_value=_shell_action_trace("call-1", json.dumps({"command": "python3 broken.py"})),
         ) as get_trace,
         patch(
             "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
@@ -190,12 +229,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
 def test_proposals_that_drop_a_render_slot_are_rejected():
     """A Writing Code rewrite without ``{RULES_EXT}`` would silently orphan that module."""
     current = "- stock rule\n{RULES_EXT}\n### Sandbox\n"
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter()
     candidate = Candidate(
         model="fast",
         prompt_modules={"WRITING_CODE": current},
@@ -218,12 +252,7 @@ def test_proposals_that_drop_a_render_slot_are_rejected():
 
 def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(evalcli)
     passing_entry = MagicMock(
         shell_executions=1,
         shell_errors=0,
@@ -269,12 +298,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
 
 def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(evalcli)
     source_entries = [
         {
             "id": "source-entry",
@@ -318,12 +342,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
 
 
 def test_high_signal_batch_retains_the_parent_eval_run_id():
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter()
     parent_eval = GleanEvaluationBatch(
         outputs=[],
         scores=[0.0],
@@ -352,12 +371,7 @@ def test_high_signal_batch_retains_the_parent_eval_run_id():
 
 
 def test_high_signal_evaluation_reuses_child_cached_eval_id():
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter()
     passing_entry = MagicMock(
         shell_executions=1,
         shell_errors=0,
@@ -405,12 +419,7 @@ def test_high_signal_evaluation_reuses_child_cached_eval_id():
 
 def test_high_signal_evaluation_scores_entries_not_shell_calls():
     evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(evalcli)
     passing = ShellToolErrorEntryMetrics(
         entry_id="fresh-passing",
         shell_executions=1,
@@ -458,47 +467,15 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
 
 def test_extract_shell_action_inputs_matches_action_run_id():
     action_input = json.dumps({"command": "python3 broken.py", "destructive": False})
-    trace = {
-        "trace": {
-            "spans": [
-                {
-                    "name": "Execute Action: Shell",
-                    "attributes": {
-                        "input": {"strValue": json.dumps({"action_input": action_input})},
-                        "span.gle": {"strValue": json.dumps({"action": {"action_run_id": "call-shell-1"}})},
-                    },
-                }
-            ]
-        }
-    }
+    trace = _shell_action_trace("call-shell-1", action_input)
 
     assert extract_shell_action_inputs(trace) == {"call-shell-1": action_input}
 
 
 def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
     evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
-    error_example = ShellToolErrorExample(
-        started_at="2026-08-11T12:00:00Z",
-        project_id="project-1",
-        entry_id="entry-1",
-        eval_id="run_123",
-        run_id="execution-1",
-        trace_id="trace-1",
-        span_id="span-1",
-        span_name="Execute Action: Shell",
-        action_id="Shell",
-        action_status="error",
-        span_status="error",
-        provider_status="failed",
-        output_status_code="1",
-        error_str="command exited with status 1",
-    )
+    adapter = _adapter(evalcli)
+    error_example = _shell_error_example()
     analysis = EvalRunShellToolErrorAnalysis(
         eval_id="run_123",
         start_date=date(2026, 8, 8),
@@ -546,46 +523,8 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
 def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
     cache_file = tmp_path / "eval-cache.json"
     runner_cache_file = tmp_path / "eval-run-cache.json"
-    error = ShellToolErrorExample(
-        started_at="2026-08-11T12:00:00Z",
-        project_id="project-1",
-        entry_id="entry-1",
-        eval_id="run_123",
-        run_id="execution-1",
-        trace_id="trace-1",
-        span_id="span-1",
-        span_name="Execute Action: Shell",
-        action_id="Shell",
-        action_status="error",
-        span_status="error",
-        provider_status="failed",
-        output_status_code="1",
-        error_str="command exited with status 1",
-    )
-    entry = ShellToolErrorEntryMetrics(
-        entry_id="entry-1",
-        shell_executions=1,
-        shell_errors=1,
-        shell_error_rate=1.0,
-        shell_error_pct=100.0,
-        recent_error_examples=(error,),
-        trace_ids=("trace-1",),
-    )
-    analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
-        start_date=date(2026, 8, 11),
-        end_date=date(2026, 8, 11),
-        aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
-            shell_executions=1,
-            shell_errors=1,
-            shell_error_rate=1.0,
-            shell_error_pct=100.0,
-            recent_error_examples=(error,),
-        ),
-        per_entry={"entry-1": entry},
-        high_signal_entry_ids=("entry-1",),
-    )
+    error = _shell_error_example()
+    analysis = _one_error_analysis("run_123", error)
     batch = [
         {
             "eval_set_name": "AI Answers Small",
@@ -597,13 +536,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
 
     first_evalcli = EvalCliClient(binary="/fake/evalcli")
     first_runner = ALRunner(evalcli=first_evalcli, cache_file=str(runner_cache_file))
-    first = SingleModelAdapter(
-        runner=first_runner,
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-        cache_file=str(cache_file),
-    )
+    first = _adapter(runner=first_runner, cache_file=str(cache_file))
     with (
         patch.object(first_evalcli, "create_eval_run", return_value="run_123") as create_eval_run,
         patch.object(first_evalcli, "wait_for_eval_run"),
@@ -618,13 +551,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
 
     second_evalcli = EvalCliClient(binary="/fake/evalcli")
     second_runner = ALRunner(evalcli=second_evalcli, cache_file=str(runner_cache_file))
-    second = SingleModelAdapter(
-        runner=second_runner,
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-        cache_file=str(cache_file),
-    )
+    second = _adapter(runner=second_runner, cache_file=str(cache_file))
     with (
         patch.object(second_evalcli, "create_eval_run") as create_eval_run,
         patch.object(second_evalcli, "wait_for_eval_run") as wait_for_eval_run,
@@ -682,13 +609,7 @@ def test_load_ignores_eval_analysis_cache(tmp_path):
         per_entry={},
         high_signal_entry_ids=(),
     )
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-        cache_file=str(cache_file),
-    )
+    adapter = _adapter(cache_file=str(cache_file))
 
     with patch(
         "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
@@ -700,69 +621,18 @@ def test_load_ignores_eval_analysis_cache(tmp_path):
 
 
 def test_trace_call_after_validation_reuses_error_text_without_action_inputs():
-    action_input = json.dumps({"command": "python3 broken.py"})
-    error = ShellToolErrorExample(
-        started_at="2026-08-11T12:00:00Z",
-        project_id="scio-prod",
-        entry_id="entry-1",
+    error = _shell_error_example(
         eval_id="run_1",
-        run_id="execution-1",
-        trace_id="trace-1",
-        span_id="span-1",
-        span_name="Execute Action: Shell",
-        action_id="Shell",
-        action_status="error",
-        span_status="error",
-        provider_status="failed",
-        output_status_code="1",
+        project_id="scio-prod",
         error_str="command not found",
         action_run_id="call-shell-1",
     )
-    analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_1",
-        start_date=date(2026, 8, 11),
-        end_date=date(2026, 8, 11),
-        aggregate=ShellToolErrorMetrics(
-            eval_id="run_1",
-            shell_executions=1,
-            shell_errors=1,
-            shell_error_rate=1.0,
-            shell_error_pct=100.0,
-            recent_error_examples=(error,),
-        ),
-        per_entry={
-            "entry-1": ShellToolErrorEntryMetrics(
-                entry_id="entry-1",
-                shell_executions=1,
-                shell_errors=1,
-                shell_error_rate=1.0,
-                shell_error_pct=100.0,
-                recent_error_examples=(error,),
-                trace_ids=("trace-1",),
-            )
-        },
-        high_signal_entry_ids=("entry-1",),
-    )
+    analysis = _one_error_analysis("run_1", error)
     evalcli = MagicMock()
-    evalcli.get_analysis_trace.return_value = {
-        "trace": {
-            "spans": [
-                {
-                    "name": "Execute Action: Shell",
-                    "attributes": {
-                        "input": {"strValue": json.dumps({"action_input": action_input})},
-                        "span.gle": {"strValue": json.dumps({"action": {"action_run_id": "call-shell-1"}})},
-                    },
-                }
-            ]
-        }
-    }
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    evalcli.get_analysis_trace.return_value = _shell_action_trace(
+        "call-shell-1", json.dumps({"command": "python3 broken.py"})
     )
+    adapter = _adapter(evalcli)
 
     with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=analysis) as fetch:
         adapter._get_or_fetch_analysis("run_1", include_action_inputs=False)
@@ -795,13 +665,7 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
         per_entry={},
         high_signal_entry_ids=(),
     )
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-        cache_file=str(cache_file),
-    )
+    adapter = _adapter(cache_file=str(cache_file))
 
     with patch(
         "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=provisional
@@ -829,12 +693,7 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
         per_entry={},
         high_signal_entry_ids=(),
     )
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter()
     batch = [
         {
             "eval_set_name": "Glean Chat V2 Medium",
@@ -864,21 +723,12 @@ def test_full_eval_fetches_per_entry_rows_and_error_examples():
             shell_error_rate=0.0679,
             shell_error_pct=6.79,
             recent_error_examples=(
-                ShellToolErrorExample(
+                _shell_error_example(
                     started_at="2026-09-02T05:27:00Z",
                     project_id="scio-prod",
-                    entry_id="entry-1",
                     eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
-                    run_id="execution-1",
-                    trace_id="trace-1",
-                    span_id="span-1",
-                    span_name="Execute Action: Shell",
-                    action_id="Shell",
                     action_status="ERROR",
                     span_status="ERROR",
-                    provider_status="failed",
-                    output_status_code="1",
-                    error_str="command exited with status 1",
                     action_run_id="call-1",
                 ),
             ),
@@ -887,12 +737,7 @@ def test_full_eval_fetches_per_entry_rows_and_error_examples():
         high_signal_entry_ids=(),
     )
     evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(evalcli)
 
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="gepa_gpt_5a0754e0543e49fc_1788306729"),
@@ -927,12 +772,7 @@ def test_launched_student_eval_is_resumed_from_in_flight_after_timeout():
     evalcli = MagicMock()
     evalcli.create_eval_run.side_effect = lambda **kwargs: kwargs["eval_run_id"]
     runner = ALRunner(evalcli=evalcli)
-    adapter = SingleModelAdapter(
-        runner=runner,
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-    )
+    adapter = _adapter(runner=runner)
     eval_kwargs = {
         "eval_set_name": "set",
         "eval_set_version": "v1",
