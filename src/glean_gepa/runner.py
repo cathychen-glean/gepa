@@ -617,6 +617,12 @@ def _validate_best_candidate_on_customer_eval(
     """Run paired customer evals on the GEPA valset and enforce metric gates."""
     if not valset:
         raise SystemExit("Customer eval requires a non-empty validation set.")
+    if compile_encoded_prompt(baseline_candidate) == compile_encoded_prompt(best_candidate):
+        log_section(
+            "CUSTOMER EVAL",
+            "Skipping customer eval: best candidate is the seed prompt, so a base/best pair would be identical.",
+        )
+        return
     gates = customer_validation_gates(experiment)
     for item in valset:
         version = item["eval_set_version"]
@@ -916,6 +922,7 @@ def _build_adapter(
         if experiment is not None:
             kwargs["pointwise_judges"] = pointwise_judges(experiment)
             kwargs["pairwise_judges"] = pairwise_judges(experiment)
+            kwargs["screening_kind"] = experiment.screening.get("kind")
         return TeacherStudentAdapter(**kwargs, teacher_model=args.teacher_model)
     return SingleModelAdapter(**kwargs)
 

@@ -106,6 +106,8 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_action_inputs: NotRequired[list[str]]
     student_first_tool_input: NotRequired[list[str]]
     teacher_first_tool_input: NotRequired[list[str]]
+    agentic_preference_rate: NotRequired[float]
+    agentic_preference_rate_feedback: NotRequired[str]
 
 
 class SingleModelALTrajectory(TypedDict):

@@ -527,6 +527,26 @@ def test_customer_eval_starts_only_the_configured_judges(validation, expected):
         evalcli.wait_for_judge_run.assert_not_called()
 
 
+def test_customer_eval_skips_when_best_is_still_the_seed():
+    evalcli = MagicMock()
+    runner = MagicMock()
+    seed = {"WRITING_CODE": "unchanged"}
+
+    _validate_best_candidate_on_customer_eval(
+        runner=runner,
+        student_model="gpt",
+        baseline_candidate=seed,
+        best_candidate=dict(seed),
+        evalcli=evalcli,
+        valset=_make_evalset(["20260908"], deployment_ids=_SAMPLED_DEPLOYMENTS),
+        experiment=_experiment_with_validation([{"metric": "agentic_preference_rate", "min": 0.50}]),
+    )
+
+    runner.start.assert_not_called()
+    runner.ensure_judge_run.assert_not_called()
+    evalcli.compare_eval_metrics.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("patch", "gates", "error", "contains", "omits"),
     [

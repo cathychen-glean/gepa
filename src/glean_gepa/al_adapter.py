@@ -265,6 +265,7 @@ class ReflectiveExampleMetrics(TypedDict):
     tool_alignment: NotRequired[float]
     citation_match: NotRequired[float]
     loop_efficiency: NotRequired[float]
+    agentic_preference_rate: NotRequired[float]
 
 
 # TypedDict with keys containing spaces must use functional form
@@ -1114,6 +1115,7 @@ class Thresholds:
 
 class GleanAdapterBase:
     supports_high_signal_eval = False
+    screening_kind: str | None = None
 
     #: Dimensions the subclass resolves from evaluation telemetry, as opposed to the
     #: constants and judge scores the base already knows about.
@@ -1326,6 +1328,14 @@ class GleanAdapterBase:
         if eval_batch.summary is None:
             return float("-inf")
         return eval_batch.summary.get(self.primary_objective, float("-inf"))
+
+    def child_screen_score(self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch) -> float:
+        """Score a focused child screen. Default is the high-signal fix rate."""
+        if self.screening_kind == "correctness_floor":
+            if child_eval.summary is None:
+                return float("-inf")
+            return float(child_eval.summary.get("correctness", float("-inf")))
+        return self.high_signal_fix_rate(parent_eval, child_eval)
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
         """Return eval-set configs narrowed to the entries that failed for a parent.

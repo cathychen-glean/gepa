@@ -33,6 +33,12 @@ from glean_gepa.run_log import format_child_proposal_report, format_screening_re
 from glean_gepa.utils import apply_single_module_edit
 
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 0.5
+SKIP_CHILD_SCREENING_KINDS = frozenset({"none", "skip"})
+
+
+def _skips_child_screening(adapter: Any) -> bool:
+    """True when the experiment asked not to run a focused or full-train screen."""
+    return getattr(adapter, "screening_kind", None) in SKIP_CHILD_SCREENING_KINDS
 
 
 @dataclass
@@ -190,9 +196,6 @@ def make_children_for_generation(
 
             for variant in variants[: offspring_count - len(children)]:
                 child = apply_single_module_edit(parent, module, variant)
-                # Cache only accepted children. A child the generation refused is
-                # unreachable on replay, and its null screening score would read as
-                # unfinished work and pin the training slice forever.
                 if not append_child(child):
                     continue
                 if cached_children is not None and all(
@@ -225,6 +228,21 @@ def _eval_entry_ids(eval_batch: GleanEvaluationBatch) -> list[str]:
     return ordered
 
 
+def _child_screen_score(
+    adapter: GleanAdapterBase,
+    parent_eval: GleanEvaluationBatch,
+    screen_eval: GleanEvaluationBatch,
+    *,
+    use_high_signal_gate: bool,
+) -> float:
+    if not use_high_signal_gate:
+        return adapter.get_screening_score(screen_eval)
+    child_screen = getattr(adapter, "child_screen_score", None)
+    if callable(child_screen):
+        return float(child_screen(parent_eval, screen_eval))
+    return adapter.high_signal_fix_rate(parent_eval, screen_eval)
+
+
 def _select_screened_children(
     adapter: GleanAdapterBase,
     parent_eval: GleanEvaluationBatch,
@@ -237,11 +255,7 @@ def _select_screened_children(
     """Keep every child eligible for GEPA's acceptance/selection stage."""
     selected: list[tuple[Candidate, GleanEvaluationBatch, float]] = []
     for child, screen_eval in zip(children, screen_evals, strict=True):
-        child_score = (
-            adapter.high_signal_fix_rate(parent_eval, screen_eval)
-            if use_high_signal_gate
-            else adapter.get_screening_score(screen_eval)
-        )
+        child_score = _child_screen_score(adapter, parent_eval, screen_eval, use_high_signal_gate=use_high_signal_gate)
         if not use_high_signal_gate or child_score >= high_signal_screen_threshold:
             selected.append((child, screen_eval, child_score))
     return selected
@@ -688,6 +702,7 @@ class EvolutionaryProposer:
             else self._children_by_root
         )
         use_high_signal_gate = getattr(self.al_adapter, "supports_high_signal_eval", False)
+        skip_child_screening = _skips_child_screening(self.al_adapter)
 
         # A root's error examples exist to drive reflection and the high-signal
         # screen. When both are already cached for this slice, the generation is
@@ -772,13 +787,22 @@ class EvolutionaryProposer:
         best_parent_cand_id = prog_idx_to_cand_id[best_parent_idx]
         parent_eval = frontier_evals[best_parent_cand_id]
         screen_evals: list[GleanEvaluationBatch] = []
+        skipped_screening = False
         cached_screening = self._cached_screening_scores(
             train_slice_key,
             valid_children,
             use_high_signal_gate=use_high_signal_gate,
             high_signal_screen_threshold=self.high_signal_screen_threshold,
         )
-        if cached_screening is not None:
+        if skip_child_screening and cached_screening is None:
+            skipped_screening = True
+            screen_scores = [1.0] * len(valid_children)
+            screened_children = [(child, None, 1.0) for child in valid_children]
+            for child in valid_children:
+                self._record_screening_result(train_slice_key, child, 1.0, True)
+            if self.evalset_policy is not None:
+                self._save_children_cache()
+        elif cached_screening is not None:
             screen_scores = [score for score, _passed in cached_screening]
             screened_children = [
                 (child, None, score)
@@ -841,10 +865,8 @@ class EvolutionaryProposer:
             screen_scores = []
             screened_children = []
             for child, screen_eval in zip(valid_children, screen_evals, strict=True):
-                score = (
-                    self.al_adapter.high_signal_fix_rate(parent_eval, screen_eval)
-                    if use_high_signal_gate
-                    else self.al_adapter.get_screening_score(screen_eval)
+                score = _child_screen_score(
+                    self.al_adapter, parent_eval, screen_eval, use_high_signal_gate=use_high_signal_gate
                 )
                 passed = not use_high_signal_gate or score >= self.high_signal_screen_threshold
                 screen_scores.append(score)
@@ -856,7 +878,9 @@ class EvolutionaryProposer:
                 self._save_children_cache()
         passed_ids = {child.candidate_id for child, _eval, _score in screened_children}
         screening_rows: list[tuple[str, float, bool, str]] = []
-        if cached_screening is not None:
+        if skipped_screening:
+            screening_rows = [(child.candidate_id, 1.0, True, "skipped high-signal screen") for child in valid_children]
+        elif cached_screening is not None:
             screening_rows = [
                 (child.candidate_id, score, passed, "cached screening result")
                 for child, (score, passed) in zip(valid_children, cached_screening, strict=True)
@@ -864,25 +888,37 @@ class EvolutionaryProposer:
         elif screen_evals:
             for child, _screen_eval, score in zip(valid_children, screen_evals, screen_scores, strict=True):
                 detail = f"score={score:.4f}"
-                if use_high_signal_gate:
+                if use_high_signal_gate and getattr(self.al_adapter, "screening_kind", None) != "correctness_floor":
                     detail = f"fix_rate={score:.3f}"
                 screening_rows.append((child.candidate_id, score, child.candidate_id in passed_ids, detail))
+        if skipped_screening:
+            screen_mode = "skip"
+        elif use_high_signal_gate:
+            screen_mode = "fix-rate"
+        else:
+            screen_mode = "full-train"
         log_section(
             f"SCREENING iteration={i}",
             format_screening_report(
-                mode="fix-rate" if use_high_signal_gate else "full-train",
-                entry_ids=_eval_entry_ids(parent_eval),
+                mode=screen_mode,
+                entry_ids=() if skipped_screening else _eval_entry_ids(parent_eval),
                 rows=screening_rows,
             ),
         )
 
         if not screened_children:
             if use_high_signal_gate:
-                best_fix_rate = max(screen_scores, default=0.0)
-                self.logger.log(
-                    f"Iteration {i}: No child fixed at least {self.high_signal_screen_threshold:.0%} "
-                    f"of the high-signal failures (best={best_fix_rate:.1%})"
-                )
+                best_score = max(screen_scores, default=0.0)
+                if getattr(self.al_adapter, "screening_kind", None) == "correctness_floor":
+                    self.logger.log(
+                        f"Iteration {i}: No child reached the correctness floor "
+                        f"{self.high_signal_screen_threshold:.0%} (best={best_score:.1%})"
+                    )
+                else:
+                    self.logger.log(
+                        f"Iteration {i}: No child fixed at least {self.high_signal_screen_threshold:.0%} "
+                        f"of the high-signal failures (best={best_score:.1%})"
+                    )
             else:
                 self.logger.log(f"Iteration {i}: No children completed screening")
             return []
@@ -909,7 +945,7 @@ class EvolutionaryProposer:
         parent_score = self.al_adapter.get_screening_score(parent_eval)
         best_child_score = max(score for _child, _eval, score in pending_children)
         child_score = best_child_score
-        proposal_score_before = 0.0 if use_high_signal_gate else parent_score
+        proposal_score_before = 0.0 if use_high_signal_gate or skip_child_screening else parent_score
 
         self.logger.log(
             f"Iteration {i}: Evolutionary proposer generated {len(children)} children, "
@@ -928,6 +964,19 @@ class EvolutionaryProposer:
             step=i,
         )
 
+        screening_kind = getattr(self.al_adapter, "screening_kind", None)
+        if skip_child_screening:
+            screening_kind_meta = screening_kind or "none"
+            screening_threshold_meta = None
+            proposal_tag = "evolutionary"
+        elif use_high_signal_gate:
+            screening_kind_meta = screening_kind or "high_signal_fix_rate"
+            screening_threshold_meta = self.high_signal_screen_threshold
+            proposal_tag = "evolutionary_high_signal"
+        else:
+            screening_kind_meta = "screening_score"
+            screening_threshold_meta = None
+            proposal_tag = "evolutionary"
         return [
             CandidateProposal(
                 candidate=child.prompt_modules,
@@ -935,11 +984,11 @@ class EvolutionaryProposer:
                 subsample_indices=subsample_ids,
                 subsample_scores_before=[proposal_score_before],
                 subsample_scores_after=[screen_score],
-                tag="evolutionary_high_signal" if use_high_signal_gate else "evolutionary",
+                tag=proposal_tag,
                 metadata={
-                    "screening_kind": "high_signal_fix_rate" if use_high_signal_gate else "screening_score",
+                    "screening_kind": screening_kind_meta,
                     "screening_score": screen_score,
-                    "screening_threshold": HIGH_SIGNAL_FIX_RATE_THRESHOLD if use_high_signal_gate else None,
+                    "screening_threshold": screening_threshold_meta,
                 },
             )
             for child, _screen_eval, screen_score in pending_children

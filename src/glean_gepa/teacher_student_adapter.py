@@ -25,6 +25,7 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import (
+    AGENTIC_JUDGE_TYPE,
     COMPLETENESS_JUDGE_TYPE,
     CORRECTNESS_INPUT_MAPPINGS,
     CORRECTNESS_JUDGE_TYPE,
@@ -33,7 +34,7 @@ from glean_gepa.evalcli_client import (
 from glean_gepa.focused_evalset import resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
-    wait_for_judge_metrics,
+    wait_for_all_judge_metrics,
 )
 from glean_gepa.objectives import TeacherStudentObjective
 from glean_gepa.objectives.tool_match import FirstToolMatchObjective
@@ -65,6 +66,27 @@ def _payloads_by_base(payload: Any) -> dict[str, Any]:
     if _ANALYSIS_FIELDS & payload.keys():
         return {"": payload}
     return {str(base): inner for base, inner in payload.items()}
+
+
+def _same_screen_batch(left: Sequence[ALDataInst], right: Sequence[ALDataInst]) -> bool:
+    """True when two child screens target the same focused eval set.
+
+    Cached eval-run ids are attached per child, so identity/`==` on the batch
+    dicts would miss the overlap and fall back to serial `evaluate()`.
+    """
+
+    def identity(batch: Sequence[ALDataInst]) -> list[tuple[Any, ...]]:
+        return [
+            (
+                item.get("eval_set_name"),
+                item.get("eval_set_version"),
+                tuple(item.get("deployment_ids") or []),
+                tuple(item.get("eval_entry_ids") or []),
+            )
+            for item in batch
+        ]
+
+    return identity(left) == identity(right)
 
 
 def _entry_queries_from_listing(entries: Iterable[Mapping[str, Any]]) -> dict[str, str]:
@@ -107,6 +129,22 @@ def _fetch_entry_queries(
     return resolved
 
 
+def _per_entry_or_aggregate(analysis: JudgeAnalysis, entry_id: str | None) -> float | None:
+    """Eval-level rows use the aggregate; per-entry rows use a real entry score.
+
+    An empty ``per_entry`` map is not a copy of the aggregate onto every row.
+    Missing entries stay unscored so high-signal selection cannot treat the
+    eval rate as every student's preference.
+    """
+    if entry_id is None:
+        return analysis.aggregate
+    if entry_id in analysis.per_entry:
+        return analysis.per_entry[entry_id]
+    if analysis.per_entry:
+        return None
+    return analysis.aggregate
+
+
 @dataclass(frozen=True)
 class _StartedPair:
     al_data_inst: TeacherStudentALDataInst
@@ -139,9 +177,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
         pointwise_judges: Sequence[PointwiseJudge] | None = None,
         pairwise_judges: Sequence[PairwiseJudge] | None = None,
         objective: TeacherStudentObjective | None = None,
+        screening_kind: str | None = None,
     ):
         self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
         self.pairwise_judges = tuple(pairwise_judges) if pairwise_judges is not None else PAIRWISE_JUDGES
+        self.screening_kind = screening_kind
         self.teacher_model = teacher_model
         self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
@@ -204,8 +244,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         if not typed_batch:
             return GleanEvaluationBatch(outputs=[], scores=[], trajectories=None, objective_scores=[], summary=None)
         started, pending_waits = self._start_batch_evals(typed_batch, candidate)
-        self._wait_pending_evals(pending_waits)
-        self._run_judges(started)
+        self._await_judge_metrics(self._wait_pending_evals(pending_waits, [started]))
         return self._finish_batch_evals(started, capture_traces)
 
     def _get_or_start_eval(
@@ -302,12 +341,33 @@ class TeacherStudentAdapter(GleanAdapterBase):
             )
         return started, pending_waits
 
-    def _wait_pending_evals(self, pending_waits: dict[str, str]) -> None:
+    def _wait_pending_evals(
+        self,
+        pending_waits: dict[str, str],
+        started_groups: Sequence[Sequence[_StartedPair]],
+    ) -> list[tuple[str, str, str, str | None]]:
+        """Wait for evals and start each pair's judges as soon as both sides finish."""
+        completed = {
+            eval_id
+            for started in started_groups
+            for pair in started
+            for eval_id in (pair.teacher_eval_id, pair.student_eval_id)
+            if eval_id not in pending_waits
+        }
+        pending: list[tuple[str, str, str, str | None]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def start_ready_judges() -> None:
+            for started in started_groups:
+                pending.extend(self._start_judges(started, ready_eval_ids=completed, seen=seen))
+
+        start_ready_judges()
         for eval_id, role in pending_waits.items():
             self.runner.wait(eval_id)
             print(f"Recorded completed {role} eval_id: {eval_id}")
-            for judge in self.pointwise_judges:
-                self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
+            completed.add(eval_id)
+            start_ready_judges()
+        return pending
 
     @staticmethod
     def _judge_key(eval_id: str, judge_type: str, base_eval_run_id: str | None = None) -> tuple[str, str, str]:
@@ -323,6 +383,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 "aggregate": analysis.aggregate,
                 "per_entry": analysis.per_entry,
                 "judge_run_id": analysis.judge_run_id,
+                "per_entry_feedback": analysis.per_entry_feedback,
             }
         return {"judge_runs": judge_runs, "judge_cache": judge_cache}
 
@@ -368,6 +429,9 @@ class TeacherStudentAdapter(GleanAdapterBase):
                         per_entry=per_entry,
                         judge_run_id=str(raw["judge_run_id"]) if raw.get("judge_run_id") else None,
                         judge_type=str(judge_type),
+                        per_entry_feedback={
+                            str(entry_id): str(text) for entry_id, text in (raw.get("per_entry_feedback") or {}).items()
+                        },
                     )
 
     def _ensure_judge(
@@ -404,44 +468,65 @@ class TeacherStudentAdapter(GleanAdapterBase):
             self._save_cache()
         return judge_run_id
 
-    def _run_judges(self, started: list[_StartedPair]) -> None:
-        """Trigger judges after evals finish; pairwise correctness uses the teacher as baseline."""
+    def _pairwise_judges_for_pair(self, pair: _StartedPair) -> tuple[PairwiseJudge, ...]:
+        """Start every configured pairwise judge, except the correctness-floor split.
+
+        ``screening.kind=correctness_floor`` still runs CORRECTNESS on focused
+        screens and AGENTIC on full/val evals. The agentic pack screens with
+        AGENTIC_JUDGE on the high-signal slice instead, so it does not split.
+        """
+        if self.screening_kind != "correctness_floor":
+            return self.pairwise_judges
+        wanted_type = CORRECTNESS_JUDGE_TYPE if pair.al_data_inst.get("eval_entry_ids") else AGENTIC_JUDGE_TYPE
+        return tuple(judge for judge in self.pairwise_judges if judge.judge_type == wanted_type)
+
+    def _start_judges(
+        self,
+        started: Sequence[_StartedPair],
+        *,
+        ready_eval_ids: set[str] | None = None,
+        seen: set[tuple[str, str, str]] | None = None,
+    ) -> list[tuple[str, str, str, str | None]]:
+        """Create Cortex judge runs for pairs whose evals are done. Do not wait for metrics."""
         pending: list[tuple[str, str, str, str | None]] = []
-        seen: set[tuple[str, str, str]] = set()
+        seen_keys = seen if seen is not None else set()
         for pair in started:
-            for judge in self.pairwise_judges:
-                cache_key = self._judge_key(pair.student_eval_id, judge.judge_type, pair.teacher_eval_id)
-                if cache_key in seen:
-                    continue
-                seen.add(cache_key)
-                if cache_key in self._judge_cache:
-                    continue
-                judge_run_id = self._ensure_judge(
-                    pair.student_eval_id,
-                    judge_type=judge.judge_type,
-                    run_params=judge.run_params,
-                    base_eval_run_id=pair.teacher_eval_id,
-                    input_mappings=judge.input_mappings,
-                )
-                pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
+            pair_ready = ready_eval_ids is None or (
+                pair.teacher_eval_id in ready_eval_ids and pair.student_eval_id in ready_eval_ids
+            )
+            if pair_ready:
+                for judge in self._pairwise_judges_for_pair(pair):
+                    cache_key = self._judge_key(pair.student_eval_id, judge.judge_type, pair.teacher_eval_id)
+                    if cache_key in seen_keys or cache_key in self._judge_cache:
+                        continue
+                    seen_keys.add(cache_key)
+                    judge_run_id = self._ensure_judge(
+                        pair.student_eval_id,
+                        judge_type=judge.judge_type,
+                        run_params=judge.run_params,
+                        base_eval_run_id=pair.teacher_eval_id,
+                        input_mappings=judge.input_mappings,
+                    )
+                    pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
+                if ready_eval_ids is not None and eval_id not in ready_eval_ids:
+                    continue
                 for judge in self.pointwise_judges:
                     cache_key = self._judge_key(eval_id, judge.judge_type)
-                    if cache_key in seen:
+                    if cache_key in seen_keys or cache_key in self._judge_cache:
                         continue
-                    seen.add(cache_key)
-                    if cache_key in self._judge_cache:
-                        continue
+                    seen_keys.add(cache_key)
                     judge_run_id = self._ensure_judge(eval_id, judge_type=judge.judge_type, run_params=judge.run_params)
                     pending.append((eval_id, judge.judge_type, judge_run_id, None))
-        for eval_id, judge_type, judge_run_id, base_eval_id in pending:
-            analysis = wait_for_judge_metrics(
-                self.runner.evalcli,
-                eval_id=eval_id,
-                judge_type=judge_type,
-                judge_run_id=judge_run_id,
-                base_eval_id=base_eval_id,
-            )
+        return pending
+
+    def _await_judge_metrics(self, pending: Sequence[tuple[str, str, str | None, str | None]]) -> None:
+        """Block until every started judge has finished, then read all scores."""
+        analyses = wait_for_all_judge_metrics(self.runner.evalcli, pending)
+        for eval_id, judge_type, _judge_run_id, base_eval_id in pending:
+            analysis = analyses.get((eval_id, judge_type, base_eval_id))
+            if analysis is None:
+                continue
             self._judge_cache[self._judge_key(eval_id, judge_type, base_eval_id)] = analysis
         if pending:
             self._save_cache()
@@ -458,17 +543,22 @@ class TeacherStudentAdapter(GleanAdapterBase):
         *,
         capture_traces: bool = True,
     ) -> list[GleanEvaluationBatch]:
-        """Overlap shared-batch screens through evaluate_many instead of threading evaluate()."""
+        """Overlap shared-batch screens; keep per-child cached eval-run ids."""
         if not items:
             return []
         first_batch = items[0][1]
-        if all(batch is first_batch or batch == first_batch for _candidate, batch in items):
-            return self.evaluate_many(
-                first_batch,
-                [candidate for candidate, _batch in items],
-                capture_traces,
+        if not all(_same_screen_batch(batch, first_batch) for _candidate, batch in items):
+            return [self.evaluate(batch, candidate, capture_traces=capture_traces) for candidate, batch in items]
+        all_started: list[list[_StartedPair]] = []
+        pending_waits: dict[str, str] = {}
+        for candidate, batch in items:
+            started, candidate_pending = self._start_batch_evals(
+                cast(list[TeacherStudentALDataInst], batch), candidate
             )
-        return [self.evaluate(batch, candidate, capture_traces=capture_traces) for candidate, batch in items]
+            all_started.append(started)
+            pending_waits.update(candidate_pending)
+        self._await_judge_metrics(self._wait_pending_evals(pending_waits, all_started))
+        return [self._finish_batch_evals(started, capture_traces) for started in all_started]
 
     def evaluate_many(
         self,
@@ -483,9 +573,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             started, candidate_pending = self._start_batch_evals(typed_batch, candidate)
             all_started.append(started)
             pending_waits.update(candidate_pending)
-        self._wait_pending_evals(pending_waits)
-        for started in all_started:
-            self._run_judges(started)
+        self._await_judge_metrics(self._wait_pending_evals(pending_waits, all_started))
         return [self._finish_batch_evals(started, capture_traces) for started in all_started]
 
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
@@ -505,7 +593,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             grouped.setdefault(key, []).append(entry_id)
         if grouped:
             count = sum(len(ids) for ids in grouped.values())
-            print(f"[High-signal] Selected {count} first-tool mismatch entries for screening")
+            print(f"[High-signal] Selected {count} entries for screening")
         return [
             {
                 "eval_set_name": eval_set_name,
@@ -527,16 +615,17 @@ class TeacherStudentAdapter(GleanAdapterBase):
     ) -> dict[str, list[ReflectiveExample]]:
         """Build reflection examples from the objective's high-signal selection.
 
-        ``k`` and ``error_hamming_distance_k`` are ignored: the proposer only sees
-        this frequency-capped mismatch set (at most 20 entries, or the full
-        most-frequent group if that group is larger).
+        ``k`` is ``search.reflection_samples`` (CLI ``--reflection_samples``): an
+        integer caps the set, ``None`` keeps every high-signal entry. Hamming
+        dedupe is not applied on this path.
         """
-        del k, error_hamming_distance_k
+        del error_hamming_distance_k
         return self.objective.make_reflective_dataset(
             candidate,
             eval_batch,
             components_to_update,
             self.objective.build_reflective_example,
+            k=k,
         )
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
@@ -571,8 +660,13 @@ class TeacherStudentAdapter(GleanAdapterBase):
             )
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
+            primary_from_pairwise_judge = any(judge.name == self.objective.name for judge in self.pairwise_judges)
             if is_focused_eval:
-                focused_alignment_rates.append(self.objective.focused_pass_rate(analysis, requested_entry_ids))
+                # Pairwise-judge primaries (agentic preference) already land in
+                # summary via the judge overlay. Overwriting with focused_pass_rate
+                # would zero that screen. Trace-based primaries still need it.
+                if self.screening_kind != "correctness_floor" and not primary_from_pairwise_judge:
+                    focused_alignment_rates.append(self.objective.focused_pass_rate(analysis, requested_entry_ids))
             else:
                 self.objective.validate_full_eval(analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
@@ -592,6 +686,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     )
                     self._entry_query_cache[cache_key] = cached
                 entry_queries = cached
+            pairwise_for_pair = self._pairwise_judges_for_pair(pair)
             student_judges = {
                 **{
                     judge.name: self._judge_for(pair.student_eval_id, judge_type=judge.judge_type)
@@ -603,7 +698,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                         judge_type=judge.judge_type,
                         base_eval_run_id=pair.teacher_eval_id,
                     )
-                    for judge in self.pairwise_judges
+                    for judge in pairwise_for_pair
                 },
             }
             for judge in self.pointwise_judges:
@@ -613,7 +708,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     f"{student_judges[judge.name].aggregate:.2f} "
                     f"teacher {pair.teacher_eval_id}={teacher_analysis.aggregate:.2f}"
                 )
-            for judge in self.pairwise_judges:
+            for judge in pairwise_for_pair:
                 print(
                     f"[{judge.judge_type}] student {pair.student_eval_id} vs teacher "
                     f"{pair.teacher_eval_id}={student_judges[judge.name].aggregate:.2f}"
@@ -633,16 +728,22 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 output = cast(TeacherStudentALRolloutOutput, dict(row.output))
                 if row.entry_id and (entry_query := entry_queries.get(row.entry_id)):
                     output["query"] = entry_query
+                judge_scores: dict[str, float] = {}
+                for name, judge_analysis in student_judges.items():
+                    score = _per_entry_or_aggregate(judge_analysis, row.entry_id)
+                    if score is None:
+                        continue
+                    judge_scores[name] = score
+                    if row.entry_id is not None and row.entry_id in judge_analysis.per_entry:
+                        output[name] = score
+                        feedback = judge_analysis.per_entry_feedback.get(row.entry_id)
+                        if feedback:
+                            output[f"{name}_feedback"] = feedback
                 all_outputs.append(output)
                 objective_score = {
                     **self.constant_scores,
                     **row.dimension_scores,
-                    **{
-                        name: judge_analysis.aggregate
-                        if row.entry_id is None
-                        else judge_analysis.per_entry.get(row.entry_id, judge_analysis.aggregate)
-                        for name, judge_analysis in student_judges.items()
-                    },
+                    **judge_scores,
                 }
                 score = self.composite_score(objective_score)
                 all_scores.append(score)
