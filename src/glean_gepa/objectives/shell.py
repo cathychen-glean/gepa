@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from datetime import time as datetime_time
 from typing import Any, ClassVar
 
@@ -25,8 +25,6 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
     EvalRunShellToolErrorAnalysis,
     fetch_eval_run_shell_tool_error_analysis,
     fetch_high_signal_evalset_entries,
-    parse_shell_tool_error_entry_metrics,
-    parse_shell_tool_error_metrics,
 )
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.reflection_prompts import CONDITIONAL_PRESERVE_RULE
@@ -37,8 +35,6 @@ WRITING_CODE_RESPONSIBILITY = (
     "ToolResult handling, parallelism via asyncio.gather, sandbox rules, and when to print vs extract. "
     f"Use shell error examples as evidence. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
 )
-
-EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
 
 
 def log_shell_tool_error_analysis(analysis: EvalRunShellToolErrorAnalysis) -> None:
@@ -140,63 +136,6 @@ def enrich_shell_error_action_inputs(
     return replace(analysis, aggregate=aggregate, per_entry=per_entry)
 
 
-def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
-    def metrics_dict(metrics: Any) -> dict[str, Any]:
-        return {
-            "eval_id": getattr(metrics, "eval_id", None),
-            "entry_id": getattr(metrics, "entry_id", None),
-            "shell_executions": metrics.shell_executions,
-            "shell_errors": metrics.shell_errors,
-            "shell_error_rate": metrics.shell_error_rate,
-            "shell_error_pct": metrics.shell_error_pct,
-            "trace_ids": list(getattr(metrics, "trace_ids", ())),
-            "session_tracking_tokens": list(getattr(metrics, "session_tracking_tokens", ())),
-            "recent_error_examples": [asdict(example) for example in metrics.recent_error_examples],
-        }
-
-    return {
-        "schema_version": EVAL_ANALYSIS_CACHE_SCHEMA_VERSION,
-        "eval_id": analysis.eval_id,
-        "start_date": analysis.start_date.isoformat(),
-        "end_date": analysis.end_date.isoformat(),
-        "aggregate": metrics_dict(analysis.aggregate),
-        "per_entry": {entry_id: metrics_dict(metrics) for entry_id, metrics in analysis.per_entry.items()},
-        "high_signal_entry_ids": list(analysis.high_signal_entry_ids),
-    }
-
-
-def _parse_eval_analysis_cache(raw_cache: Any) -> dict[str, EvalRunShellToolErrorAnalysis]:
-    parsed: dict[str, EvalRunShellToolErrorAnalysis] = {}
-    if not isinstance(raw_cache, dict):
-        return parsed
-    for eval_id, raw in raw_cache.items():
-        try:
-            if not isinstance(raw, dict):
-                continue
-            if raw.get("schema_version") != EVAL_ANALYSIS_CACHE_SCHEMA_VERSION:
-                print(f"[Cache] Refreshing legacy shell error analysis for eval_id: {eval_id}")
-                continue
-            aggregate = parse_shell_tool_error_metrics(raw["aggregate"])
-            if aggregate.shell_executions == 0:
-                print(f"[Cache] Refreshing provisional 0/0 shell analysis for eval_id: {eval_id}")
-                continue
-            per_entry = {
-                entry_id: parse_shell_tool_error_entry_metrics(metrics)
-                for entry_id, metrics in (raw.get("per_entry") or {}).items()
-            }
-            parsed[str(eval_id)] = EvalRunShellToolErrorAnalysis(
-                eval_id=str(raw.get("eval_id") or eval_id),
-                start_date=date.fromisoformat(raw["start_date"]),
-                end_date=date.fromisoformat(raw["end_date"]),
-                aggregate=aggregate,
-                per_entry=per_entry,
-                high_signal_entry_ids=tuple(raw.get("high_signal_entry_ids") or ()),
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return parsed
-
-
 class ShellSuccessObjective(SingleModelObjective):
     """Score student evals by shell-tool success rate from Agentspan."""
 
@@ -224,16 +163,10 @@ class ShellSuccessObjective(SingleModelObjective):
         evalcli: Any | None = None,
         include_action_inputs: bool = True,
     ) -> EvalRunShellToolErrorAnalysis:
-        del include_action_inputs
         cached = self._eval_analysis_cache.get(eval_id)
         if cached is not None:
-            missing_entry_breakdown = (
-                include_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0
-            )
-            if not missing_entry_breakdown:
-                print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
-                return cached
-            print(f"[Cache] Refetching shell error analysis with per-entry metrics for eval_id: {eval_id}")
+            print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
+            return cached
         analysis = fetch_eval_run_shell_tool_error_analysis(
             self.bigquery_client,
             eval_id=eval_id,
@@ -241,13 +174,15 @@ class ShellSuccessObjective(SingleModelObjective):
             include_error_examples=include_error_examples,
             include_per_entry=include_per_entry,
         )
-        if include_error_examples:
-            if evalcli is not None:
-                analysis = enrich_shell_error_action_inputs(evalcli, analysis)
-            if analysis.aggregate.shell_executions == 0:
-                print(f"[Cache] Not caching provisional 0/0 shell analysis for eval_id: {eval_id}")
-                return analysis
-            self._eval_analysis_cache[eval_id] = analysis
+        # A trace call that hits a validation-stored entry gets shell error text
+        # but no action inputs, for the life of the process. That is the accepted
+        # trade for no unhydrated set.
+        if evalcli is not None and include_action_inputs:
+            analysis = enrich_shell_error_action_inputs(evalcli, analysis)
+        if analysis.aggregate.shell_executions == 0:
+            print(f"[Cache] Not caching provisional 0/0 shell analysis for eval_id: {eval_id}")
+            return analysis
+        self._eval_analysis_cache[eval_id] = analysis
         return analysis
 
     def is_pending(self, analysis: EvalRunShellToolErrorAnalysis) -> bool:
@@ -463,17 +398,10 @@ class ShellSuccessObjective(SingleModelObjective):
         del metrics
         return None
 
-    def cache_payload(self) -> dict[str, Any]:
-        return {eval_id: _serialize_eval_analysis(analysis) for eval_id, analysis in self._eval_analysis_cache.items()}
-
-    def load_cache(self, raw_cache: Any) -> None:
-        self._eval_analysis_cache = _parse_eval_analysis_cache(raw_cache)
-
 
 register_telemetry_source("single_model", "shell_telemetry", ShellSuccessObjective)
 
 __all__ = [
-    "EVAL_ANALYSIS_CACHE_SCHEMA_VERSION",
     "ShellSuccessObjective",
     "enrich_shell_error_action_inputs",
     "log_shell_tool_error_analysis",

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
-from datetime import date
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTrajectory
@@ -16,8 +14,6 @@ from glean_gepa.objectives.utils.loop_count_util import (
     LOOP_EFFICIENCY_OBJECTIVE,
     TARGET_LOOP_COUNT,
     EvalRunLoopCountAnalysis,
-    LoopCountEntryMetrics,
-    aggregate_loop_count_metrics,
     fetch_eval_run_loop_count_analysis,
     log_loop_count_analysis,
 )
@@ -30,61 +26,6 @@ WRITING_CODE_RESPONSIBILITY = (
     "and never skip the search or citation work the question requires. "
     f"{CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
 )
-
-EVAL_LOOP_CACHE_SCHEMA_VERSION = 2
-
-
-def _serialize_eval_analysis(analysis: EvalRunLoopCountAnalysis) -> dict[str, Any]:
-    return {
-        "schema_version": EVAL_LOOP_CACHE_SCHEMA_VERSION,
-        "eval_id": analysis.eval_id,
-        "start_date": analysis.start_date.isoformat(),
-        "end_date": analysis.end_date.isoformat(),
-        "aggregate": asdict(analysis.aggregate),
-        "per_entry": {entry_id: asdict(metrics) for entry_id, metrics in analysis.per_entry.items()},
-        "high_signal_entry_ids": list(analysis.high_signal_entry_ids),
-    }
-
-
-def _parse_eval_analysis_cache(
-    raw_cache: Any,
-    *,
-    target_loops: int = TARGET_LOOP_COUNT,
-    correctness_pass: float = CORRECTNESS_PASS,
-) -> dict[str, EvalRunLoopCountAnalysis]:
-    parsed: dict[str, EvalRunLoopCountAnalysis] = {}
-    if not isinstance(raw_cache, dict):
-        return parsed
-    for eval_id, raw in raw_cache.items():
-        try:
-            if not isinstance(raw, dict) or raw.get("schema_version") != EVAL_LOOP_CACHE_SCHEMA_VERSION:
-                continue
-            per_entry = {
-                str(entry_id): LoopCountEntryMetrics(
-                    entry_id=str(metrics.get("entry_id") or entry_id),
-                    loop_count=int(metrics.get("loop_count") or 0),
-                    correctness=float(metrics.get("correctness") or 0.0),
-                    has_error=bool(metrics.get("has_error")),
-                    action_inputs=tuple(metrics.get("action_inputs") or ()),
-                    target_loops=target_loops,
-                    correctness_pass=correctness_pass,
-                )
-                for entry_id, metrics in (raw.get("per_entry") or {}).items()
-                if isinstance(metrics, dict)
-            }
-            parsed[str(eval_id)] = EvalRunLoopCountAnalysis(
-                eval_id=str(raw.get("eval_id") or eval_id),
-                start_date=date.fromisoformat(raw["start_date"]),
-                end_date=date.fromisoformat(raw["end_date"]),
-                aggregate=aggregate_loop_count_metrics(str(raw.get("eval_id") or eval_id), per_entry),
-                per_entry=per_entry,
-                high_signal_entry_ids=tuple(
-                    sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
-                ),
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return parsed
 
 
 def _rollout_output(
@@ -149,16 +90,11 @@ class LoopEfficiencyObjective(SingleModelObjective):
         evalcli: Any | None = None,
         include_action_inputs: bool = True,
     ) -> EvalRunLoopCountAnalysis:
-        del include_error_examples
+        del include_error_examples, include_per_entry
         cached = self._eval_analysis_cache.get(eval_id)
         if cached is not None:
-            missing_entry_breakdown = (
-                include_per_entry and not cached.per_entry and cached.aggregate.compared_entries > 0
-            )
-            if not missing_entry_breakdown:
-                print(f"[Cache HIT] Using cached loop-count analysis for eval_id: {eval_id}")
-                return cached
-            print(f"[Cache] Refetching loop-count analysis with per-entry metrics for eval_id: {eval_id}")
+            print(f"[Cache HIT] Using cached loop-count analysis for eval_id: {eval_id}")
+            return cached
         analysis = fetch_eval_run_loop_count_analysis(
             self.bigquery_client,
             eval_id=eval_id,
@@ -363,20 +299,9 @@ class LoopEfficiencyObjective(SingleModelObjective):
             f"correctness={metrics.get('correctness', 0.0):.2f}"
         )
 
-    def cache_payload(self) -> dict[str, Any]:
-        return {eval_id: _serialize_eval_analysis(analysis) for eval_id, analysis in self._eval_analysis_cache.items()}
-
-    def load_cache(self, raw_cache: Any) -> None:
-        self._eval_analysis_cache = _parse_eval_analysis_cache(
-            raw_cache,
-            target_loops=self._target_loop_count(),
-            correctness_pass=self._correctness_pass(),
-        )
-
 
 register_telemetry_source("single_model", "loop_telemetry", LoopEfficiencyObjective)
 
 __all__ = [
-    "EVAL_LOOP_CACHE_SCHEMA_VERSION",
     "LoopEfficiencyObjective",
 ]

@@ -153,30 +153,21 @@ class SingleModelAdapter(GleanAdapterBase):
     def _eval_analysis_cache(self) -> dict[str, Any]:
         return getattr(self.objective, "_eval_analysis_cache", {})
 
-    def _extra_cache_payload(self) -> dict[str, Any]:
-        return {"eval_analysis_cache": self.objective.cache_payload()}
-
-    def _load_extra_cache(self, data: dict[str, Any]) -> None:
-        self.objective.load_cache(data.get("eval_analysis_cache", {}))
-
     def _get_or_fetch_analysis(
         self,
         eval_id: str,
         *,
-        include_error_examples: bool = True,
-        include_per_entry: bool = True,
         include_action_inputs: bool = True,
     ):
-        analysis = self.objective.analyze(
+        # Every fetch asks for per-entry rows and shell error text. A validation
+        # result can then satisfy a later trace call in this process.
+        return self.objective.analyze(
             eval_id,
-            include_error_examples=include_error_examples,
-            include_per_entry=include_per_entry,
+            include_error_examples=True,
+            include_per_entry=True,
             evalcli=self.runner.evalcli,
             include_action_inputs=include_action_inputs,
         )
-        if eval_id in self._eval_analysis_cache:
-            self._save_cache()
-        return analysis
 
     def _evaluate_single_model(
         self,
@@ -268,8 +259,6 @@ class SingleModelAdapter(GleanAdapterBase):
                 )
             analysis = self._get_or_fetch_analysis(
                 student_eval_id,
-                include_error_examples=capture_traces and not is_focused_eval,
-                include_per_entry=is_focused_eval or capture_traces,
                 include_action_inputs=not bool(al_data_inst.get("validation_only")),
             )
             if self.objective.is_pending(analysis):
