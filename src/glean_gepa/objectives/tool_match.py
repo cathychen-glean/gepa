@@ -5,13 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from glean_gepa.adapter_types import (
-    TeacherStudentALRolloutOutput,
-    TeacherStudentALTrajectory,
-)
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
+from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
+from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
-from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
@@ -59,27 +55,17 @@ def _rollout_output(
     teacher_tool_calls: int | None = None,
     student_first_tool_input: tuple[str, str] | None = None,
     teacher_first_tool_input: tuple[str, str] | None = None,
-) -> TeacherStudentALRolloutOutput:
+):
     """One rollout row. Tool-call counts default to the listed events."""
-    output: TeacherStudentALRolloutOutput = {
-        "deployment_id": deployment_id,
-        "query": query,
-        "student_answer": "",
-        "student_tool_events": student_tools,
-        "student_loops": 0,
-        "student_tool_calls": len(student_tools) if student_tool_calls is None else student_tool_calls,
-        "student_tool_errors": 0,
-        "student_input_tokens": 0,
-        "student_output_tokens": 0,
-        "student_latency_ms": None,
-        "teacher_answer": "",
-        "teacher_tool_events": teacher_tools,
-        "teacher_loops": 0,
-        "teacher_tool_calls": len(teacher_tools) if teacher_tool_calls is None else teacher_tool_calls,
-        "teacher_input_tokens": 0,
-        "teacher_output_tokens": 0,
-        "entry_id": entry_id,
-    }
+    output = paired_rollout_output(
+        deployment_id=deployment_id,
+        query=query,
+        entry_id=entry_id,
+        student_tool_events=student_tools,
+        teacher_tool_events=teacher_tools,
+        student_tool_calls=student_tool_calls,
+        teacher_tool_calls=teacher_tool_calls,
+    )
     if student_first_tool_input:
         output["student_first_tool_input"] = list(student_first_tool_input)
     if teacher_first_tool_input:
@@ -225,7 +211,6 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         return (
             int(tool_alignment < float(self.pack_param("failure_score_below", 0.7))),
             int(self._mismatch_key(output) is not None),
-            int(output.get("student_tool_errors", 0) > 0),
         )
 
     def build_reflective_example(
@@ -238,7 +223,6 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         tool_alignment = objective_scores.get(self.name, trajectory["score"])
-        correctness = objective_scores.get("correctness")
         student_tools = output.get("student_tool_events", [])
         teacher_tools = output.get("teacher_tool_events", [])
         mismatch = self._mismatch_key(output)
@@ -254,8 +238,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"First-tool mismatch: teacher {teacher_phrase} and student {student_phrase}.")
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
-        if correctness is not None and correctness < JUDGE_SPECS["correctness"].default_min:
-            feedback_parts.append(f"Correctness issue: score={correctness:.2f}.")
+        feedback_parts.extend(self.wired_signal_issues(objective_scores))
 
         inputs: ReflectiveExampleInputs = {
             "eval_set": trajectory["data"]["eval_set_name"],
@@ -263,12 +246,6 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             "deployment_id": output["deployment_id"],
             "query": output["query"],
         }
-        metrics: ReflectiveExampleMetrics = {
-            "score": trajectory["score"],
-            "tool_alignment": tool_alignment,
-        }
-        if correctness is not None:
-            metrics["correctness"] = correctness
         action_inputs: list[str] = []
         for role in ("teacher", "student"):
             pair = output.get(f"{role}_first_tool_input")
@@ -290,18 +267,8 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             "Action Inputs": action_inputs,
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
-            "Metrics": metrics,
+            "Metrics": self.reflective_metrics(trajectory),
         }
-
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        parts = [
-            f"score={metrics['score']:.2f}",
-            f"tool_alignment={metrics.get('tool_alignment', metrics['score']):.2f}",
-        ]
-        correctness = metrics.get("correctness")
-        if correctness is not None:
-            parts.append(f"correctness={correctness:.2f}")
-        return ", ".join(parts)
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
         return high_signal_core_tool_keys(trajectories)

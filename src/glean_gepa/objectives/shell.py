@@ -2,29 +2,21 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
-from datetime import date, datetime, timedelta, timezone
-from datetime import time as datetime_time
+from dataclasses import asdict
+from datetime import date
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTrajectory
-from glean_gepa.al_adapter import (
-    ReflectiveExample,
-    ReflectiveExampleInputs,
-    ReflectiveExampleMetrics,
-    extract_shell_action_inputs,
-)
-from glean_gepa.debug import debug_print
-from glean_gepa.evalcli_client import EvalCliClient
+from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE
 from glean_gepa.objectives.base import ScoredRow, SingleModelObjective, register_telemetry_source
 from glean_gepa.objectives.utils.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
+    enrich_shell_error_action_inputs,
     fetch_eval_run_shell_tool_error_analysis,
-    fetch_high_signal_evalset_entries,
+    log_shell_tool_error_analysis,
     parse_shell_tool_error_entry_metrics,
     parse_shell_tool_error_metrics,
 )
@@ -39,105 +31,6 @@ WRITING_CODE_RESPONSIBILITY = (
 )
 
 EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
-
-
-def log_shell_tool_error_analysis(analysis: EvalRunShellToolErrorAnalysis) -> None:
-    """Log the fetched shell-tool error rate and recent error details."""
-    aggregate = analysis.aggregate
-    print(
-        f"[Shell Tool] Fetched error rate for eval {analysis.eval_id}: "
-        f"{aggregate.shell_error_pct:.2f}% "
-        f"({aggregate.shell_errors}/{aggregate.shell_executions})"
-    )
-    for example in aggregate.recent_error_examples:
-        if example.action_input:
-            debug_print(f"[Shell Tool] Action input for eval {analysis.eval_id}: {example.action_input}")
-        if example.error_str:
-            debug_print(f"[Shell Tool] Error for eval {analysis.eval_id}: {example.error_str}")
-
-
-def _timestamp_millis(value: str | None) -> int | None:
-    if not value:
-        return None
-    normalized = value.replace(" UTC", "+00:00")
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp() * 1000)
-
-
-def enrich_shell_error_action_inputs(
-    evalcli: EvalCliClient,
-    analysis: EvalRunShellToolErrorAnalysis,
-) -> EvalRunShellToolErrorAnalysis:
-    """Fetch detailed traces and attach serialized Shell inputs to failed actions."""
-    examples = list(analysis.aggregate.recent_error_examples)
-    for metrics in analysis.per_entry.values():
-        examples.extend(metrics.recent_error_examples)
-
-    grouped: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
-    for example in examples:
-        if example.project_id and example.trace_id and example.action_run_id and not example.action_input:
-            grouped[(example.project_id, example.trace_id)].append(example)
-    if not grouped:
-        return analysis
-
-    print(f"[Shell Tool] Fetching action inputs for {len(grouped)} traces on eval {analysis.eval_id}")
-    resolved: dict[tuple[str, str, str], str] = {}
-    for (deployment_id, trace_id), trace_examples in grouped.items():
-        timestamps = [
-            timestamp
-            for example in trace_examples
-            for timestamp in [_timestamp_millis(example.started_at)]
-            if timestamp is not None
-        ]
-        if timestamps:
-            start_time_millis = min(timestamps) - int(timedelta(hours=1).total_seconds() * 1000)
-            end_time_millis = max(timestamps) + 1000
-        else:
-            start_dt = datetime.combine(analysis.start_date, datetime_time.min, tzinfo=timezone.utc)
-            end_dt = datetime.combine(analysis.end_date + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc)
-            start_time_millis = int(start_dt.timestamp() * 1000)
-            end_time_millis = int(end_dt.timestamp() * 1000)
-        try:
-            detailed_trace = evalcli.get_analysis_trace(
-                deployment_id=deployment_id,
-                trace_id=trace_id,
-                start_time_millis=start_time_millis,
-                end_time_millis=end_time_millis,
-            )
-        except Exception as exc:
-            print(f"[Shell Tool] Failed to fetch action inputs for trace {trace_id}: {exc}")
-            continue
-        for action_run_id, action_input in extract_shell_action_inputs(detailed_trace).items():
-            resolved[(deployment_id, trace_id, action_run_id)] = action_input
-
-    def enrich_example(example: Any) -> Any:
-        if example.action_input or not (example.project_id and example.trace_id and example.action_run_id):
-            return example
-        action_input = resolved.get((example.project_id, example.trace_id, example.action_run_id))
-        return replace(example, action_input=action_input) if action_input else example
-
-    if not resolved:
-        return analysis
-
-    aggregate = replace(
-        analysis.aggregate,
-        recent_error_examples=tuple(enrich_example(example) for example in analysis.aggregate.recent_error_examples),
-    )
-    per_entry = {
-        entry_id: replace(
-            metrics,
-            recent_error_examples=tuple(enrich_example(example) for example in metrics.recent_error_examples),
-        )
-        for entry_id, metrics in analysis.per_entry.items()
-    }
-    return replace(analysis, aggregate=aggregate, per_entry=per_entry)
 
 
 def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
@@ -205,6 +98,7 @@ class ShellSuccessObjective(SingleModelObjective):
     focused_bucket_type = SESSION_BUCKET_TYPE
     failure_label = "HIGH-SIGNAL FAILURES"
     pending_telemetry_label = "shell"
+    pending_count = "shell_executions"
     module_responsibilities: ClassVar[Mapping[str, str]] = {WRITING_CODE_KEY: WRITING_CODE_RESPONSIBILITY}
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
@@ -250,22 +144,9 @@ class ShellSuccessObjective(SingleModelObjective):
             self._eval_analysis_cache[eval_id] = analysis
         return analysis
 
-    def is_pending(self, analysis: EvalRunShellToolErrorAnalysis) -> bool:
-        return analysis.aggregate.shell_executions == 0
-
-    def aggregate_score(self, analysis: EvalRunShellToolErrorAnalysis) -> float:
-        return analysis.aggregate.shell_success_rate
-
     def focused_pass_rate(self, analysis: EvalRunShellToolErrorAnalysis, requested_entry_ids: Sequence[str]) -> float:
         passed_entries = sum(1 for entry_metrics in analysis.per_entry.values() if entry_metrics.shell_errors == 0)
         return passed_entries / len(requested_entry_ids)
-
-    def entry_ids_to_score(
-        self, analysis: EvalRunShellToolErrorAnalysis, requested_entry_ids: Sequence[str] | None
-    ) -> tuple[str, ...]:
-        if requested_entry_ids:
-            return tuple(analysis.per_entry) or tuple(requested_entry_ids)
-        return analysis.high_signal_entry_ids
 
     def log_analysis(self, analysis: EvalRunShellToolErrorAnalysis) -> None:
         log_shell_tool_error_analysis(analysis)
@@ -387,24 +268,6 @@ class ShellSuccessObjective(SingleModelObjective):
             )
         return rows
 
-    def prepare_focused_source_entries(
-        self,
-        *,
-        eval_set_name: str,
-        eval_set_version: str,
-        eval_run_id: str,
-        entry_ids: Sequence[str],
-        deployment_ids: Sequence[str],
-    ) -> list[dict[str, Any]] | None:
-        return fetch_high_signal_evalset_entries(
-            self.bigquery_client,
-            eval_set_name=eval_set_name,
-            eval_set_version=eval_set_version,
-            eval_run_id=eval_run_id,
-            entry_ids=list(entry_ids),
-            deployment_ids=list(deployment_ids),
-        )
-
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name
         output = trajectory["output"]
@@ -423,7 +286,6 @@ class ShellSuccessObjective(SingleModelObjective):
     ) -> ReflectiveExample:
         del component_name, candidate
         output = trajectory["output"]
-        shell_success_rate = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         shell_error_messages = [
             sanitized for error in output.get("shell_error_messages", []) if (sanitized := strip_stdout_sections(error))
         ]
@@ -456,12 +318,8 @@ class ShellSuccessObjective(SingleModelObjective):
             "Action Inputs": output.get("shell_action_inputs", [])[:5],
             "Execution Errors": shell_error_messages[:5],
             "Feedback": feedback,
-            "Metrics": {"score": trajectory["score"], "shell_success_rate": shell_success_rate},
+            "Metrics": self.reflective_metrics(trajectory),
         }
-
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
-        del metrics
-        return None
 
     def cache_payload(self) -> dict[str, Any]:
         return {eval_id: _serialize_eval_analysis(analysis) for eval_id, analysis in self._eval_analysis_cache.items()}
@@ -475,6 +333,4 @@ register_telemetry_source("single_model", "shell_telemetry", ShellSuccessObjecti
 __all__ = [
     "EVAL_ANALYSIS_CACHE_SCHEMA_VERSION",
     "ShellSuccessObjective",
-    "enrich_shell_error_action_inputs",
-    "log_shell_tool_error_analysis",
 ]

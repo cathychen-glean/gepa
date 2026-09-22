@@ -1,5 +1,5 @@
-# Pack: fewer agent loops on a student-only eval, gated so an incorrect
-# answer scores 0. Scorable only by single_model mode (`packs: [loops]`).
+# Pack: fewer agent loops on a student-only eval.
+# Scorable only by single_model mode (`packs: [loops]`).
 
 signals:
   - name: loop_efficiency
@@ -13,15 +13,14 @@ objective:
   focused_bucket_type: QUERY_CANONICAL
   params:
     target_loop_count: 2
-    correctness_pass: 0.5
     failure_score_below: 1.0
 
 screening:
   kind: high_signal_fix_rate
   threshold: 0.333
-  high_signal: extra_loops_or_incorrect
+  high_signal: loop_efficiency
 
 reflection:
   editable_modules: [WRITING_CODE]
-  failure_label: "HIGH-SIGNAL FAILURES (extra loops or incorrect)"
+  failure_label: "HIGH-SIGNAL FAILURES (extra loops)"
   # Override module reflection prompts with modules.<KEY>.

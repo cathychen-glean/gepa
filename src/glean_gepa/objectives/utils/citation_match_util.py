@@ -8,12 +8,13 @@ from datetime import date
 from typing import Any
 
 from glean_gepa.objectives.utils.action_input_trace import (
-    build_trace_locator,
     fetch_action_inputs_by_entry,
+    trace_locators_for_rows,
 )
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
+    EVAL_ENTRY_ID_EXPR,
     QueryParameter,
     default_date_range,
     run_windowed_per_entry_query,
@@ -172,10 +173,7 @@ def build_citation_match_per_entry_query(
 WITH citation_spans AS (
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
-    COALESCE(
-      jsonPayload.context.eval.entry_uuid,
-      CAST(jsonPayload.context.eval.entry_id AS STRING)
-    ) AS entry_id,
+    {EVAL_ENTRY_ID_EXPR} AS entry_id,
     jsonPayload.context.agent_trace.trace_id AS trace_id,
     resource.labels.project_id AS deployment_id,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms,
@@ -318,29 +316,17 @@ def _enrich_action_inputs(
     detailed trace located by the scrub-safe ids returned alongside the citations.
     """
     high_signal = set(high_signal_entry_ids)
-    rows = [row for row in per_entry_rows if str(row.get("entry_id") or "") in high_signal]
-    if not rows:
-        return per_entry
-
-    def _locators(role: str) -> list[Any]:
-        collected = []
-        for row in rows:
-            locator = build_trace_locator(
-                entry_id=str(row.get("entry_id") or ""),
-                deployment_id=row.get(f"{role}_deployment_id"),
-                trace_id=row.get(f"{role}_trace_id"),
-                min_start_ms=row.get(f"{role}_min_start_ms"),
-                max_start_ms=row.get(f"{role}_max_start_ms"),
-            )
-            if locator is not None:
-                collected.append(locator)
-        return collected
-
     student_inputs = fetch_action_inputs_by_entry(
-        evalcli, _locators("student"), limit=ACTION_INPUT_SURFACE_LIMIT, role_label="student"
+        evalcli,
+        trace_locators_for_rows(per_entry_rows, entry_ids=high_signal, role="student"),
+        limit=ACTION_INPUT_SURFACE_LIMIT,
+        role_label="student",
     )
     teacher_inputs = fetch_action_inputs_by_entry(
-        evalcli, _locators("teacher"), limit=ACTION_INPUT_SURFACE_LIMIT, role_label="teacher"
+        evalcli,
+        trace_locators_for_rows(per_entry_rows, entry_ids=high_signal, role="teacher"),
+        limit=ACTION_INPUT_SURFACE_LIMIT,
+        role_label="teacher",
     )
     if not student_inputs and not teacher_inputs:
         return per_entry

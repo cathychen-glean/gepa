@@ -24,13 +24,11 @@ from glean_gepa.objectives.utils.loop_count_util import (
 from glean_gepa.single_model_adapter import SingleModelAdapter
 
 
-def test_loop_efficiency_is_zero_when_incorrect_and_one_at_or_below_target():
-    assert loop_efficiency_score(0, 1.0) == 1.0
-    assert loop_efficiency_score(2, 1.0) == 1.0
-    assert loop_efficiency_score(3, 1.0) == 0.5
-    assert loop_efficiency_score(4, 1.0) == 1 / 3
-    assert loop_efficiency_score(1, 0.0) == 0.0
-    assert loop_efficiency_score(8, 0.4) == 0.0
+def test_loop_efficiency_is_one_at_or_below_target_and_decays_above_it():
+    assert loop_efficiency_score(0) == 1.0
+    assert loop_efficiency_score(2) == 1.0
+    assert loop_efficiency_score(3) == 0.5
+    assert loop_efficiency_score(4) == 1 / 3
 
 
 def test_parse_uses_errors_as_correctness_when_judge_score_is_missing():
@@ -40,7 +38,7 @@ def test_parse_uses_errors_as_correctness_when_judge_score_is_missing():
 
     failed = parse_loop_count_entry_metrics({"entry_id": "e2", "loop_count": 1, "has_error": True})
     assert failed.correctness == 0.0
-    assert failed.loop_efficiency == 0.0
+    assert failed.loop_efficiency == 1.0
 
     judged = parse_loop_count_entry_metrics({"entry_id": "e3", "loop_count": 3, "has_error": False, "correctness": 1.0})
     assert judged.loop_efficiency == 0.5
@@ -107,11 +105,11 @@ def test_loop_count_query_and_fetch():
     assert analysis.per_entry["entry-2"].loop_efficiency == 1 / 4
     # High-signal entry-2's tool payload is resolved from its detailed trace.
     assert analysis.per_entry["entry-2"].action_inputs == ('{"command":"ls"}',)
-    # entry-3 is high-signal but exposes no trace locator, so it stays empty.
-    assert analysis.per_entry["entry-3"].loop_efficiency == 0.0
+    # entry-3 errored, but with no floor it scores by its loop count (one loop).
+    assert analysis.per_entry["entry-3"].loop_efficiency == 1.0
     assert analysis.per_entry["entry-3"].action_inputs == ()
-    assert analysis.high_signal_entry_ids == ("entry-2", "entry-3")
-    assert analysis.aggregate.matching_entries == 1
+    assert analysis.high_signal_entry_ids == ("entry-2",)
+    assert analysis.aggregate.matching_entries == 2
     assert client.query.call_count == 2
 
     evalcli.get_analysis_trace.reset_mock()
@@ -178,7 +176,7 @@ def test_evalcli_overlay_prefers_loopcount_and_correctness_judge():
     # Overlay must not drop the action-input evidence captured from BigQuery.
     assert updated["e1"].action_inputs == ('{"command":"ls"}',)
     assert updated["e2"].loop_count == 1
-    assert updated["e2"].loop_efficiency == 0.0
+    assert updated["e2"].loop_efficiency == 1.0
 
 
 def test_loops_pack_constructs_the_loop_efficiency_objective(tmp_path):
@@ -231,7 +229,7 @@ def test_loop_cache_recomputes_high_signal_when_the_loop_cap_changes():
     assert loosened.per_entry["C"].loop_efficiency == 1.0
 
 
-def test_loop_objective_scores_incorrect_or_extra_loops_below_one():
+def test_loop_objective_scores_extra_loops_below_one():
     objective = LoopEfficiencyObjective(bigquery_client=MagicMock())
     per_entry = {
         "ok": LoopCountEntryMetrics("ok", 2, 1.0, False),
@@ -260,8 +258,9 @@ def test_loop_objective_scores_incorrect_or_extra_loops_below_one():
     by_entry = {row.entry_id: row for row in rows}
     assert by_entry["ok"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 1.0
     assert by_entry["slow"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 0.0
-    assert by_entry["wrong"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 0.0
-    assert objective.focused_pass_rate(analysis, ["ok", "slow", "wrong"]) == 1 / 3
+    assert by_entry["wrong"].dimension_scores[LOOP_EFFICIENCY_OBJECTIVE] == 1.0
+    assert "correctness" not in by_entry["wrong"].output
+    assert objective.focused_pass_rate(analysis, ["ok", "slow", "wrong"]) == 2 / 3
     example = objective.build_reflective_example(
         "MODULE",
         {
@@ -273,6 +272,8 @@ def test_loop_objective_scores_incorrect_or_extra_loops_below_one():
         {},
     )
     assert example["Action Inputs"] == [f"cmd{i}" for i in range(5)]
+    assert "correctness" not in example["Metrics"]
+    assert "Used 4 loops" in example["Feedback"]
 
 
 def test_single_model_adapter_uses_query_canonical_focused_sets_for_loops():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal, NamedTuple, NotRequired, TypeAlias, TypedDict
 
 JudgingMode: TypeAlias = Literal["teacher_student", "single_model"]
@@ -82,22 +83,14 @@ class SingleModelALRolloutOutput(BaseALRolloutOutput):
 
 
 class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
-    """Full paired execution details used by teacher/student judging."""
+    """Paired answers and tool traces used by teacher/student judging."""
 
     student_answer: str
     student_tool_events: list[str]
-    student_loops: int
     student_tool_calls: int
-    student_tool_errors: int
-    student_input_tokens: int
-    student_output_tokens: int
-    student_latency_ms: int | None
     teacher_answer: str
     teacher_tool_events: list[str]
-    teacher_loops: int
     teacher_tool_calls: int
-    teacher_input_tokens: int
-    teacher_output_tokens: int
     student_eval_run_id: NotRequired[str]
     teacher_eval_run_id: NotRequired[str]
     judge_run_id: NotRequired[str]
@@ -109,6 +102,41 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_first_tool_input: NotRequired[list[str]]
     agentic_preference_rate: NotRequired[float]
     agentic_preference_rate_feedback: NotRequired[str]
+
+
+def paired_rollout_output(
+    *,
+    deployment_id: str,
+    query: str,
+    entry_id: str,
+    student_answer: str = "",
+    teacher_answer: str = "",
+    student_tool_events: Sequence[str] = (),
+    teacher_tool_events: Sequence[str] = (),
+    student_tool_calls: int | None = None,
+    teacher_tool_calls: int | None = None,
+    student_eval_run_id: str | None = None,
+    teacher_eval_run_id: str | None = None,
+) -> TeacherStudentALRolloutOutput:
+    """Paired rollout. Objectives pass the answers, tools, and eval ids they score."""
+    student_events = list(student_tool_events)
+    teacher_events = list(teacher_tool_events)
+    output: TeacherStudentALRolloutOutput = {
+        "deployment_id": deployment_id,
+        "query": query,
+        "entry_id": entry_id,
+        "student_answer": student_answer,
+        "student_tool_events": student_events,
+        "student_tool_calls": len(student_events) if student_tool_calls is None else student_tool_calls,
+        "teacher_answer": teacher_answer,
+        "teacher_tool_events": teacher_events,
+        "teacher_tool_calls": len(teacher_events) if teacher_tool_calls is None else teacher_tool_calls,
+    }
+    if student_eval_run_id is not None:
+        output["student_eval_run_id"] = student_eval_run_id
+    if teacher_eval_run_id is not None:
+        output["teacher_eval_run_id"] = teacher_eval_run_id
+    return output
 
 
 class SingleModelALTrajectory(TypedDict):
@@ -140,6 +168,7 @@ __all__ = [
     "EvalSetALDataInst",
     "JudgingMode",
     "PointwiseJudge",
+    "paired_rollout_output",
     "SingleModelALDataInst",
     "SingleModelALRolloutOutput",
     "SingleModelALTrajectory",

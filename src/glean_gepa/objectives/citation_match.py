@@ -5,13 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from glean_gepa.adapter_types import (
-    TeacherStudentALRolloutOutput,
-    TeacherStudentALTrajectory,
-)
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
+from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
+from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
-from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
 from glean_gepa.objectives.utils.citation_match_util import (
     CITATION_MATCH_OBJECTIVE,
@@ -52,38 +48,22 @@ def _rollout_output(
     teacher_citations: list[str],
     student_action_inputs: list[str] | None = None,
     teacher_action_inputs: list[str] | None = None,
-) -> TeacherStudentALRolloutOutput:
+):
     """One rollout row. Citation IDs ride on optional output fields plus answers."""
-    output: TeacherStudentALRolloutOutput = {
-        "deployment_id": deployment_id,
-        "query": query,
-        "student_answer": _cited_blob(student_citations),
-        "student_tool_events": [],
-        "student_loops": 0,
-        "student_tool_calls": 0,
-        "student_tool_errors": 0,
-        "student_input_tokens": 0,
-        "student_output_tokens": 0,
-        "student_latency_ms": None,
-        "teacher_answer": _cited_blob(teacher_citations),
-        "teacher_tool_events": [],
-        "teacher_loops": 0,
-        "teacher_tool_calls": 0,
-        "teacher_input_tokens": 0,
-        "teacher_output_tokens": 0,
-        "entry_id": entry_id,
-        "student_citations": student_citations,
-        "teacher_citations": teacher_citations,
-    }
+    output = paired_rollout_output(
+        deployment_id=deployment_id,
+        query=query,
+        entry_id=entry_id,
+        student_answer="citations=" + (", ".join(student_citations) if student_citations else "(none)"),
+        teacher_answer="citations=" + (", ".join(teacher_citations) if teacher_citations else "(none)"),
+    )
+    output["student_citations"] = student_citations
+    output["teacher_citations"] = teacher_citations
     if student_action_inputs:
         output["student_action_inputs"] = list(student_action_inputs)
     if teacher_action_inputs:
         output["teacher_action_inputs"] = list(teacher_action_inputs)
     return output
-
-
-def _cited_blob(citations: Sequence[str]) -> str:
-    return "citations=" + (", ".join(citations) if citations else "(none)")
 
 
 class CitationMatchObjective(TeacherStudentObjective):
@@ -189,7 +169,6 @@ class CitationMatchObjective(TeacherStudentObjective):
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
         citation_match = objective_scores.get(self.name, trajectory["score"])
-        correctness = objective_scores.get("correctness")
         student_citations = list(output.get("student_citations") or [])
         teacher_citations = list(output.get("teacher_citations") or [])
         mismatch = self._mismatch_key(output)
@@ -199,8 +178,7 @@ class CitationMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"Citation-set mismatch: {missing}; {extra}.")
         if citation_match < 1.0:
             feedback_parts.append(f"Citation match issue: score={citation_match:.2f}.")
-        if correctness is not None and correctness < JUDGE_SPECS["correctness"].default_min:
-            feedback_parts.append(f"Correctness issue: score={correctness:.2f}.")
+        feedback_parts.extend(self.wired_signal_issues(objective_scores))
 
         inputs: ReflectiveExampleInputs = {
             "eval_set": trajectory["data"]["eval_set_name"],
@@ -211,12 +189,6 @@ class CitationMatchObjective(TeacherStudentObjective):
         # The raw user query is scrubbed, so surface the teacher's tool payloads
         # (the searches it ran) as the intent signal behind the cited sources.
         teacher_action_inputs = output.get("teacher_action_inputs") or []
-        metrics: ReflectiveExampleMetrics = {
-            "score": trajectory["score"],
-            "citation_match": citation_match,
-        }
-        if correctness is not None:
-            metrics["correctness"] = correctness
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -230,18 +202,8 @@ class CitationMatchObjective(TeacherStudentObjective):
             "Action Inputs": list(teacher_action_inputs[:5]),
             "Execution Errors": [],
             "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student citation divergence.",
-            "Metrics": metrics,
+            "Metrics": self.reflective_metrics(trajectory),
         }
-
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        parts = [
-            f"score={metrics['score']:.2f}",
-            f"citation_match={metrics.get('citation_match', metrics['score']):.2f}",
-        ]
-        correctness = metrics.get("correctness")
-        if correctness is not None:
-            parts.append(f"correctness={correctness:.2f}")
-        return ", ".join(parts)
 
 
 register_telemetry_source("teacher_student", "citation_match", CitationMatchObjective)

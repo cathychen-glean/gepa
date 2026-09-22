@@ -288,7 +288,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     ]
     with (
         patch(
-            "glean_gepa.objectives.shell.fetch_high_signal_evalset_entries",
+            "glean_gepa.single_model_adapter.fetch_high_signal_evalset_entries",
             return_value=source_entries,
         ) as resolve_entries,
         patch(

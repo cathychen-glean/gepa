@@ -375,6 +375,8 @@ def test_rules_ext_reflects_on_its_own_ranking_of_non_core_mismatches():
 def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
     """Correctness vs the teacher is absent until the pairwise judge has scored."""
     objective = FirstToolMatchObjective()
+    objective.high_signal = "tool_alignment"
+    objective.signal_names = ("tool_alignment", "correctness")
 
     absent = _reflective_example(objective, {"tool_alignment": 0.0})
     assert "correctness" not in absent["Metrics"]
@@ -390,6 +392,12 @@ def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
     passing = _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.9})
     assert "Correctness" not in passing["Feedback"]
     assert passing["Metrics"]["correctness"] == 0.9
+
+    unwired = FirstToolMatchObjective()
+    unwired.high_signal = "tool_alignment"
+    hidden = _reflective_example(unwired, {"tool_alignment": 0.0, "correctness": 0.5})
+    assert "correctness" not in hidden["Metrics"]
+    assert "Correctness" not in hidden["Feedback"]
 
 
 def test_aggregate_and_empty_analysis():

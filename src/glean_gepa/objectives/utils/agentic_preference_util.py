@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from glean_gepa.judge_metrics_util import CUSTOMER_AGENTIC_PREFERENCE_METRIC
-from glean_gepa.objectives.utils.tool_match_util import fetch_eval_run_tool_match_analysis
+from glean_gepa.objectives.utils.tool_match_util import (
+    ToolMatchEntryMetrics,
+    fetch_eval_run_tool_match_analysis,
+)
 
 AGENTIC_PREFERENCE_OBJECTIVE = CUSTOMER_AGENTIC_PREFERENCE_METRIC
 
@@ -82,31 +85,6 @@ def _answer_from_run_entry(run_entry: Mapping[str, Any]) -> str:
     return ""
 
 
-def _tool_sequences_by_entry(
-    client: Any,
-    *,
-    teacher_eval_id: str,
-    student_eval_id: str,
-    lookback_days: int,
-) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
-    """Load each role's scored tool sequence per entry from agentspan."""
-    if client is None:
-        return {}
-    try:
-        analysis = fetch_eval_run_tool_match_analysis(
-            client,
-            teacher_eval_id=teacher_eval_id,
-            student_eval_id=student_eval_id,
-            lookback_days=lookback_days,
-        )
-    except Exception as exc:
-        print(f"[agentic preference] Could not load tool sequences for {student_eval_id}: {exc}")
-        return {}
-    return {
-        entry_id: (metrics.student_tools, metrics.teacher_tools) for entry_id, metrics in analysis.per_entry.items()
-    }
-
-
 def fetch_paired_preference_traces(
     client: Any,
     *,
@@ -133,12 +111,17 @@ def fetch_paired_preference_traces(
         return empty_agentic_preference_analysis(teacher_eval_id, student_eval_id)
     if not isinstance(view, Mapping):
         return empty_agentic_preference_analysis(teacher_eval_id, student_eval_id)
-    tools_by_entry = _tool_sequences_by_entry(
-        client,
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
-        lookback_days=lookback_days,
-    )
+    tools_by_entry: dict[str, ToolMatchEntryMetrics] = {}
+    if client is not None:
+        try:
+            tools_by_entry = fetch_eval_run_tool_match_analysis(
+                client,
+                teacher_eval_id=teacher_eval_id,
+                student_eval_id=student_eval_id,
+                lookback_days=lookback_days,
+            ).per_entry
+        except Exception as exc:
+            print(f"[agentic preference] Could not load tool sequences for {student_eval_id}: {exc}")
     per_entry: dict[str, AgenticPreferenceEntry] = {}
     for entry in view.get("entries") or []:
         if not isinstance(entry, Mapping):
@@ -156,13 +139,13 @@ def fetch_paired_preference_traces(
                 student_answer = _answer_from_run_entry(run_entry)
             elif run_id == teacher_eval_id:
                 teacher_answer = _answer_from_run_entry(run_entry)
-        student_tools, teacher_tools = tools_by_entry.get(entry_id, ((), ()))
+        tool_metrics = tools_by_entry.get(entry_id)
         per_entry[entry_id] = AgenticPreferenceEntry(
             entry_id=entry_id,
             student_answer=student_answer,
             teacher_answer=teacher_answer,
-            student_tools=student_tools,
-            teacher_tools=teacher_tools,
+            student_tools=tool_metrics.student_tools if tool_metrics is not None else (),
+            teacher_tools=tool_metrics.teacher_tools if tool_metrics is not None else (),
         )
     if per_entry and tools_by_entry:
         joined = sum(1 for metrics in per_entry.values() if metrics.student_tools or metrics.teacher_tools)

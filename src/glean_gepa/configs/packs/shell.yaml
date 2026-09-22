@@ -17,7 +17,7 @@ objective:
 screening:
   kind: high_signal_fix_rate
   threshold: 0.5
-  high_signal: shell_error_entries
+  high_signal: shell_success_rate
 
 reflection:
   editable_modules: [WRITING_CODE, CORE_TOOLS]

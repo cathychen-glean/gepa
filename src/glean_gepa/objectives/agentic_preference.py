@@ -7,11 +7,8 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from glean_gepa.adapter_types import (
-    TeacherStudentALRolloutOutput,
-    TeacherStudentALTrajectory,
-)
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
+from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
+from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.judge_metrics_util import PREFERENCE_TIE
 from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
@@ -113,38 +110,18 @@ def _rollout_output(
     teacher_tools: Sequence[str] = (),
     student_eval_run_id: str = "",
     teacher_eval_run_id: str = "",
-) -> TeacherStudentALRolloutOutput:
-    return {
-        "deployment_id": deployment_id,
-        "query": query,
-        "student_eval_run_id": student_eval_run_id,
-        "teacher_eval_run_id": teacher_eval_run_id,
-        "student_answer": student_answer,
-        "student_tool_events": list(student_tools),
-        "student_loops": 0,
-        "student_tool_calls": len(student_tools),
-        "student_tool_errors": 0,
-        "student_input_tokens": 0,
-        "student_output_tokens": 0,
-        "student_latency_ms": None,
-        "teacher_answer": teacher_answer,
-        "teacher_tool_events": list(teacher_tools),
-        "teacher_loops": 0,
-        "teacher_tool_calls": len(teacher_tools),
-        "teacher_input_tokens": 0,
-        "teacher_output_tokens": 0,
-        "entry_id": entry_id,
-    }
-
-
-def _preference_score(output: Mapping[str, Any]) -> float | None:
-    raw = output.get(AGENTIC_PREFERENCE_OBJECTIVE)
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+):
+    return paired_rollout_output(
+        deployment_id=deployment_id,
+        query=query,
+        entry_id=entry_id,
+        student_answer=student_answer,
+        teacher_answer=teacher_answer,
+        student_tool_events=student_tools,
+        teacher_tool_events=teacher_tools,
+        student_eval_run_id=student_eval_run_id,
+        teacher_eval_run_id=teacher_eval_run_id,
+    )
 
 
 def _rationale_cache_key(output: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -310,13 +287,13 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
                     self._rationale_cache[(student_eval_id, entry_id, cache_scope)] = rationale
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
-        score = _preference_score(output)
+        score = output.get(self.name)
         return score is not None and score < PREFERENCE_TIE
 
     def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
         if self.is_high_signal(output):
             return TEACHER_PREFERRED_KEY
-        score = _preference_score(output)
+        score = output.get(self.name)
         if score is not None and score >= KEEP_PREFERENCE_THRESHOLD:
             return STUDENT_PREFERRED_KEY
         return None
@@ -373,9 +350,9 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         del component_name, candidate
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
-        preference = _preference_score(output)
+        preference = output.get(self.name)
         if preference is None:
-            preference = float(objective_scores.get(self.name, trajectory["score"]))
+            preference = objective_scores.get(self.name, trajectory["score"])
         if preference >= KEEP_PREFERENCE_THRESHOLD:
             feedback_parts = [
                 f"KEEP: the pairwise agentic judge already preferred the student "
@@ -400,13 +377,6 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
             "deployment_id": output["deployment_id"],
             "query": output["query"],
         }
-        metrics: ReflectiveExampleMetrics = {
-            "score": trajectory["score"],
-            "agentic_preference_rate": preference,
-        }
-        correctness = objective_scores.get("correctness")
-        if correctness is not None:
-            metrics["correctness"] = correctness
         return {
             "Inputs": inputs,
             "Generated Outputs": {
@@ -418,18 +388,8 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
             "Action Inputs": [],
             "Execution Errors": [],
             "Feedback": "\n".join(feedback_parts),
-            "Metrics": metrics,
+            "Metrics": self.reflective_metrics(trajectory),
         }
-
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        parts = [
-            f"score={metrics['score']:.2f}",
-            f"agentic_preference_rate={metrics.get('agentic_preference_rate', metrics['score']):.2f}",
-        ]
-        correctness = metrics.get("correctness")
-        if correctness is not None:
-            parts.append(f"correctness={correctness:.2f}")
-        return ", ".join(parts)
 
 
 register_telemetry_source("teacher_student", "agentic_preference", AgenticPreferenceObjective)

@@ -11,7 +11,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, cast
 
 from glean_gepa.adapter_types import JudgingMode
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
@@ -66,9 +66,86 @@ class PackConfigurable:
     """Pack YAML knobs overlaid onto an objective instance after construction."""
 
     params: dict[str, Any]
+    # Set from ``screening.high_signal`` and ``signals[].name`` by ``configure_objective``.
+    high_signal: str | None = None
+    signal_names: tuple[str, ...] = ()
 
     def pack_param(self, key: str, default: Any) -> Any:
         return (getattr(self, "params", None) or {}).get(key, default)
+
+    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
+        """Render ``score``, ``screening.high_signal``, then each other ``signals.name``.
+
+        A signal is omitted when that metric was not scored. No ``high_signal`` omits the line.
+        """
+        high_signal = self.high_signal
+        if not high_signal:
+            return None
+        parts = [
+            f"score={metrics['score']:.2f}",
+            f"{high_signal}={metrics.get(high_signal, metrics['score']):.2f}",
+        ]
+        names = self.signal_names
+        seen = {high_signal}
+        for name in names:
+            if name in seen:
+                continue
+            other = metrics.get(name)
+            if other is None:
+                continue
+            parts.append(f"{name}={other:.2f}")
+            seen.add(name)
+        return ", ".join(parts)
+
+    def reflective_metrics(self, trajectory: Mapping[str, Any]) -> ReflectiveExampleMetrics:
+        """Score plus each signal this run is configured to report.
+
+        The objective's own metric is always included. Any other ``signals.name``
+        from the pack YAML, such as a pairwise correctness judge, is included
+        only when that trajectory actually scored it.
+        """
+        from glean_gepa.al_adapter import ReflectiveExampleMetrics
+
+        objective_scores = trajectory.get("objective_scores") or {}
+        metrics: dict[str, float] = {"score": float(trajectory["score"])}
+        objective_name = getattr(self, "name", None)
+        ordered: list[str] = []
+        if isinstance(objective_name, str) and objective_name:
+            ordered.append(objective_name)
+        if self.high_signal and self.high_signal not in ordered:
+            ordered.append(self.high_signal)
+        for name in self.signal_names:
+            if name not in ordered:
+                ordered.append(name)
+        for name in ordered:
+            raw = objective_scores.get(name)
+            if raw is None and name == objective_name:
+                raw = trajectory.get("score")
+            if isinstance(raw, bool) or not isinstance(raw, int | float):
+                continue
+            metrics[name] = float(raw)
+        return cast(ReflectiveExampleMetrics, metrics)
+
+    def wired_signal_issues(self, objective_scores: Mapping[str, Any]) -> list[str]:
+        """Feedback lines for wired judge signals that scored below their floor.
+
+        The objective's own metric is omitted; its example already describes that failure.
+        """
+        from glean_gepa.judge_metrics_util import JUDGE_SPECS
+
+        objective_name = getattr(self, "name", None)
+        parts: list[str] = []
+        for name in self.signal_names:
+            if name == objective_name:
+                continue
+            spec = JUDGE_SPECS.get(name)
+            raw = objective_scores.get(name)
+            if spec is None or isinstance(raw, bool) or not isinstance(raw, int | float):
+                continue
+            score = float(raw)
+            if score < spec.default_min:
+                parts.append(f"{name.replace('_', ' ').capitalize()} issue: score={score:.2f}.")
+        return parts
 
     def reflection_prompt(self, module_name: str) -> str:
         return module_responsibility(
@@ -107,6 +184,15 @@ def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
         base = dict(getattr(type(objective), "module_responsibilities", {}) or {})
         base.update({str(name): str(text) for name, text in modules.items()})
         objective.module_responsibilities = base
+    screening = pack.get("screening") or {}
+    high_signal = screening.get("high_signal")
+    if high_signal:
+        objective.high_signal = str(high_signal)
+    signals = pack.get("signals")
+    if isinstance(signals, Sequence) and not isinstance(signals, str | bytes):
+        objective.signal_names = tuple(
+            str(signal["name"]) for signal in signals if isinstance(signal, Mapping) and signal.get("name")
+        )
 
 
 class TeacherStudentObjective(PackConfigurable, ABC):
@@ -345,9 +431,6 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         candidate: dict[str, str],
     ) -> ReflectiveExample: ...
 
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
-        return None
-
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
         del trajectories
         return []
@@ -366,6 +449,8 @@ class SingleModelObjective(PackConfigurable, ABC):
     failure_label: str = "HIGH-SIGNAL FAILURES"
     # Human-readable telemetry name for pending/read logs; empty falls back to ``name``.
     pending_telemetry_label: str = ""
+    # Aggregate count that stays 0 until scorable telemetry has landed.
+    pending_count: str
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
 
     @abstractmethod
@@ -379,17 +464,22 @@ class SingleModelObjective(PackConfigurable, ABC):
         include_action_inputs: bool = True,
     ) -> Any: ...
 
-    @abstractmethod
-    def is_pending(self, analysis: Any) -> bool: ...
+    def is_pending(self, analysis: Any) -> bool:
+        """Telemetry has not landed while ``pending_count`` on the aggregate is 0."""
+        return getattr(analysis.aggregate, self.pending_count) == 0
 
-    @abstractmethod
-    def aggregate_score(self, analysis: Any) -> float: ...
+    def aggregate_score(self, analysis: Any) -> float:
+        """The objective ``name`` is the float field on ``analysis.aggregate``."""
+        return float(getattr(analysis.aggregate, self.name))
 
     @abstractmethod
     def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
 
-    @abstractmethod
-    def entry_ids_to_score(self, analysis: Any, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]: ...
+    def entry_ids_to_score(self, analysis: Any, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
+        """Focused batches score the fetched entries. Full evals score the high-signal set."""
+        if requested_entry_ids:
+            return tuple(analysis.per_entry) or tuple(requested_entry_ids)
+        return tuple(analysis.high_signal_entry_ids)
 
     @abstractmethod
     def log_analysis(self, analysis: Any) -> None: ...
@@ -410,17 +500,6 @@ class SingleModelObjective(PackConfigurable, ABC):
     ) -> list[ScoredRow]: ...
 
     @abstractmethod
-    def prepare_focused_source_entries(
-        self,
-        *,
-        eval_set_name: str,
-        eval_set_version: str,
-        eval_run_id: str,
-        entry_ids: Sequence[str],
-        deployment_ids: Sequence[str],
-    ) -> list[dict[str, Any]] | None: ...
-
-    @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...
 
     @abstractmethod
@@ -430,9 +509,6 @@ class SingleModelObjective(PackConfigurable, ABC):
         trajectory: Any,
         candidate: dict[str, str],
     ) -> ReflectiveExample: ...
-
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
-        return None
 
     def cache_payload(self) -> dict[str, Any]:
         return {}
