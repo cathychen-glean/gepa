@@ -227,8 +227,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
         include_action_inputs: bool = True,
     ):
         self.objective.bigquery_client = self.bigquery_client
-        # Val-only eval sets never feed reflection; skip analyze-trace hydration.
-        self.objective.evalcli = self.runner.evalcli if include_action_inputs else None
+        # Validation skips trace hydration. evalcli stays available; the requested
+        # flag decides whether this fetch hydrates and whether the cache hits.
+        self.objective.include_action_inputs = include_action_inputs
+        self.objective.evalcli = self.runner.evalcli
         self.objective.lookback_days = self.agentspan_lookback_days
         analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()
@@ -661,6 +663,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             primary_from_pairwise_judge = any(judge.name == self.objective.name for judge in self.pairwise_judges)
+            self.objective.require_compared_entries(analysis)
             if is_focused_eval:
                 # Pairwise-judge primaries (agentic preference) already land in
                 # summary via the judge overlay. Overwriting with focused_pass_rate

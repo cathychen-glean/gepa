@@ -118,8 +118,10 @@ class CitationMatchObjective(TeacherStudentObjective):
             label="citation match analysis",
         )
 
-    def validate_full_eval(self, analysis: EvalRunCitationMatchAnalysis) -> None:
+    def require_compared_entries(self, analysis: EvalRunCitationMatchAnalysis) -> None:
         require_compared_citation_entries(analysis)
+
+    def validate_full_eval(self, analysis: EvalRunCitationMatchAnalysis) -> None:
         log_citation_match_analysis(analysis)
 
     def focused_pass_rate(self, analysis: EvalRunCitationMatchAnalysis, requested_entry_ids: Sequence[str]) -> float:

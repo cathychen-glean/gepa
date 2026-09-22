@@ -757,6 +757,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum seconds to wait for one Cortex eval run.",
     )
     parser.add_argument(
+        "--eval_run_grace_period_sec",
+        type=_nonnegative_int,
+        default=None,
+        help="Seconds to keep polling after a run is usable while entries are still unfinished. "
+        "Omit to use the 1800s default. 0 returns as soon as the run is usable.",
+    )
+    parser.add_argument(
         "--cache_file",
         type=Path,
         default=None,
@@ -991,6 +998,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         evalcli=evalcli,
         cache_file=str(eval_run_cache_file) if eval_run_cache_file else None,
         eval_run_timeout_sec=args.eval_run_timeout_sec,
+        eval_run_grace_period_sec=args.eval_run_grace_period_sec,
     )
     adapter_kwargs = {
         "runner": al_runner,

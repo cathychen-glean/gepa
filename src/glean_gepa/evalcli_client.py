@@ -184,6 +184,25 @@ def _task_count(entry: dict[str, Any]) -> int:
     return count if isinstance(count, int) else 0
 
 
+def _active_task_counts(status: Any) -> list[tuple[Any, int]]:
+    """Return ``(task_status, count)`` pairs with a positive count, or ``[]`` for a malformed payload."""
+    if not isinstance(status, dict):
+        return []
+    task_counts = status.get("taskCountsByStatus") or []
+    if not isinstance(task_counts, list):
+        return []
+    return [
+        (entry.get("status"), count)
+        for entry in task_counts
+        if isinstance(entry, dict) and (count := _task_count(entry)) > 0
+    ]
+
+
+def _unfinished_task_count(status: Any) -> int:
+    """Count tasks that are not yet terminal."""
+    return sum(count for task_status, count in _active_task_counts(status) if task_status not in TERMINAL_TASK_STATUSES)
+
+
 def classify_eval_run_status(status: Any) -> str:
     """Classify a Cortex run-status payload as ongoing, usable, or missing.
 
@@ -191,23 +210,11 @@ def classify_eval_run_status(status: Any) -> str:
     is more than 9x the unfinished remainder. The last 10% of entries can sit in
     queue or grind through execution for a long time without moving the score.
     """
-    if not isinstance(status, dict):
-        return "missing"
-    task_counts = status.get("taskCountsByStatus") or []
-    if not isinstance(task_counts, list):
-        return "missing"
-    active_counts = [entry for entry in task_counts if isinstance(entry, dict) and _task_count(entry) > 0]
+    active_counts = _active_task_counts(status)
     if not active_counts:
         return "missing"
-    finished = 0
-    unfinished = 0
-    for entry in active_counts:
-        task_status = entry.get("status")
-        count = _task_count(entry)
-        if task_status in FINISHED_TASK_STATUSES:
-            finished += count
-        elif task_status not in TERMINAL_TASK_STATUSES:
-            unfinished += count
+    finished = sum(count for task_status, count in active_counts if task_status in FINISHED_TASK_STATUSES)
+    unfinished = sum(count for task_status, count in active_counts if task_status not in TERMINAL_TASK_STATUSES)
     if unfinished == 0:
         return "usable"
     return "usable" if finished > MIN_FINISHED_TO_UNFINISHED_RATIO * unfinished else "ongoing"
@@ -330,9 +337,11 @@ class EvalCliClient:
         *,
         poll_interval_sec: int = 60,
         timeout_sec: int | None = None,
+        grace_period_sec: int = 1800,
     ) -> list[Any] | None:
         print(f"Waiting for eval run {eval_run_id} to complete...")
         started_at = time.monotonic()
+        usable_since: float | None = None
         while True:
             if timeout_sec is not None and time.monotonic() - started_at >= timeout_sec:
                 raise EvalCliError(f"Eval run {eval_run_id} timed out after {timeout_sec}s")
@@ -353,8 +362,24 @@ class EvalCliClient:
 
             print(f"Eval run {eval_run_id} status: {json.dumps(statuses, sort_keys=True, default=str)}")
             if isinstance(statuses, list) and statuses and classify_eval_run_status(statuses[0]) == "usable":
-                print(f"Eval run {eval_run_id} completed successfully")
-                return statuses
+                unfinished = _unfinished_task_count(statuses[0])
+                if unfinished == 0 or grace_period_sec == 0:
+                    if unfinished > 0:
+                        print(f"Eval run {eval_run_id} is usable with {unfinished} unfinished, proceeding")
+                    elif usable_since is None:
+                        print(f"Eval run {eval_run_id} completed successfully")
+                    else:
+                        print(f"Eval run {eval_run_id} completed")
+                    return statuses
+                if usable_since is None:
+                    usable_since = time.monotonic()
+                    print(
+                        f"Eval run {eval_run_id} is usable with {unfinished} unfinished; "
+                        f"grace period of {grace_period_sec}s started"
+                    )
+                elif time.monotonic() - usable_since >= grace_period_sec:
+                    print(f"Eval run {eval_run_id} grace period expired with {unfinished} unfinished, proceeding")
+                    return statuses
             if isinstance(statuses, list) and statuses:
                 counts = statuses[0].get("taskCountsByStatus") or []
                 summary = ", ".join(

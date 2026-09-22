@@ -249,6 +249,19 @@ def test_paired_traces_join_tools_without_blocking_on_a_missing_fetch():
     assert fallback.per_entry["lost"].student_tools == ()
 
 
+def test_validation_fetch_skips_the_analysis_view():
+    evalcli = MagicMock()
+    analysis = fetch_paired_preference_traces(
+        object(),
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        evalcli=evalcli,
+        include_action_inputs=False,
+    )
+    evalcli.get_analysis_view.assert_not_called()
+    assert analysis.per_entry == {}
+
+
 def test_reflection_follows_losses_not_wins():
     objective = AgenticPreferenceObjective()
     lost = _trajectory(
