@@ -318,7 +318,7 @@ def test_empty_trace_refetch_keeps_the_unhydrated_entry():
         third = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
 
     assert first is unhydrated
-    assert second is empty
+    assert second is unhydrated
     assert third is unhydrated
     assert fetch.call_count == 2
     assert adapter._analysis_cache[("teacher-1", "student-1")] is unhydrated
@@ -700,25 +700,21 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
     assert [score["tool_alignment"] for score in result.objective_scores] == [1.0, 0.0]
 
 
-def test_finish_focused_eval_does_not_raise_when_no_entries_were_compared():
-    adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
+def test_finish_focused_eval_raises_when_no_entries_were_compared():
+    adapter = _teacher_student_adapter(MagicMock())
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
-    result = adapter._finish_batch_evals(
-        [
-            _StartedPair(
-                al_data_inst={**EVAL_SET, "eval_entry_ids": ["s1"]},
-                teacher_eval_id="teacher-1",
-                student_eval_id="student-1",
-            )
-        ],
-        capture_traces=False,
-    )
 
-    assert result.outputs == []
-    assert result.summary == {
-        "correctness": 0.0,
-        "tool_alignment": 0.0,
-    }
+    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
+        adapter._finish_batch_evals(
+            [
+                _StartedPair(
+                    al_data_inst={**EVAL_SET, "eval_entry_ids": ["s1"]},
+                    teacher_eval_id="teacher-1",
+                    student_eval_id="student-1",
+                )
+            ],
+            capture_traces=False,
+        )
 
 
 def test_finish_batch_evals_raises_when_no_entries_were_compared():

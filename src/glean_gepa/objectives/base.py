@@ -169,8 +169,8 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         ``fetch`` and ``empty`` are passed in from the concrete objective's module
         so unit tests can still patch the module-level fetch function.
 
-        An empty comparison is not stored, and an empty refetch leaves any entry
-        already cached in place. ``include_action_inputs`` false marks the pair
+        An empty comparison is not stored. An empty refetch leaves any entry
+        already cached in place and returns that entry. ``include_action_inputs`` false marks the pair
         unhydrated; a later call that requests action inputs fetches again and
         replaces that entry.
         """
@@ -193,7 +193,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
             )
         if not self.analysis_is_cacheable(analysis):
             print(f"[Cache] Not caching provisional empty {label} for {teacher_eval_id} vs {student_eval_id}")
-            return analysis
+            return cache.get(cache_key, analysis)
         cache[cache_key] = analysis
         if self.include_action_inputs:
             unhydrated.discard(cache_key)
@@ -201,6 +201,10 @@ class TeacherStudentObjective(PackConfigurable, ABC):
             unhydrated.add(cache_key)
         print(f"[Cache MISS] Fetched {label} for {teacher_eval_id} vs {student_eval_id}")
         return analysis
+
+    def require_compared_entries(self, analysis: Any) -> None:
+        """Reject a 0/0 comparison. Objectives without a compared-entry count do nothing."""
+        del analysis
 
     @abstractmethod
     def validate_full_eval(self, analysis: Any) -> None: ...

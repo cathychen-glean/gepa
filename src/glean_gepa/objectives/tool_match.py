@@ -137,8 +137,10 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             label="tool match analysis",
         )
 
-    def validate_full_eval(self, analysis: EvalRunToolMatchAnalysis) -> None:
+    def require_compared_entries(self, analysis: EvalRunToolMatchAnalysis) -> None:
         require_compared_eval_entries(analysis)
+
+    def validate_full_eval(self, analysis: EvalRunToolMatchAnalysis) -> None:
         log_tool_match_analysis(analysis)
 
     def focused_pass_rate(self, analysis: EvalRunToolMatchAnalysis, requested_entry_ids: Sequence[str]) -> float:

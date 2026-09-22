@@ -663,6 +663,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
             is_focused_eval = bool(requested_entry_ids)
             primary_from_pairwise_judge = any(judge.name == self.objective.name for judge in self.pairwise_judges)
+            self.objective.require_compared_entries(analysis)
             if is_focused_eval:
                 # Pairwise-judge primaries (agentic preference) already land in
                 # summary via the judge overlay. Overwriting with focused_pass_rate
