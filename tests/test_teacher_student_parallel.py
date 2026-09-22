@@ -289,42 +289,10 @@ def test_get_or_fetch_analysis_caches_fetch():
     assert second is fetched
 
 
-def _cacheable_tool_analysis(*, student_eval_id: str = "student-1") -> EvalRunToolMatchAnalysis:
-    return EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id=student_eval_id,
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id=student_eval_id,
-            compared_entries=1,
-            matching_entries=1,
-            tool_match_rate=1.0,
-        ),
-        per_entry={},
-        high_signal_entry_ids=(),
-    )
-
-
 def test_empty_paired_analysis_is_not_cached():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
-    empty = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
-            compared_entries=0,
-            matching_entries=0,
-            tool_match_rate=0.0,
-        ),
-        per_entry={},
-        high_signal_entry_ids=(),
-    )
+    empty = _tool_match_analysis(compared_entries=0)
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         return_value=empty,
@@ -339,22 +307,8 @@ def test_empty_paired_analysis_is_not_cached():
 def test_empty_trace_refetch_keeps_the_unhydrated_entry():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
-    unhydrated = _cacheable_tool_analysis()
-    empty = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
-            compared_entries=0,
-            matching_entries=0,
-            tool_match_rate=0.0,
-        ),
-        per_entry={},
-        high_signal_entry_ids=(),
-    )
+    unhydrated = _tool_match_analysis()
+    empty = _tool_match_analysis(compared_entries=0)
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         side_effect=[unhydrated, empty],
@@ -386,8 +340,8 @@ def test_validation_fetch_then_trace_fetch_rehydrates():
     evalcli = MagicMock()
     adapter = _teacher_student_adapter(evalcli)
     adapter.bigquery_client = MagicMock()
-    unhydrated = _cacheable_tool_analysis()
-    hydrated = _cacheable_tool_analysis()
+    unhydrated = _tool_match_analysis()
+    hydrated = _tool_match_analysis()
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         side_effect=[unhydrated, hydrated],
@@ -410,7 +364,7 @@ def test_trace_fetch_then_validation_fetch_is_one_call():
     evalcli = MagicMock()
     adapter = _teacher_student_adapter(evalcli)
     adapter.bigquery_client = MagicMock()
-    hydrated = _cacheable_tool_analysis()
+    hydrated = _tool_match_analysis()
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         return_value=hydrated,
@@ -429,7 +383,7 @@ def test_seeded_analysis_cache_hits_for_a_trace_call():
     evalcli = MagicMock()
     adapter = _teacher_student_adapter(evalcli)
     adapter.bigquery_client = MagicMock()
-    seeded = _cacheable_tool_analysis()
+    seeded = _tool_match_analysis()
     adapter._analysis_cache[("teacher-1", "student-1")] = seeded
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
@@ -443,21 +397,7 @@ def test_seeded_analysis_cache_hits_for_a_trace_call():
 def test_validation_only_skips_action_input_hydration():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
-    fetched = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
-            compared_entries=1,
-            matching_entries=1,
-            tool_match_rate=1.0,
-        ),
-        per_entry={},
-        high_signal_entry_ids=(),
-    )
+    fetched = _tool_match_analysis()
 
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
