@@ -124,8 +124,13 @@ class TeacherStudentObjective(PackConfigurable, ABC):
     reflection_entry_limit: ClassVar[int] = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
     bigquery_client: Any | None = None
     evalcli: Any | None = None
+    # Set by the adapter for each fetch. True requests action-input hydration.
+    include_action_inputs: bool = True
     lookback_days: int = 1
     _paired_analysis_cache: dict[tuple[str, str], Any]
+    # Pairs stored from a call that did not request action inputs. A seeded
+    # cache entry is absent here and is treated as hydrated.
+    _unhydrated_pairs: set[tuple[str, str]]
 
     @property
     def analysis_cache(self) -> dict[tuple[str, str], Any]:
@@ -134,6 +139,20 @@ class TeacherStudentObjective(PackConfigurable, ABC):
 
     @abstractmethod
     def analyze(self, teacher_eval_id: str, student_eval_id: str) -> Any: ...
+
+    def _unhydrated_pair_keys(self) -> set[tuple[str, str]]:
+        pairs = getattr(self, "_unhydrated_pairs", None)
+        if not isinstance(pairs, set):
+            pairs = set()
+            self._unhydrated_pairs = pairs
+        return pairs
+
+    def analysis_is_cacheable(self, analysis: Any) -> bool:
+        """False for a provisional empty comparison, so a later call can fetch again."""
+        aggregate = getattr(analysis, "aggregate", None)
+        if aggregate is not None and hasattr(aggregate, "compared_entries"):
+            return aggregate.compared_entries > 0
+        return bool(getattr(analysis, "per_entry", None))
 
     def cached_paired_analysis(
         self,
@@ -149,10 +168,16 @@ class TeacherStudentObjective(PackConfigurable, ABC):
 
         ``fetch`` and ``empty`` are passed in from the concrete objective's module
         so unit tests can still patch the module-level fetch function.
+
+        An empty comparison is not stored, and an empty refetch leaves any entry
+        already cached in place. ``include_action_inputs`` false marks the pair
+        unhydrated; a later call that requests action inputs fetches again and
+        replaces that entry.
         """
         cache_key = (teacher_eval_id, student_eval_id)
+        unhydrated = self._unhydrated_pair_keys()
         cached = cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and (not self.include_action_inputs or cache_key not in unhydrated):
             print(f"[Cache HIT] Using cached {label} for {teacher_eval_id} vs {student_eval_id}")
             return cached
         if self.bigquery_client is None:
@@ -164,8 +189,16 @@ class TeacherStudentObjective(PackConfigurable, ABC):
                 student_eval_id=student_eval_id,
                 lookback_days=self.lookback_days,
                 evalcli=self.evalcli,
+                include_action_inputs=self.include_action_inputs,
             )
+        if not self.analysis_is_cacheable(analysis):
+            print(f"[Cache] Not caching provisional empty {label} for {teacher_eval_id} vs {student_eval_id}")
+            return analysis
         cache[cache_key] = analysis
+        if self.include_action_inputs:
+            unhydrated.discard(cache_key)
+        else:
+            unhydrated.add(cache_key)
         print(f"[Cache MISS] Fetched {label} for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 

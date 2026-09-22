@@ -253,6 +253,7 @@ def fetch_eval_run_citation_match_analysis(
     end_date: date | None = None,
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     evalcli: Any | None = None,
+    include_action_inputs: bool = True,
 ) -> EvalRunCitationMatchAnalysis:
     eval_ids = [teacher_eval_id, student_eval_id]
     result = run_windowed_per_entry_query(
@@ -292,7 +293,7 @@ def fetch_eval_run_citation_match_analysis(
     high_signal_entry_ids = tuple(
         sorted(entry_id for entry_id, metrics in per_entry.items() if not metrics.citations_match)
     )
-    if evalcli is not None:
+    if evalcli is not None and include_action_inputs:
         per_entry = _enrich_action_inputs(evalcli, per_entry, per_entry_rows, high_signal_entry_ids)
     return EvalRunCitationMatchAnalysis(
         teacher_eval_id=teacher_eval_id,

@@ -227,8 +227,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
         include_action_inputs: bool = True,
     ):
         self.objective.bigquery_client = self.bigquery_client
-        # Val-only eval sets never feed reflection; skip analyze-trace hydration.
-        self.objective.evalcli = self.runner.evalcli if include_action_inputs else None
+        # Validation skips trace hydration. evalcli stays available; the requested
+        # flag decides whether this fetch hydrates and whether the cache hits.
+        self.objective.include_action_inputs = include_action_inputs
+        self.objective.evalcli = self.runner.evalcli
         self.objective.lookback_days = self.agentspan_lookback_days
         analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
         self._save_cache()

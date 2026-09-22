@@ -114,10 +114,12 @@ def fetch_paired_preference_traces(
     student_eval_id: str,
     lookback_days: int = 1,
     evalcli: Any | None = None,
+    include_action_inputs: bool = True,
     **_: Any,
 ) -> AgenticPreferenceAnalysis:
     """Load student/teacher answers and tool sequences so reflection has both."""
-    if evalcli is None:
+    # Validation batches score the judge aggregate, not per-entry traces.
+    if not include_action_inputs:
         return empty_agentic_preference_analysis(teacher_eval_id, student_eval_id)
     get_view = getattr(evalcli, "get_analysis_view", None)
     if not callable(get_view):

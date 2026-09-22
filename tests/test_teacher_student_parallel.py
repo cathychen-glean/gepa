@@ -282,13 +282,165 @@ def test_get_or_fetch_analysis_caches_fetch():
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
         evalcli=adapter.objective.evalcli,
+        include_action_inputs=True,
         skip_tools=SKIPPED_TOOL_NAMES,
     )
     assert first is fetched
     assert second is fetched
 
 
-def test_validation_only_skips_action_input_evalcli():
+def _cacheable_tool_analysis(*, student_eval_id: str = "student-1") -> EvalRunToolMatchAnalysis:
+    return EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id=student_eval_id,
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id=student_eval_id,
+            compared_entries=1,
+            matching_entries=1,
+            tool_match_rate=1.0,
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+
+
+def test_empty_paired_analysis_is_not_cached():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.bigquery_client = MagicMock()
+    empty = EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id="student-1",
+            compared_entries=0,
+            matching_entries=0,
+            tool_match_rate=0.0,
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        return_value=empty,
+    ) as fetch:
+        adapter._get_or_fetch_analysis("teacher-1", "student-1")
+        adapter._get_or_fetch_analysis("teacher-1", "student-1")
+
+    assert fetch.call_count == 2
+    assert ("teacher-1", "student-1") not in adapter._analysis_cache
+
+
+def test_empty_trace_refetch_keeps_the_unhydrated_entry():
+    adapter = _teacher_student_adapter(MagicMock())
+    adapter.bigquery_client = MagicMock()
+    unhydrated = _cacheable_tool_analysis()
+    empty = EvalRunToolMatchAnalysis(
+        teacher_eval_id="teacher-1",
+        student_eval_id="student-1",
+        start_date=date(2026, 8, 8),
+        end_date=date(2026, 8, 11),
+        aggregate=ToolMatchMetrics(
+            teacher_eval_id="teacher-1",
+            student_eval_id="student-1",
+            compared_entries=0,
+            matching_entries=0,
+            tool_match_rate=0.0,
+        ),
+        per_entry={},
+        high_signal_entry_ids=(),
+    )
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        side_effect=[unhydrated, empty],
+    ) as fetch:
+        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
+        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
+        third = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
+
+    assert first is unhydrated
+    assert second is empty
+    assert third is unhydrated
+    assert fetch.call_count == 2
+    assert adapter._analysis_cache[("teacher-1", "student-1")] is unhydrated
+    assert ("teacher-1", "student-1") in adapter.objective._unhydrated_pairs
+
+
+def test_missing_bigquery_client_does_not_cache_the_empty_analysis():
+    adapter = _teacher_student_adapter(MagicMock())
+
+    first = adapter._get_or_fetch_analysis("teacher-1", "student-1")
+    second = adapter._get_or_fetch_analysis("teacher-1", "student-1")
+
+    assert first.aggregate.compared_entries == 0
+    assert second.aggregate.compared_entries == 0
+    assert ("teacher-1", "student-1") not in adapter._analysis_cache
+
+
+def test_validation_fetch_then_trace_fetch_rehydrates():
+    evalcli = MagicMock()
+    adapter = _teacher_student_adapter(evalcli)
+    adapter.bigquery_client = MagicMock()
+    unhydrated = _cacheable_tool_analysis()
+    hydrated = _cacheable_tool_analysis()
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        side_effect=[unhydrated, hydrated],
+    ) as fetch:
+        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
+        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
+
+    assert first is unhydrated
+    assert second is hydrated
+    assert fetch.call_count == 2
+    assert fetch.call_args_list[0].kwargs["evalcli"] is evalcli
+    assert fetch.call_args_list[0].kwargs["include_action_inputs"] is False
+    assert fetch.call_args_list[1].kwargs["evalcli"] is evalcli
+    assert fetch.call_args_list[1].kwargs["include_action_inputs"] is True
+    assert adapter._analysis_cache[("teacher-1", "student-1")] is hydrated
+    assert ("teacher-1", "student-1") not in adapter.objective._unhydrated_pairs
+
+
+def test_trace_fetch_then_validation_fetch_is_one_call():
+    evalcli = MagicMock()
+    adapter = _teacher_student_adapter(evalcli)
+    adapter.bigquery_client = MagicMock()
+    hydrated = _cacheable_tool_analysis()
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+        return_value=hydrated,
+    ) as fetch:
+        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
+        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
+
+    fetch.assert_called_once()
+    assert fetch.call_args.kwargs["evalcli"] is evalcli
+    assert fetch.call_args.kwargs["include_action_inputs"] is True
+    assert first is hydrated
+    assert second is hydrated
+
+
+def test_seeded_analysis_cache_hits_for_a_trace_call():
+    evalcli = MagicMock()
+    adapter = _teacher_student_adapter(evalcli)
+    adapter.bigquery_client = MagicMock()
+    seeded = _cacheable_tool_analysis()
+    adapter._analysis_cache[("teacher-1", "student-1")] = seeded
+    with patch(
+        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
+    ) as fetch:
+        got = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
+
+    fetch.assert_not_called()
+    assert got is seeded
+
+
+def test_validation_only_skips_action_input_hydration():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
     fetched = EvalRunToolMatchAnalysis(
@@ -327,7 +479,8 @@ def test_validation_only_skips_action_input_evalcli():
         teacher_eval_id="teacher-1",
         student_eval_id="student-1",
         lookback_days=adapter.agentspan_lookback_days,
-        evalcli=None,
+        evalcli=adapter.runner.evalcli,
+        include_action_inputs=False,
         skip_tools=SKIPPED_TOOL_NAMES,
     )
 
