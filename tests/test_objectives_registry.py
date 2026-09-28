@@ -33,7 +33,8 @@ def test_build_objective_defaults_to_the_builtin_source_for_each_mode():
 
 
 def test_a_second_registered_source_is_constructible(tmp_path):
-    register_telemetry_source("teacher_student", "dummy_trace", _DummyTeacherStudentObjective)
+    # A bare stub; skip contract validation so this test only covers config wiring.
+    register_telemetry_source("teacher_student", "dummy_trace", _DummyTeacherStudentObjective, validate=False)
     try:
         assert is_registered_telemetry_source("teacher_student", "dummy_trace")
         packs = tmp_path / "packs"

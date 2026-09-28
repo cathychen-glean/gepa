@@ -20,7 +20,7 @@ objective:
 screening:
   kind: high_signal_fix_rate
   threshold: 0.449
-  high_signal: teacher_preferred
+  high_signal: agentic_preference_rate
 
 reflection:
   editable_modules: [RULES_EXT, EXECUTION_DISCIPLINE, CORE_TOOLS]

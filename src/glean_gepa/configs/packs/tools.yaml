@@ -22,7 +22,7 @@ objective:
 screening:
   kind: high_signal_fix_rate
   threshold: 0.25
-  high_signal: first_tool_mismatch
+  high_signal: tool_alignment
 
 reflection:
   editable_modules: [CORE_TOOLS, RULES_EXT]

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as datetime_time
 from typing import Any
 
+from glean_gepa.debug import debug_print
+from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
@@ -964,6 +968,107 @@ def fetch_shell_tool_error_metrics(
         agentspan_table=agentspan_table,
     )
     return analysis.aggregate
+
+
+def log_shell_tool_error_analysis(analysis: EvalRunShellToolErrorAnalysis) -> None:
+    """Log the fetched shell-tool error rate and recent error details."""
+    aggregate = analysis.aggregate
+    print(
+        f"[Shell Tool] Fetched error rate for eval {analysis.eval_id}: "
+        f"{aggregate.shell_error_pct:.2f}% "
+        f"({aggregate.shell_errors}/{aggregate.shell_executions})"
+    )
+    for example in aggregate.recent_error_examples:
+        if example.action_input:
+            debug_print(f"[Shell Tool] Action input for eval {analysis.eval_id}: {example.action_input}")
+        if example.error_str:
+            debug_print(f"[Shell Tool] Error for eval {analysis.eval_id}: {example.error_str}")
+
+
+def _timestamp_millis(value: str | None) -> int | None:
+    if not value:
+        return None
+    normalized = value.replace(" UTC", "+00:00")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def enrich_shell_error_action_inputs(
+    evalcli: EvalCliClient,
+    analysis: EvalRunShellToolErrorAnalysis,
+) -> EvalRunShellToolErrorAnalysis:
+    """Fetch detailed traces and attach serialized Shell inputs to failed actions."""
+    from glean_gepa.al_adapter import extract_shell_action_inputs
+
+    examples = list(analysis.aggregate.recent_error_examples)
+    for metrics in analysis.per_entry.values():
+        examples.extend(metrics.recent_error_examples)
+
+    grouped: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
+    for example in examples:
+        if example.project_id and example.trace_id and example.action_run_id and not example.action_input:
+            grouped[(example.project_id, example.trace_id)].append(example)
+    if not grouped:
+        return analysis
+
+    print(f"[Shell Tool] Fetching action inputs for {len(grouped)} traces on eval {analysis.eval_id}")
+    resolved: dict[tuple[str, str, str], str] = {}
+    for (deployment_id, trace_id), trace_examples in grouped.items():
+        timestamps = [
+            timestamp
+            for example in trace_examples
+            for timestamp in [_timestamp_millis(example.started_at)]
+            if timestamp is not None
+        ]
+        if timestamps:
+            start_time_millis = min(timestamps) - int(timedelta(hours=1).total_seconds() * 1000)
+            end_time_millis = max(timestamps) + 1000
+        else:
+            start_dt = datetime.combine(analysis.start_date, datetime_time.min, tzinfo=timezone.utc)
+            end_dt = datetime.combine(analysis.end_date + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc)
+            start_time_millis = int(start_dt.timestamp() * 1000)
+            end_time_millis = int(end_dt.timestamp() * 1000)
+        try:
+            detailed_trace = evalcli.get_analysis_trace(
+                deployment_id=deployment_id,
+                trace_id=trace_id,
+                start_time_millis=start_time_millis,
+                end_time_millis=end_time_millis,
+            )
+        except Exception as exc:
+            print(f"[Shell Tool] Failed to fetch action inputs for trace {trace_id}: {exc}")
+            continue
+        for action_run_id, action_input in extract_shell_action_inputs(detailed_trace).items():
+            resolved[(deployment_id, trace_id, action_run_id)] = action_input
+
+    def enrich_example(example: Any) -> Any:
+        if example.action_input or not (example.project_id and example.trace_id and example.action_run_id):
+            return example
+        action_input = resolved.get((example.project_id, example.trace_id, example.action_run_id))
+        return replace(example, action_input=action_input) if action_input else example
+
+    if not resolved:
+        return analysis
+
+    aggregate = replace(
+        analysis.aggregate,
+        recent_error_examples=tuple(enrich_example(example) for example in analysis.aggregate.recent_error_examples),
+    )
+    per_entry = {
+        entry_id: replace(
+            metrics,
+            recent_error_examples=tuple(enrich_example(example) for example in metrics.recent_error_examples),
+        )
+        for entry_id, metrics in analysis.per_entry.items()
+    }
+    return replace(analysis, aggregate=aggregate, per_entry=per_entry)
 
 
 def empty_shell_tool_error_metrics(eval_id: str) -> ShellToolErrorMetrics:

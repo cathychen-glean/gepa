@@ -17,7 +17,7 @@ objective:
 screening:
   kind: high_signal_fix_rate
   threshold: 0.25
-  high_signal: citation_set_mismatch
+  high_signal: citation_match
 
 reflection:
   editable_modules: [WRITING_CODE, RULES_EXT]

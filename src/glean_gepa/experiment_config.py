@@ -234,7 +234,12 @@ def screening_threshold(config: ExperimentConfig) -> float | None:
 
 def experiment_objective_pack(config: ExperimentConfig) -> dict[str, Any]:
     """Slice of the merged experiment that ``build_objective`` applies to the metric."""
-    return {"objective": config.objective, "reflection": config.reflection}
+    return {
+        "objective": config.objective,
+        "reflection": config.reflection,
+        "screening": config.screening,
+        "signals": list(config.signals),
+    }
 
 
 def customer_validation_gates(config: ExperimentConfig | None) -> dict[str, float]:

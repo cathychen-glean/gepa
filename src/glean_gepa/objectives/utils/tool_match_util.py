@@ -8,13 +8,14 @@ from datetime import date
 from typing import Any
 
 from glean_gepa.objectives.utils.action_input_trace import (
-    build_trace_locator,
     fetch_first_tool_inputs_by_entry,
+    trace_locators_for_rows,
 )
 from glean_gepa.objectives.utils.agentspan_query import (
     AGENT_RUN_FAILURE_FILTER,
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
+    EVAL_ENTRY_ID_EXPR,
     EXECUTE_ACTION_FILTER,
     QueryParameter,
     default_date_range,
@@ -92,28 +93,19 @@ def build_tool_match_per_entry_query(
     return f"""
 WITH failed_runs AS (
   SELECT DISTINCT
-    COALESCE(
-      jsonPayload.context.eval.entry_uuid,
-      CAST(jsonPayload.context.eval.entry_id AS STRING)
-    ) AS entry_id
+    {EVAL_ENTRY_ID_EXPR} AS entry_id
   FROM `{agentspan_table}`
   WHERE {wildcard_shard_filter("start_date", "end_date")}
     AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
     AND {AGENT_RUN_FAILURE_FILTER}
     -- @eval_ids is exactly the teacher/student pair, so any hit means one of the two
     -- roles died on this entry. A NULL here would make the IN below return NULL.
-    AND COALESCE(
-      jsonPayload.context.eval.entry_uuid,
-      CAST(jsonPayload.context.eval.entry_id AS STRING)
-    ) IS NOT NULL
+    AND {EVAL_ENTRY_ID_EXPR} IS NOT NULL
 ),
 tool_spans AS (
   SELECT
     jsonPayload.context.eval.eval_id AS eval_id,
-    COALESCE(
-      jsonPayload.context.eval.entry_uuid,
-      CAST(jsonPayload.context.eval.entry_id AS STRING)
-    ) AS entry_id,
+    {EVAL_ENTRY_ID_EXPR} AS entry_id,
     REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') AS tool_name,
     jsonPayload.context.agent_trace.trace_id AS trace_id,
     resource.labels.project_id AS deployment_id,
@@ -332,34 +324,16 @@ def _enrich_action_inputs(
     detailed trace located by the scrub-safe ids returned alongside the tool names.
     """
     high_signal = set(high_signal_entry_ids)
-    rows = [row for row in per_entry_rows if str(row.get("entry_id") or "") in high_signal]
-    if not rows:
-        return per_entry
-
-    def _locators(role: str) -> list[Any]:
-        collected = []
-        for row in rows:
-            locator = build_trace_locator(
-                entry_id=str(row.get("entry_id") or ""),
-                deployment_id=row.get(f"{role}_deployment_id"),
-                trace_id=row.get(f"{role}_trace_id"),
-                min_start_ms=row.get(f"{role}_min_start_ms"),
-                max_start_ms=row.get(f"{role}_max_start_ms"),
-            )
-            if locator is not None:
-                collected.append(locator)
-        return collected
-
     skipped = SKIPPED_TOOL_NAMES if skip_tools is None else skip_tools
     student_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
-        _locators("student"),
+        trace_locators_for_rows(per_entry_rows, entry_ids=high_signal, role="student"),
         skip_tools=skipped,
         role_label="student",
     )
     teacher_inputs = fetch_first_tool_inputs_by_entry(
         evalcli,
-        _locators("teacher"),
+        trace_locators_for_rows(per_entry_rows, entry_ids=high_signal, role="teacher"),
         skip_tools=skipped,
         role_label="teacher",
     )

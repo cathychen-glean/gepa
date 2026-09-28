@@ -36,7 +36,7 @@ from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_all_judge_metrics,
 )
-from glean_gepa.objectives import TeacherStudentObjective
+from glean_gepa.objectives import AnalysisRequest, TeacherStudentObjective
 from glean_gepa.objectives.tool_match import FirstToolMatchObjective
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
@@ -183,12 +183,17 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self.pairwise_judges = tuple(pairwise_judges) if pairwise_judges is not None else PAIRWISE_JUDGES
         self.screening_kind = screening_kind
         self.teacher_model = teacher_model
-        self.bigquery_client = bigquery_client
         self.agentspan_lookback_days = agentspan_lookback_days
         self.objective = objective or FirstToolMatchObjective(
             bigquery_client=bigquery_client,
             lookback_days=agentspan_lookback_days,
         )
+        # The objective owns the fetch clients. Align an injected objective once here
+        # rather than on every fetch; ``bigquery_client`` below forwards to it.
+        if bigquery_client is not None:
+            self.objective.bigquery_client = bigquery_client
+        self.objective.lookback_days = agentspan_lookback_days
+        self.objective.evalcli = runner.evalcli
         self.telemetry_dimensions = self.objective.telemetry_dimensions
         self._judge_runs: dict[tuple[str, str, str], str] = {}
         self._judge_cache: dict[tuple[str, str, str], JudgeAnalysis] = {}
@@ -216,6 +221,15 @@ class TeacherStudentAdapter(GleanAdapterBase):
         )
 
     @property
+    def bigquery_client(self) -> Any | None:
+        """The objective's BigQuery client. One owner, so a late assignment reaches the fetch."""
+        return self.objective.bigquery_client
+
+    @bigquery_client.setter
+    def bigquery_client(self, client: Any | None) -> None:
+        self.objective.bigquery_client = client
+
+    @property
     def _analysis_cache(self) -> dict[tuple[str, str], Any]:
         return self.objective.analysis_cache
 
@@ -226,13 +240,10 @@ class TeacherStudentAdapter(GleanAdapterBase):
         *,
         include_action_inputs: bool = True,
     ):
-        self.objective.bigquery_client = self.bigquery_client
-        # Validation skips trace hydration. evalcli stays available; the requested
-        # flag decides whether this fetch hydrates and whether the cache hits.
-        self.objective.include_action_inputs = include_action_inputs
-        self.objective.evalcli = self.runner.evalcli
-        self.objective.lookback_days = self.agentspan_lookback_days
-        analysis = self.objective.analyze(teacher_eval_id, student_eval_id)
+        # Validation skips trace hydration. evalcli stays available; the request
+        # decides whether this fetch hydrates and whether the cache hits.
+        request = AnalysisRequest(evalcli=self.runner.evalcli, hydrate_action_inputs=include_action_inputs)
+        analysis = self.objective.analyze(teacher_eval_id, student_eval_id, request=request)
         self._save_cache()
         return analysis
 

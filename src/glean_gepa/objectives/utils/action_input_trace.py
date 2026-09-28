@@ -15,7 +15,7 @@ entries, and extracts each span's tool payload from whichever envelope it used.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -169,6 +169,37 @@ def build_trace_locator(
     )
 
 
+def trace_locators_for_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    entry_ids: Collection[str] | None = None,
+    role: str | None = None,
+) -> list[TraceActionInputLocator]:
+    """Locators for high-signal rows.
+
+    ``role`` selects paired columns such as ``student_trace_id``. Omit it when
+    the row already uses ``trace_id``, ``deployment_id``, ``min_start_ms``, and
+    ``max_start_ms``.
+    """
+    prefix = f"{role}_" if role else ""
+    allowed = None if entry_ids is None else set(entry_ids)
+    locators: list[TraceActionInputLocator] = []
+    for row in rows:
+        entry_id = str(row.get("entry_id") or "")
+        if allowed is not None and entry_id not in allowed:
+            continue
+        locator = build_trace_locator(
+            entry_id=entry_id,
+            deployment_id=row.get(f"{prefix}deployment_id"),
+            trace_id=row.get(f"{prefix}trace_id"),
+            min_start_ms=row.get(f"{prefix}min_start_ms"),
+            max_start_ms=row.get(f"{prefix}max_start_ms"),
+        )
+        if locator is not None:
+            locators.append(locator)
+    return locators
+
+
 def _iter_entry_traces(
     evalcli: Any,
     locators: Iterable[TraceActionInputLocator],
@@ -256,4 +287,5 @@ __all__ = [
     "extract_trace_tool_inputs",
     "fetch_action_inputs_by_entry",
     "fetch_first_tool_inputs_by_entry",
+    "trace_locators_for_rows",
 ]

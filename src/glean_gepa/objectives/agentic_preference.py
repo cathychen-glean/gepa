@@ -7,17 +7,15 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from glean_gepa.adapter_types import (
-    TeacherStudentALRolloutOutput,
-    TeacherStudentALTrajectory,
-)
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs, ReflectiveExampleMetrics
+from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
+from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.judge_metrics_util import PREFERENCE_TIE
-from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
+from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
 from glean_gepa.objectives.utils.agentic_preference_util import (
     AGENTIC_PREFERENCE_OBJECTIVE,
     AgenticPreferenceAnalysis,
+    AgenticPreferenceEntry,
     empty_agentic_preference_analysis,
     fetch_paired_preference_traces,
     fetch_preference_rationales,
@@ -113,38 +111,18 @@ def _rollout_output(
     teacher_tools: Sequence[str] = (),
     student_eval_run_id: str = "",
     teacher_eval_run_id: str = "",
-) -> TeacherStudentALRolloutOutput:
-    return {
-        "deployment_id": deployment_id,
-        "query": query,
-        "student_eval_run_id": student_eval_run_id,
-        "teacher_eval_run_id": teacher_eval_run_id,
-        "student_answer": student_answer,
-        "student_tool_events": list(student_tools),
-        "student_loops": 0,
-        "student_tool_calls": len(student_tools),
-        "student_tool_errors": 0,
-        "student_input_tokens": 0,
-        "student_output_tokens": 0,
-        "student_latency_ms": None,
-        "teacher_answer": teacher_answer,
-        "teacher_tool_events": list(teacher_tools),
-        "teacher_loops": 0,
-        "teacher_tool_calls": len(teacher_tools),
-        "teacher_input_tokens": 0,
-        "teacher_output_tokens": 0,
-        "entry_id": entry_id,
-    }
-
-
-def _preference_score(output: Mapping[str, Any]) -> float | None:
-    raw = output.get(AGENTIC_PREFERENCE_OBJECTIVE)
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+):
+    return paired_rollout_output(
+        deployment_id=deployment_id,
+        query=query,
+        entry_id=entry_id,
+        student_answer=student_answer,
+        teacher_answer=teacher_answer,
+        student_tool_events=student_tools,
+        teacher_tool_events=teacher_tools,
+        student_eval_run_id=student_eval_run_id,
+        teacher_eval_run_id=teacher_eval_run_id,
+    )
 
 
 def _rationale_cache_key(output: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -211,10 +189,13 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         self._paired_analysis_cache: dict[tuple[str, str], AgenticPreferenceAnalysis] = {}
         self._rationale_cache: dict[tuple[str, str, str], str] = {}
 
-    def analyze(self, teacher_eval_id: str, student_eval_id: str) -> AgenticPreferenceAnalysis:
+    def analyze(
+        self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest
+    ) -> AgenticPreferenceAnalysis:
         return self.cached_paired_analysis(
             teacher_eval_id,
             student_eval_id,
+            request=request,
             cache=self._paired_analysis_cache,
             fetch=fetch_paired_preference_traces,
             empty=empty_agentic_preference_analysis,
@@ -229,49 +210,44 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         del analysis, requested_entry_ids
         return 0.0
 
-    def scored_rows(
+    # The score is a placeholder: the adapter overlays the pairwise judge's
+    # per-entry verdicts after these rows are built.
+
+    def aggregate_row(self, analysis: AgenticPreferenceAnalysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(
+            entry_id=None,
+            dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
+            output=_rollout_output(
+                entry_id=ctx.query,
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_eval_run_id=analysis.student_eval_id,
+                teacher_eval_run_id=analysis.teacher_eval_id,
+            ),
+        )
+
+    def entry_row(
         self,
+        entry_id: str,
+        metrics: AgenticPreferenceEntry,
         analysis: AgenticPreferenceAnalysis,
-        *,
-        focused: bool,
-        capture_traces: bool,
-        query: str,
-        deployment_id: str,
-    ) -> list[ScoredRow]:
-        if focused and not analysis.per_entry:
-            return []
-        if not focused and not capture_traces:
-            return [
-                ScoredRow(
-                    entry_id=None,
-                    dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
-                    output=_rollout_output(
-                        entry_id=query,
-                        deployment_id=deployment_id,
-                        query=query,
-                        student_eval_run_id=analysis.student_eval_id,
-                        teacher_eval_run_id=analysis.teacher_eval_id,
-                    ),
-                )
-            ]
-        return [
-            ScoredRow(
+        ctx: ScoringContext,
+    ) -> ScoredRow:
+        return ScoredRow(
+            entry_id=entry_id,
+            dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
+            output=_rollout_output(
                 entry_id=entry_id,
-                dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
-                output=_rollout_output(
-                    entry_id=entry_id,
-                    deployment_id=deployment_id,
-                    query=query,
-                    student_answer=metrics.student_answer,
-                    teacher_answer=metrics.teacher_answer,
-                    student_tools=metrics.student_tools,
-                    teacher_tools=metrics.teacher_tools,
-                    student_eval_run_id=analysis.student_eval_id,
-                    teacher_eval_run_id=analysis.teacher_eval_id,
-                ),
-            )
-            for entry_id, metrics in analysis.per_entry.items()
-        ]
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_answer=metrics.student_answer,
+                teacher_answer=metrics.teacher_answer,
+                student_tools=metrics.student_tools,
+                teacher_tools=metrics.teacher_tools,
+                student_eval_run_id=analysis.student_eval_id,
+                teacher_eval_run_id=analysis.teacher_eval_id,
+            ),
+        )
 
     def hydrate_reflective_trajectories(self, selected: list[Any]) -> None:
         """Attach the judge's prose verdict to the entries reflection will read."""
@@ -310,13 +286,13 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
                     self._rationale_cache[(student_eval_id, entry_id, cache_scope)] = rationale
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
-        score = _preference_score(output)
+        score = output.get(self.name)
         return score is not None and score < PREFERENCE_TIE
 
     def _mismatch_key(self, output: Mapping[str, Any]) -> tuple[str, str] | None:
         if self.is_high_signal(output):
             return TEACHER_PREFERRED_KEY
-        score = _preference_score(output)
+        score = output.get(self.name)
         if score is not None and score >= KEEP_PREFERENCE_THRESHOLD:
             return STUDENT_PREFERRED_KEY
         return None
@@ -373,9 +349,9 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         del component_name, candidate
         output = trajectory["output"]
         objective_scores = trajectory.get("objective_scores", {})
-        preference = _preference_score(output)
+        preference = output.get(self.name)
         if preference is None:
-            preference = float(objective_scores.get(self.name, trajectory["score"]))
+            preference = objective_scores.get(self.name, trajectory["score"])
         if preference >= KEEP_PREFERENCE_THRESHOLD:
             feedback_parts = [
                 f"KEEP: the pairwise agentic judge already preferred the student "
@@ -394,44 +370,16 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         rationale = output.get(f"{self.name}_feedback")
         if isinstance(rationale, str) and rationale.strip():
             feedback_parts.append(f"Judge verdict by dimension:\n{rationale.strip()}")
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        metrics: ReflectiveExampleMetrics = {
-            "score": trajectory["score"],
-            "agentic_preference_rate": preference,
-        }
-        correctness = objective_scores.get("correctness")
-        if correctness is not None:
-            metrics["correctness"] = correctness
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
+        return self.reflective_example(
+            trajectory,
+            feedback="\n".join(feedback_parts),
+            generated={
                 "student_answer": output.get("student_answer", ""),
                 "teacher_answer": output.get("teacher_answer", ""),
                 "student_tools": list(output.get("student_tool_events") or []),
                 "teacher_tools": list(output.get("teacher_tool_events") or []),
             },
-            "Action Inputs": [],
-            "Execution Errors": [],
-            "Feedback": "\n".join(feedback_parts),
-            "Metrics": metrics,
-        }
+        )
 
-    def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str:
-        parts = [
-            f"score={metrics['score']:.2f}",
-            f"agentic_preference_rate={metrics.get('agentic_preference_rate', metrics['score']):.2f}",
-        ]
-        correctness = metrics.get("correctness")
-        if correctness is not None:
-            parts.append(f"correctness={correctness:.2f}")
-        return ", ".join(parts)
-
-
-register_telemetry_source("teacher_student", "agentic_preference", AgenticPreferenceObjective)
 
 __all__ = ["AgenticPreferenceObjective"]

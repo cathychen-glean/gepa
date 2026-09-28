@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 
 from glean_gepa.objectives.utils.action_input_trace import (
-    build_trace_locator,
     fetch_action_inputs_by_entry,
+    trace_locators_for_rows,
 )
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
+    EVAL_ENTRY_ID_EXPR,
     EXECUTE_ACTION_FILTER,
     QueryParameter,
     default_date_range,
@@ -25,10 +27,8 @@ ACTION_INPUT_SURFACE_LIMIT = 5
 
 LOOP_EFFICIENCY_OBJECTIVE = "loop_efficiency"
 # 1.0 when the student finishes in this many loops or fewer. Extra loops decay
-# as 1 / (1 + extra). Incorrect entries score 0 so fewer loops cannot hide a
-# worse answer.
+# as 1 / (1 + extra).
 TARGET_LOOP_COUNT = 2
-CORRECTNESS_PASS = 0.5
 
 
 @dataclass(frozen=True)
@@ -39,18 +39,10 @@ class LoopCountEntryMetrics:
     has_error: bool
     action_inputs: tuple[str, ...] = ()
     target_loops: int = TARGET_LOOP_COUNT
-    correctness_pass: float = CORRECTNESS_PASS
 
     @property
     def loop_efficiency(self) -> float:
-        if self.has_error:
-            return 0.0
-        return loop_efficiency_score(
-            self.loop_count,
-            self.correctness,
-            target_loops=self.target_loops,
-            correctness_pass=self.correctness_pass,
-        )
+        return loop_efficiency_score(self.loop_count, target_loops=self.target_loops)
 
 
 @dataclass(frozen=True)
@@ -75,23 +67,43 @@ class EvalRunLoopCountAnalysis:
 
 def loop_efficiency_score(
     loop_count: int,
-    correctness: float,
     *,
     target_loops: int = TARGET_LOOP_COUNT,
-    correctness_pass: float = CORRECTNESS_PASS,
 ) -> float:
-    """Higher-is-better score: 0 if incorrect, else 1.0 at or below the loop cap."""
-    if correctness < correctness_pass:
-        return 0.0
+    """Higher-is-better score: 1.0 at or below the loop cap, decaying as loops grow."""
     extra = max(0, int(loop_count) - target_loops)
     return 1.0 / (1.0 + extra)
+
+
+def loop_reflection_feedback(*, loops: int, target_loops: int) -> str:
+    if loops > target_loops:
+        return (
+            f"Used {loops} loops; stay at or below {target_loops} by batching independent calls "
+            "and stopping once the answer is grounded."
+        )
+    return "Reduce extra agent loops."
+
+
+def loop_count_entry_from_cache(
+    entry_id: str,
+    metrics: Mapping[str, Any],
+    *,
+    target_loops: int,
+) -> LoopCountEntryMetrics:
+    return LoopCountEntryMetrics(
+        entry_id=str(metrics.get("entry_id") or entry_id),
+        loop_count=int(metrics.get("loop_count") or 0),
+        correctness=float(metrics.get("correctness") or 0.0),
+        has_error=bool(metrics.get("has_error")),
+        action_inputs=tuple(metrics.get("action_inputs") or ()),
+        target_loops=target_loops,
+    )
 
 
 def parse_loop_count_entry_metrics(
     row: dict[str, Any],
     *,
     target_loops: int = TARGET_LOOP_COUNT,
-    correctness_pass: float = CORRECTNESS_PASS,
 ) -> LoopCountEntryMetrics:
     loop_count = int(row.get("loop_count") or 0)
     has_error = bool(row.get("has_error"))
@@ -108,7 +120,6 @@ def parse_loop_count_entry_metrics(
         correctness=correctness,
         has_error=has_error,
         target_loops=target_loops,
-        correctness_pass=correctness_pass,
     )
 
 
@@ -174,10 +185,7 @@ def build_loop_count_per_entry_query(
     return f"""
 WITH eval_spans AS (
   SELECT
-    COALESCE(
-      jsonPayload.context.eval.entry_uuid,
-      CAST(jsonPayload.context.eval.entry_id AS STRING)
-    ) AS entry_id,
+    {EVAL_ENTRY_ID_EXPR} AS entry_id,
     {EXECUTE_ACTION_FILTER} AS is_loop,
     (
       jsonPayload.action.execution_status = 'ERROR'
@@ -215,7 +223,6 @@ def fetch_eval_run_loop_count_analysis(
     evalcli: Any | None = None,
     include_action_inputs: bool = True,
     target_loops: int = TARGET_LOOP_COUNT,
-    correctness_pass: float = CORRECTNESS_PASS,
 ) -> EvalRunLoopCountAnalysis:
     result = run_windowed_per_entry_query(
         client,
@@ -241,15 +248,11 @@ def fetch_eval_run_loop_count_analysis(
     per_entry = {
         metrics.entry_id: metrics
         for row in per_entry_rows
-        for metrics in [
-            parse_loop_count_entry_metrics(row, target_loops=target_loops, correctness_pass=correctness_pass)
-        ]
+        for metrics in [parse_loop_count_entry_metrics(row, target_loops=target_loops)]
         if metrics.entry_id
     }
     if evalcli is not None:
-        per_entry = overlay_evalcli_loop_and_correctness(
-            evalcli, eval_id, per_entry, target_loops=target_loops, correctness_pass=correctness_pass
-        )
+        per_entry = overlay_evalcli_loop_and_correctness(evalcli, eval_id, per_entry, target_loops=target_loops)
     high_signal_entry_ids = tuple(
         sorted(entry_id for entry_id, metrics in per_entry.items() if metrics.loop_efficiency < 1.0)
     )
@@ -276,22 +279,7 @@ def _enrich_action_inputs(
     The scrubbed table cannot serve tool payloads, so resolve them from the detailed
     trace located by the scrub-safe ids returned alongside the loop counts.
     """
-    high_signal = set(high_signal_entry_ids)
-    locators = [
-        locator
-        for row in per_entry_rows
-        if str(row.get("entry_id") or "") in high_signal
-        for locator in [
-            build_trace_locator(
-                entry_id=str(row.get("entry_id") or ""),
-                deployment_id=row.get("deployment_id"),
-                trace_id=row.get("trace_id"),
-                min_start_ms=row.get("min_start_ms"),
-                max_start_ms=row.get("max_start_ms"),
-            )
-        ]
-        if locator is not None
-    ]
+    locators = trace_locators_for_rows(per_entry_rows, entry_ids=set(high_signal_entry_ids))
     if not locators:
         return per_entry
     action_inputs_by_entry = fetch_action_inputs_by_entry(
@@ -315,7 +303,6 @@ def overlay_evalcli_loop_and_correctness(
     per_entry: dict[str, LoopCountEntryMetrics],
     *,
     target_loops: int = TARGET_LOOP_COUNT,
-    correctness_pass: float = CORRECTNESS_PASS,
 ) -> dict[str, LoopCountEntryMetrics]:
     """Prefer eval ``loopCount`` and CORRECTNESS judge scores when the view has them."""
     get_view = getattr(evalcli, "get_analysis_view", None)
@@ -349,7 +336,6 @@ def overlay_evalcli_loop_and_correctness(
             has_error=has_error,
             action_inputs=current.action_inputs if current else (),
             target_loops=target_loops,
-            correctness_pass=correctness_pass,
         )
     return updated
 

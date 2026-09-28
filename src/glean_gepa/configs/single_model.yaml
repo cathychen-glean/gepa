@@ -10,7 +10,7 @@ mode: single_model
 packs: [shell] # or packs: [loops]
 
 run:
-  dir: run_sm # or dir: run_sm_loops
+  dir: run_sm
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
   seed_candidate: data/seed_candidate.json

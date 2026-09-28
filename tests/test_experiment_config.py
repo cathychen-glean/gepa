@@ -17,7 +17,7 @@ from glean_gepa.experiment_config import (
     runner_arg_defaults,
 )
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
-from glean_gepa.objectives import build_objective
+from glean_gepa.objectives import AnalysisRequest, build_objective
 from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.objectives.utils.tool_match_util import empty_tool_match_analysis
 from glean_gepa.runner import _parse_args
@@ -109,10 +109,28 @@ def test_mode_yaml_overlays_the_pack(tmp_path):
         + "reflection:\n  modules:\n    RULES_EXT: Override the rules module.\n",
     )
     assert overlaid.objective["params"]["failure_score_below"] == 0.4
+    assert overlaid.screening["high_signal"] == "tool_alignment"
     assert "Shell" in overlaid.objective["params"]["skipped_tools"]
     assert overlaid.reflection["modules"]["RULES_EXT"] == "Override the rules module."
     objective = build_objective("teacher_student", overlaid.signals, pack=experiment_objective_pack(overlaid))
     assert objective.pack_param("failure_score_below", None) == 0.4
+    assert objective.high_signal == "tool_alignment"
+    assert objective.signal_names == ("tool_alignment",)
+    assert (
+        objective.format_reflective_metrics({"score": 0.0, "tool_alignment": 0.25, "correctness": 0.5})
+        == "score=0.00, tool_alignment=0.25"
+    )
+    correctness_config = _load_mode(tmp_path, _mode_yaml(signals=_PAIRWISE_CORRECTNESS))
+    with_correctness = build_objective(
+        "teacher_student",
+        correctness_config.signals,
+        pack=experiment_objective_pack(correctness_config),
+    )
+    assert with_correctness.signal_names == ("tool_alignment", "correctness")
+    assert (
+        with_correctness.format_reflective_metrics({"score": 0.0, "tool_alignment": 0.25, "correctness": 0.5})
+        == "score=0.00, tool_alignment=0.25, correctness=0.50"
+    )
     assert objective.reflection_prompt("RULES_EXT") == "Override the rules module."
 
     skipped_tools = _load_mode(tmp_path, _objective_yaml("  params:\n    skipped_tools:\n      - Shell\n"))
@@ -124,7 +142,7 @@ def test_mode_yaml_overlays_the_pack(tmp_path):
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         return_value=empty_tool_match_analysis("teacher-1", "student-1"),
     ) as fetch:
-        fetch_objective.analyze("teacher-1", "student-1")
+        fetch_objective.analyze("teacher-1", "student-1", request=AnalysisRequest())
     skipped = fetch.call_args.kwargs["skip_tools"]
     assert skipped == frozenset({"Shell"})
 

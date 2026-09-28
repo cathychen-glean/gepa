@@ -239,6 +239,28 @@ def test_al_runner_run_still_waits_before_returning():
     assert events[0].split(":", 1)[1] == events[1].split(":", 1)[1]
 
 
+def test_adapter_aligns_objective_clients_once_and_forwards_bigquery_client():
+    """Fetch options travel in the request; clients are set on the objective at init, not per call."""
+    evalcli = MagicMock()
+    adapter = _teacher_student_adapter(evalcli)
+    assert adapter.objective.evalcli is evalcli
+    assert adapter.objective.lookback_days == adapter.agentspan_lookback_days
+    assert adapter.bigquery_client is None
+
+    client = MagicMock()
+    adapter.bigquery_client = client
+    assert adapter.objective.bigquery_client is client
+
+    with patch.object(adapter.objective, "analyze", return_value=_tool_match_analysis()) as analyze:
+        adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
+    request = analyze.call_args.kwargs["request"]
+    assert analyze.call_args.args == ("teacher-1", "student-1")
+    assert request.evalcli is evalcli
+    assert request.hydrate_action_inputs is False
+    # No per-call mutation of the objective.
+    assert not hasattr(adapter.objective, "include_action_inputs")
+
+
 def test_get_or_fetch_analysis_returns_empty_without_bigquery():
     adapter = _teacher_student_adapter(MagicMock())
 

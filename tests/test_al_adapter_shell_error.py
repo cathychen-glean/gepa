@@ -11,7 +11,8 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
-from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION
+from glean_gepa.objectives import AnalysisRequest
+from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION, ShellSuccessObjective
 from glean_gepa.objectives.utils.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
@@ -20,6 +21,64 @@ from glean_gepa.objectives.utils.shell_tool_error_util import (
     ShellToolErrorMetrics,
 )
 from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPendingError
+
+
+def _shell_analysis(*, executions: int, per_entry: bool) -> EvalRunShellToolErrorAnalysis:
+    aggregate = ShellToolErrorMetrics(
+        eval_id="run",
+        shell_executions=executions,
+        shell_errors=0,
+        shell_error_rate=0.0,
+        shell_error_pct=0.0,
+        recent_error_examples=(),
+    )
+    entry = ShellToolErrorEntryMetrics(
+        entry_id="e1",
+        shell_executions=executions,
+        shell_errors=0,
+        shell_error_rate=0.0,
+        shell_error_pct=0.0,
+        recent_error_examples=(),
+    )
+    return EvalRunShellToolErrorAnalysis(
+        eval_id="run",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 2),
+        aggregate=aggregate,
+        per_entry={"e1": entry} if per_entry else {},
+        high_signal_entry_ids=(),
+    )
+
+
+def test_shell_cache_hooks_drive_the_shared_helper():
+    """Shell keeps only trace fetches and refetches when a hit lacks the per-entry rows asked for."""
+    objective = ShellSuccessObjective(bigquery_client=MagicMock())
+    aggregate_only = _shell_analysis(executions=3, per_entry=False)
+    with_entries = _shell_analysis(executions=3, per_entry=True)
+    pending = _shell_analysis(executions=0, per_entry=False)
+
+    # Only trace-detail results are cacheable.
+    assert not objective.analysis_is_cacheable(with_entries, AnalysisRequest(detail="aggregate"))
+    assert not objective.analysis_is_cacheable(with_entries, AnalysisRequest(detail="per_entry"))
+    assert objective.analysis_is_cacheable(with_entries, AnalysisRequest(detail="traces"))
+    assert not objective.analysis_is_cacheable(pending, AnalysisRequest(detail="traces"))
+
+    # An aggregate-only hit serves aggregate requests but not per-entry ones.
+    assert objective.cache_hit_is_sufficient(aggregate_only, AnalysisRequest(detail="aggregate"))
+    assert not objective.cache_hit_is_sufficient(aggregate_only, AnalysisRequest(detail="per_entry"))
+    assert objective.cache_hit_is_sufficient(with_entries, AnalysisRequest(detail="traces"))
+
+    # End to end through the helper: validation is never stored, trace is, and a
+    # per-entry request after a trace hit reuses it.
+    with patch(
+        "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
+        side_effect=[aggregate_only, with_entries],
+    ) as fetch:
+        assert objective.analyze("run", request=AnalysisRequest(detail="aggregate")) is aggregate_only
+        assert objective.analysis_cache == {}
+        assert objective.analyze("run", request=AnalysisRequest(detail="traces")) is with_entries
+        assert objective.analyze("run", request=AnalysisRequest(detail="per_entry")) is with_entries
+    assert fetch.call_count == 2
 
 
 def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[str]):
@@ -261,8 +320,8 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
         )
 
     ensure.assert_called_once()
-    assert get_analysis.call_args.kwargs["include_error_examples"] is False
-    assert get_analysis.call_args.kwargs["include_per_entry"] is True
+    # Focused evals need per-entry scores, not trace-level error examples.
+    assert get_analysis.call_args.kwargs["detail"] == "per_entry"
     assert run_eval.call_args.kwargs["eval_set_name"] == "gepa-high-signal-source"
     assert run_eval.call_args.kwargs["eval_set_version"] == "v1_hs_abc"
     assert run_eval.call_args.kwargs["run_label"] == "gepa_high_signal"
@@ -288,7 +347,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
     ]
     with (
         patch(
-            "glean_gepa.objectives.shell.fetch_high_signal_evalset_entries",
+            "glean_gepa.single_model_adapter.fetch_high_signal_evalset_entries",
             return_value=source_entries,
         ) as resolve_entries,
         patch(
@@ -413,8 +472,11 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
         student_model="fast",
         thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
     )
+    # Telemetry for a focused run is keyed by the requested entry ids. The failing
+    # entry has 100 calls with 1 error: per-entry pass/fail must score it 0.0, not
+    # its 99% call-level success rate.
     passing = ShellToolErrorEntryMetrics(
-        entry_id="fresh-passing",
+        entry_id="source-1",
         shell_executions=1,
         shell_errors=0,
         shell_error_rate=0.0,
@@ -422,7 +484,7 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
         recent_error_examples=(),
     )
     failing = ShellToolErrorEntryMetrics(
-        entry_id="fresh-failing",
+        entry_id="source-2",
         shell_executions=100,
         shell_errors=1,
         shell_error_rate=0.01,
@@ -692,7 +754,8 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
     )
 
     with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=analysis) as fetch:
-        assert adapter._get_or_fetch_analysis("run_cached") is analysis
+        # Only a trace-detail fetch is cached; that is what full trace evals request.
+        assert adapter._get_or_fetch_analysis("run_cached", detail="traces") is analysis
         fetch.assert_called_once()
 
     adapter._save_cache()

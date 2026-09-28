@@ -27,6 +27,8 @@ AGENT_RUN_FAILURE_FILTER = (
     "STARTS_WITH(jsonPayload.span_info.span_name, 'Agent Run:') "
     "AND jsonPayload.span_info.execution_status.code = 'ERROR'"
 )
+# Cortex entry UUID, falling back to the numeric entry id on older spans.
+EVAL_ENTRY_ID_EXPR = "COALESCE(jsonPayload.context.eval.entry_uuid, CAST(jsonPayload.context.eval.entry_id AS STRING))"
 # Note: the scrubber strips ``span_info.inputs`` from this table, so tool-call
 # payloads are not queryable here. Objectives instead carry the scrub-safe
 # ``trace_id``/``project_id``/timestamps out of BigQuery and resolve the payloads
