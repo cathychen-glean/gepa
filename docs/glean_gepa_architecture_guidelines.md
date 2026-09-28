@@ -15,11 +15,11 @@ GEPA engine wiring (`api.py`)
         |
         +--> TeacherStudentAdapter
         |      evaluates student vs. teacher through EvalCLI + Judge
-        |      objectives: correctness, tool alignment, grounding
+        |      objectives (objectives/registry.py): tool_match, citation_match, agentic_preference
         |
         +--> SingleModelAdapter
                evaluates one student through EvalCLI + BigQuery
-               objective: shell_success_rate
+               objectives (objectives/registry.py): shell_telemetry, loop_telemetry
                optionally creates a fresh replay eval set per candidate
 
 Shared infrastructure (not adapters)
@@ -107,6 +107,101 @@ uv run python -m glean_gepa.runner \
 5. Preserve the distinction between a selection score and reflection diagnostics. Scores choose candidates; traces, error strings, and per-entry data explain what to edit.
 6. Cache keys must include every result-changing input: eval-set identity/version, model, prompt hash, and run label. Keep fresh eval-set cache behavior explicit.
 7. Every extraction step gets characterization tests before cleanup. Remote EvalCLI/BigQuery runs are smoke tests, not unit tests.
+
+## Adding an objective
+
+An objective turns one eval run (or a teacher/student pair) into per-entry
+scores and reflection evidence. Adapters, the proposer, caching, and the
+reflection frame are shared; you write the parts that know your signal.
+
+### Files you touch
+
+| File | What goes there |
+|---|---|
+| `objectives/utils/<signal>_util.py` | Fetch and parse: the BigQuery/EvalCLI query, an `EntryMetrics` dataclass, an `Analysis` dataclass, `empty_*_analysis`, `log_*_analysis`. Nothing here imports from `objectives/*.py`. |
+| `objectives/<signal>.py` | The objective class. Subclass `TeacherStudentObjective` or `SingleModelObjective` and fill in the hooks below. |
+| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string a pack YAML uses to select you. |
+| `configs/packs/<pack>.yaml` | A pack that names your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `loops.yaml`. |
+| `tests/test_<signal>_objective.py` | At least the contract test (see below), a scoring test, and a reflective-example test. |
+
+Do not touch the adapters, `base.py`, or `protocol.py` unless every existing
+objective needs the change.
+
+### Class attributes
+
+```python
+name = "loop_efficiency"                 # objective score key; also the pack signal name
+telemetry_dimensions = ("loop_efficiency",)
+focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
+failure_label = "HIGH-SIGNAL FAILURES (extra loops)"
+module_responsibilities = {WRITING_CODE_KEY: "..."}   # optional; seeds the reflection prompt
+```
+
+`SingleModelObjective` also needs `pending_telemetry_label` and `pending_count`,
+which name the aggregate field that is `0` while BigQuery is still ingesting.
+
+### Hooks (all abstract)
+
+| Hook | Returns | Notes |
+|---|---|---|
+| `analyze(eval_id, *, request)` / `analyze(teacher_eval_id, student_eval_id, *, request)` | your `Analysis` | Wrap the fetch in `self.cached_eval_analysis(...)` (single model) or `self.cached_paired_analysis(...)` (teacher/student). Read `request.wants_per_entry`, `request.wants_traces`, `request.hydrate_action_inputs` to size the query. |
+| `focused_pass_rate(analysis, requested_entry_ids)` | `float` | Share of the requested entries that pass. |
+| `entry_row(entry_id, metrics, analysis, ctx)` | `ScoredRow` | One entry. `ctx` carries `eval_set_name`, `deployment_id`, and `ctx.entry_query(entry_id)`. Put every field `build_reflective_example` will read into `output`. |
+| `aggregate_row(analysis, ctx)` | `ScoredRow` | The whole-run row used for validation batches. |
+| `failure_pattern(component_name, trajectory)` | `tuple` | Grouping key for near-duplicate failures; return `()` to disable. |
+| `build_reflective_example(component_name, candidate, trajectory)` | `ReflectiveExample` | Compute `feedback` (and `generated` for teacher/student), then `return self.reflective_example(trajectory, feedback=..., action_inputs=..., execution_errors=...)`. The helper owns `Inputs`, `Metrics`, and the evidence caps. |
+| `log_analysis(analysis)` | `None` | Single model only. Usually delegates to `log_*_analysis` in your util. |
+| `validate_full_eval(analysis)` | `None` | Teacher/student only. Raise when a full eval has nothing to compare. |
+
+Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
+`cache_hit_is_sufficient`, `analysis_is_cacheable`, `cache_payload` /
+`load_cache` (implement both if your analysis should survive a resume).
+
+### Scores
+
+- Every score is higher-is-better in `[0.0, 1.0]`. `scored_rows_are_normalized`
+  in `protocol.py` rejects anything else.
+- `objective_scores` in each row must contain `self.name`. Extra keys are fine;
+  the pack decides which ones enter the composite.
+- Provisional results (telemetry not yet ingested) return an analysis whose
+  aggregate reports `0` entries. `is_pending` sees that and the adapter retries.
+
+### Register and test
+
+```python
+# objectives/registry.py
+ObjectiveSpec(
+    mode="single_model",
+    source="downvote_judge",
+    class_path="glean_gepa.objectives.downvote_judge:DownvoteJudgeObjective",
+    summary="Judge did not downvote the answer.",
+),
+```
+
+```python
+# tests/test_downvote_judge_objective.py  (mirrors tests/test_loop_objective.py)
+from glean_gepa.objectives import registry
+from glean_gepa.objectives.protocol import ObjectiveProtocol, check_objective_contract
+
+def test_satisfies_contract_and_is_registered() -> None:
+    assert check_objective_contract(DownvoteJudgeObjective) == []
+    assert isinstance(DownvoteJudgeObjective(bigquery_client=MagicMock()), ObjectiveProtocol)
+    assert registry.resolve("single_model", "downvote_judge") is DownvoteJudgeObjective
+```
+
+`tests/test_objectives_catalog.py` already asserts that every spec in
+`BUILTIN_OBJECTIVES` loads and satisfies the protocol, so a missing hook fails
+CI before you write a scoring test.
+
+### Checklist
+
+- [ ] Util module fetches, parses, logs. No adapter or objective imports.
+- [ ] Objective class sets the class attributes and implements every hook in the table.
+- [ ] `analyze` goes through the shared cache helper.
+- [ ] `build_reflective_example` goes through `self.reflective_example`.
+- [ ] `ObjectiveSpec` added; `uv run pytest tests/test_objectives_catalog.py` passes.
+- [ ] Pack YAML added; `uv run pytest tests/test_experiment_config.py` passes.
+- [ ] `uv run ruff check src/ && uv run pyright src/` clean.
 
 ## Children cache (`glean_children_cache.json`)
 
