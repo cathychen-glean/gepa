@@ -10,17 +10,19 @@ from glean_gepa.objectives.loop_efficiency import (
     LoopCountEntryMetrics,
     build_loop_count_per_entry_query,
     fetch_eval_run_loop_count_analysis,
-    loop_efficiency_score,
     overlay_evalcli_loop_and_correctness,
     parse_loop_count_entry_metrics,
 )
 
 
 def test_loop_efficiency_is_one_at_or_below_target_and_decays_above_it():
-    assert loop_efficiency_score(0) == 1.0
-    assert loop_efficiency_score(2) == 1.0
-    assert loop_efficiency_score(3) == 0.5
-    assert loop_efficiency_score(4) == 1 / 3
+    def efficiency(loop_count: int) -> float:
+        return LoopCountEntryMetrics("e", loop_count, 1.0, False).loop_efficiency
+
+    assert efficiency(0) == 1.0
+    assert efficiency(2) == 1.0
+    assert efficiency(3) == 0.5
+    assert efficiency(4) == 1 / 3
 
 
 def test_parse_uses_errors_as_correctness_when_judge_score_is_missing():
