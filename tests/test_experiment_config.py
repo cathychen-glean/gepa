@@ -50,14 +50,13 @@ def _objective_yaml(snippet: str) -> str:
 
 
 def test_correctness_can_be_weighted_into_the_composite(tmp_path):
-    body = (
-        resolve_config_path("teacher_student")
-        .read_text()
-        .replace(
-            "  composite:\n    tool_alignment: 1.0",
-            "  primary: correctness\n  composite:\n    correctness: 0.5\n    tool_alignment: 0.5",
-        )
-    )
+    # Built from _mode_yaml, not by editing the packaged teacher_student.yaml:
+    # that file's composite changed once already and the str.replace silently
+    # matched nothing, leaving this test asserting against the unedited config.
+    body = _mode_yaml(
+        signals=_PAIRWISE_CORRECTNESS,
+        composite="    correctness: 0.5\n    tool_alignment: 0.5\n",
+    ).replace("objective:\n", "objective:\n  primary: correctness\n")
     config = _load_mode(tmp_path, body)
 
     assert config.primary_objective == "correctness"
