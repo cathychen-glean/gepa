@@ -13,7 +13,7 @@ from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
 from glean_gepa.objectives import AnalysisRequest
 from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION, ShellSuccessObjective
-from glean_gepa.objectives.utils.shell_tool_error_util import (
+from glean_gepa.objectives.shell import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
     ShellToolErrorEntryMetrics,
@@ -41,7 +41,7 @@ def _shell_analysis(*, executions: int, per_entry: bool) -> EvalRunShellToolErro
         recent_error_examples=(),
     )
     return EvalRunShellToolErrorAnalysis(
-        eval_id="run",
+        eval_ids=("run",),
         start_date=date(2026, 8, 1),
         end_date=date(2026, 8, 2),
         aggregate=aggregate,
@@ -102,7 +102,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         }
     ]
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
@@ -564,7 +564,7 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
         error_str="command exited with status 1",
     )
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
@@ -636,7 +636,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         trace_ids=("trace-1",),
     )
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 11),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
@@ -720,7 +720,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
 def test_shell_error_analysis_cache_round_trip(tmp_path):
     cache_file = tmp_path / "eval-cache.json"
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_cached",
+        eval_ids=("run_cached",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
@@ -780,7 +780,7 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
 def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path):
     cache_file = tmp_path / "eval-cache.json"
     provisional = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
@@ -814,7 +814,7 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
 
 def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
     provisional = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
@@ -853,7 +853,7 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
 
 def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
+        eval_ids=("gepa_gpt_5a0754e0543e49fc_1788306729",),
         start_date=date(2026, 9, 2),
         end_date=date(2026, 9, 2),
         aggregate=ShellToolErrorMetrics(
@@ -950,7 +950,7 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         )
     )
     refreshed = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
@@ -1004,7 +1004,7 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         )
     )
     refreshed = EvalRunShellToolErrorAnalysis(
-        eval_id="run_legacy",
+        eval_ids=("run_legacy",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(

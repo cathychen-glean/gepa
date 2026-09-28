@@ -5,15 +5,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from glean_gepa.objectives.utils.tool_names import SKIPPED_TOOL_NAMES
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
-from glean_gepa.objectives.utils.tool_match_util import (
-    SKIPPED_TOOL_NAMES,
+from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.objectives.tool_match import (
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
-    NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
     ToolMatchMetrics,
 )
@@ -103,8 +103,7 @@ def _tool_match_analysis(
         )
     matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
     return EvalRunToolMatchAnalysis(
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
+        eval_ids=(teacher_eval_id, student_eval_id),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
@@ -276,8 +275,7 @@ def test_get_or_fetch_analysis_caches_fetch():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
     fetched = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
@@ -450,8 +448,7 @@ def test_validation_only_skips_action_input_hydration():
 def test_finish_batch_evals_uses_tool_match_and_correctness():
     adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     analysis = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
@@ -604,8 +601,7 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
     """
     adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     adapter._analysis_cache[("teacher-1", "student-1")] = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
@@ -677,8 +673,7 @@ def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
 def test_finish_focused_eval_uses_requested_entry_denominator():
     adapter = _teacher_student_adapter(MagicMock())
     analysis = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
@@ -726,7 +721,7 @@ def test_finish_focused_eval_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
 
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
             [
                 _StartedPair(
@@ -743,7 +738,7 @@ def test_finish_batch_evals_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
 
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
             [
                 _StartedPair(

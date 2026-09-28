@@ -11,10 +11,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Literal, TypeVar, cast
 
 import glean_gepa.objectives.registry as _registry
 from glean_gepa.adapter_types import JudgingMode
+from glean_gepa.objectives.utils.core import EVIDENCE_LIMIT, RunAnalysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import DEFAULT_MODULE_RESPONSIBILITY, core_tool_reflection_prompt
@@ -29,7 +30,8 @@ if TYPE_CHECKING:
 _REFLECTION_K_DEFAULT = object()
 
 # Reflection surfaces at most this many tool payloads / error strings per example.
-REFLECTION_EVIDENCE_LIMIT = 5
+# Same cap the utils use for console logging; one number, defined in core.
+REFLECTION_EVIDENCE_LIMIT = EVIDENCE_LIMIT
 
 # The catalog and registry live in ``glean_gepa.objectives.registry``. These
 # names are kept so existing imports keep working; they read from that module.
@@ -40,6 +42,12 @@ MODE_DEFAULT_PACK: dict[JudgingMode, str] = {
 MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
     spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
 }
+
+
+# The frame a concrete objective's ``analyze()`` returns. Subclasses bind it:
+# ``class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis])``
+# and every hook below then receives that type instead of ``Any``.
+AnalysisT = TypeVar("AnalysisT", bound=RunAnalysis[Any, Any])
 
 
 AnalysisDetail = Literal["aggregate", "per_entry", "traces"]
@@ -318,7 +326,7 @@ def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
         )
 
 
-class TeacherStudentObjective(PackConfigurable, ABC):
+class TeacherStudentObjective(PackConfigurable, ABC, Generic[AnalysisT]):
     """Paired teacher-vs-student trace comparison."""
 
     name: str
@@ -346,7 +354,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return getattr(self, "_paired_analysis_cache", {})
 
     @abstractmethod
-    def analyze(self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest) -> Any: ...
+    def analyze(self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest) -> AnalysisT: ...
 
     def _unhydrated_pair_keys(self) -> set[tuple[str, str]]:
         pairs = getattr(self, "_unhydrated_pairs", None)
@@ -355,7 +363,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
             self._unhydrated_pairs = pairs
         return pairs
 
-    def analysis_is_cacheable(self, analysis: Any) -> bool:
+    def analysis_is_cacheable(self, analysis: AnalysisT) -> bool:
         """False for a provisional empty comparison, so a later call can fetch again."""
         aggregate = getattr(analysis, "aggregate", None)
         if aggregate is not None and hasattr(aggregate, "compared_entries"):
@@ -368,11 +376,11 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         student_eval_id: str,
         *,
         request: AnalysisRequest,
-        cache: dict[tuple[str, str], Any],
-        fetch: Callable[..., Any],
-        empty: Callable[[str, str], Any],
+        cache: dict[tuple[str, str], AnalysisT],
+        fetch: Callable[..., AnalysisT],
+        empty: Callable[[str, str], AnalysisT],
         label: str,
-    ) -> Any:
+    ) -> AnalysisT:
         """Fetch (or reuse a cached) paired analysis with shared HIT/MISS logging.
 
         ``fetch`` and ``empty`` are passed in from the concrete objective's module
@@ -411,19 +419,19 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         print(f"[Cache MISS] Fetched {label} for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 
-    def require_compared_entries(self, analysis: Any) -> None:
+    def require_compared_entries(self, analysis: AnalysisT) -> None:
         """Reject a 0/0 comparison. Objectives without a compared-entry count do nothing."""
         del analysis
 
     @abstractmethod
-    def validate_full_eval(self, analysis: Any) -> None: ...
+    def validate_full_eval(self, analysis: AnalysisT) -> None: ...
 
     @abstractmethod
-    def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
+    def focused_pass_rate(self, analysis: AnalysisT, requested_entry_ids: Sequence[str]) -> float: ...
 
     def scored_rows(
         self,
-        analysis: Any,
+        analysis: AnalysisT,
         *,
         focused: bool,
         capture_traces: bool,
@@ -446,11 +454,11 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return [self.entry_row(entry_id, metrics, analysis, ctx) for entry_id, metrics in analysis.per_entry.items()]
 
     @abstractmethod
-    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def entry_row(self, entry_id: str, metrics: Any, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Score and rollout output for one compared entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
 
     @abstractmethod
-    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def aggregate_row(self, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Run-level score for validation batches. ``ScoredRow.entry_id`` must be ``None``."""
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
@@ -584,7 +592,7 @@ class TelemetryPendingError(RuntimeError):
     """Raised when an eval has no scorable telemetry yet; callers should retry, not score 0/0."""
 
 
-class SingleModelObjective(PackConfigurable, ABC):
+class SingleModelObjective(PackConfigurable, ABC, Generic[AnalysisT]):
     """Student-only BigQuery / agentspan metric."""
 
     name: str
@@ -602,7 +610,7 @@ class SingleModelObjective(PackConfigurable, ABC):
     _unhydrated_eval_ids: set[str]
 
     @abstractmethod
-    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> Any: ...
+    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> AnalysisT: ...
 
     # --- shared per-eval cache -------------------------------------------
 
@@ -619,7 +627,7 @@ class SingleModelObjective(PackConfigurable, ABC):
         del cached, request
         return True
 
-    def analysis_is_cacheable(self, analysis: Any, request: AnalysisRequest) -> bool:
+    def analysis_is_cacheable(self, analysis: AnalysisT, request: AnalysisRequest) -> bool:
         """False for a provisional result, so a later call fetches again."""
         del request
         return not self.is_pending(analysis)
@@ -629,9 +637,9 @@ class SingleModelObjective(PackConfigurable, ABC):
         eval_id: str,
         *,
         request: AnalysisRequest,
-        fetch: Callable[[AnalysisRequest], Any],
+        fetch: Callable[[AnalysisRequest], AnalysisT],
         label: str,
-    ) -> Any:
+    ) -> AnalysisT:
         """Fetch (or reuse a cached) analysis for one eval with shared HIT/MISS logging.
 
         ``fetch`` is called with the request only; the objective's closure supplies
@@ -667,18 +675,18 @@ class SingleModelObjective(PackConfigurable, ABC):
             unhydrated.add(eval_id)
         return analysis
 
-    def is_pending(self, analysis: Any) -> bool:
+    def is_pending(self, analysis: AnalysisT) -> bool:
         """Telemetry has not landed while ``pending_count`` on the aggregate is 0."""
         return getattr(analysis.aggregate, self.pending_count) == 0
 
-    def aggregate_score(self, analysis: Any) -> float:
+    def aggregate_score(self, analysis: AnalysisT) -> float:
         """The objective ``name`` is the float field on ``analysis.aggregate``."""
         return float(getattr(analysis.aggregate, self.name))
 
     @abstractmethod
-    def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
+    def focused_pass_rate(self, analysis: AnalysisT, requested_entry_ids: Sequence[str]) -> float: ...
 
-    def entry_ids_to_score(self, analysis: Any, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
+    def entry_ids_to_score(self, analysis: AnalysisT, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
         """Which entries get a per-entry ``ScoredRow``.
 
         Focused eval (``requested_entry_ids`` given): the requested ids that have
@@ -693,11 +701,11 @@ class SingleModelObjective(PackConfigurable, ABC):
         return tuple(analysis.high_signal_entry_ids)
 
     @abstractmethod
-    def log_analysis(self, analysis: Any) -> None: ...
+    def log_analysis(self, analysis: AnalysisT) -> None: ...
 
     def scored_rows(
         self,
-        analysis: Any,
+        analysis: AnalysisT,
         *,
         al_data_inst: Mapping[str, Any],
         student_eval_id: str,
@@ -731,11 +739,11 @@ class SingleModelObjective(PackConfigurable, ABC):
         return [self.entry_row(entry_id, analysis.per_entry[entry_id], analysis, ctx) for entry_id in entry_ids]
 
     @abstractmethod
-    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def entry_row(self, entry_id: str, metrics: Any, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Score and rollout output for one entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
 
     @abstractmethod
-    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def aggregate_row(self, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Run-level score. ``ScoredRow.entry_id`` must be ``None``; the base re-keys it when needed."""
 
     @abstractmethod

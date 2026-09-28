@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
-from glean_gepa.objectives.utils.tool_match_util import first_tool_mismatch_pair
+from glean_gepa.objectives.utils.tool_names import first_tool_mismatch_pair
 from glean_gepa.prompt_constants import (
     CORE_TOOL_DESCRIPTIONS,
     CORE_TOOL_KEYS,

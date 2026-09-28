@@ -19,7 +19,7 @@ from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
 from glean_gepa.objectives import AnalysisDetail, AnalysisRequest, SingleModelObjective, TelemetryPendingError
 from glean_gepa.objectives.shell import ShellSuccessObjective
-from glean_gepa.objectives.utils.shell_tool_error_util import fetch_high_signal_evalset_entries
+from glean_gepa.objectives.utils.evalset_entries import fetch_high_signal_evalset_entries
 from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 

@@ -114,18 +114,53 @@ An objective turns one eval run (or a teacher/student pair) into per-entry
 scores and reflection evidence. Adapters, the proposer, caching, and the
 reflection frame are shared; you write the parts that know your signal.
 
+### Start from a template
+
+Two complete, importable objectives live beside the real ones. Copy the one
+that matches where your signal comes from, rename, and fill the `TODO`s:
+
+| Template | Source | Lines | Use when |
+|---|---|---|---|
+| `objectives/_template_agentspan.py` | BigQuery `agentspan_*` spans | ~300 | The signal is in span telemetry: tool calls, loop counts, errors, citations. |
+| `objectives/_template_evalcli.py` | EvalCLI analysis view | ~210 | The eval run already carries the signal: a judge dimension, a per-entry flag, a downvote. |
+
+Both pass `check_objective_contract` and pyright as-is. Each is one file in
+the same layout as the five shipped objectives, top to bottom:
+
+1. **Types.** One `EntryMetrics` dataclass with `entry_id`, `passed`, `score`;
+   one aggregate dataclass; the `Analysis` frame alias.
+2. **Parse and reduce.** `parse_row(row) -> EntryMetrics | None` and
+   `aggregate(eval_ids, per_entry) -> Aggregate`.
+3. **Source.** Agentspan: one SQL query returning one row per entry, passed to
+   `fetch_agentspan_analysis`. EvalCLI: one call, then `build_analysis`.
+4. **Feedback.** One function returning the sentence the reflector reads for a
+   failing entry.
+5. **Objective class.** `SingleModelObjective[Analysis]` or
+   `TeacherStudentObjective[Analysis]`, with the hooks below.
+
+### The four decisions
+
+Everything specific to your objective is an answer to one of these. The
+template marks where each goes.
+
+| Decision | Where it lands |
+|---|---|
+| What is one entry, and when has it passed? | `EntryMetrics.passed` / `.score` |
+| What does the run score, and which field is `0` while telemetry is still landing? | the aggregate dataclass; `pending_count` on the class |
+| Where do the rows come from? | `build_*_per_entry_query` + `fetch_agentspan_analysis`, or one EvalCLI call + `build_analysis` |
+| What should the prompt do differently for a failing entry? | `*_feedback` → `build_reflective_example` |
+
 ### Files you touch
 
 | File | What goes there |
 |---|---|
-| `objectives/utils/<signal>_util.py` | Fetch and parse: the BigQuery/EvalCLI query, an `EntryMetrics` dataclass, an `Analysis` dataclass, `empty_*_analysis`, `log_*_analysis`. Nothing here imports from `objectives/*.py`. |
-| `objectives/<signal>.py` | The objective class. Subclass `TeacherStudentObjective` or `SingleModelObjective` and fill in the hooks below. |
+| `objectives/<signal>.py` | The copied template. One file: types, parsing, source, feedback, class. |
 | `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string a pack YAML uses to select you. |
 | `configs/packs/<pack>.yaml` | A pack that names your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `loops.yaml`. |
-| `tests/test_<signal>_objective.py` | At least the contract test (see below), a scoring test, and a reflective-example test. |
+| `tests/test_<signal>_objective.py` | At least the contract test (below), a scoring test, and a reflective-example test. |
 
-Do not touch the adapters, `base.py`, or `protocol.py` unless every existing
-objective needs the change.
+Do not touch the adapters, `base.py`, `protocol.py`, or anything under
+`objectives/utils/` unless every existing objective needs the change.
 
 ### Class attributes
 
@@ -138,9 +173,14 @@ module_responsibilities = {WRITING_CODE_KEY: "..."}   # optional; seeds the refl
 ```
 
 `SingleModelObjective` also needs `pending_telemetry_label` and `pending_count`,
-which name the aggregate field that is `0` while BigQuery is still ingesting.
+which name the aggregate field that is `0` while telemetry is still ingesting.
 
-### Hooks (all abstract)
+### Hooks
+
+The base classes are generic in the frame your `analyze()` returns:
+`class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis])`.
+Every hook then receives that type, and pyright flags a hook typed against the
+wrong frame.
 
 | Hook | Returns | Notes |
 |---|---|---|
@@ -149,9 +189,10 @@ which name the aggregate field that is `0` while BigQuery is still ingesting.
 | `entry_row(entry_id, metrics, analysis, ctx)` | `ScoredRow` | One entry. `ctx` carries `eval_set_name`, `deployment_id`, and `ctx.entry_query(entry_id)`. Put every field `build_reflective_example` will read into `output`. |
 | `aggregate_row(analysis, ctx)` | `ScoredRow` | The whole-run row used for validation batches. |
 | `failure_pattern(component_name, trajectory)` | `tuple` | Grouping key for near-duplicate failures; return `()` to disable. |
-| `build_reflective_example(component_name, candidate, trajectory)` | `ReflectiveExample` | Compute `feedback` (and `generated` for teacher/student), then `return self.reflective_example(trajectory, feedback=..., action_inputs=..., execution_errors=...)`. The helper owns `Inputs`, `Metrics`, and the evidence caps. |
-| `log_analysis(analysis)` | `None` | Single model only. Usually delegates to `log_*_analysis` in your util. |
-| `validate_full_eval(analysis)` | `None` | Teacher/student only. Raise when a full eval has nothing to compare. |
+| `build_reflective_example(component_name, trajectory, candidate)` | `ReflectiveExample` | Compute `feedback` (and `generated` for teacher/student), then `return self.reflective_example(trajectory, feedback=..., action_inputs=..., execution_errors=...)`. The helper owns `Inputs`, `Metrics`, and the evidence caps. |
+| `log_analysis(analysis)` | `None` | Single model only. Call `core.log_analysis(analysis, label=, headline=, entry_line=)`. |
+| `validate_full_eval(analysis)` | `None` | Teacher/student only. Log the comparison; raise when a full eval has nothing to compare. |
+| `require_compared_entries(analysis)` | `None` | Teacher/student only, optional. Raise `core.NoComparedEntriesError` with a hint when `compared_entries == 0`; default does nothing. |
 
 Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 `cache_hit_is_sufficient`, `analysis_is_cacheable`, `cache_payload` /
@@ -193,10 +234,28 @@ def test_satisfies_contract_and_is_registered() -> None:
 `BUILTIN_OBJECTIVES` loads and satisfies the protocol, so a missing hook fails
 CI before you write a scoring test.
 
+### What `objectives/utils/` gives you
+
+You call these; you do not add to them for one objective.
+
+| Module | What it is |
+|---|---|
+| `core` | The frame: `RunAnalysis[A, E]` / `PairedRunAnalysis`, `EntryMetricsLike`, `build_analysis`, `empty_analysis`, `select_high_signal`, `require_compared_entries`, `log_analysis`, `EVIDENCE_LIMIT`. |
+| `agentspan` | BigQuery: `bounds_query` (`"= @eval_id"` or `"IN UNNEST(@eval_ids)"`), `paired_role_query` (the teacher/student FULL OUTER JOIN scaffold), `fetch_agentspan_analysis` (window → query → `filter_rows` → `parse_row` → `post_parse` → high-signal → `enrich` → `aggregate`). |
+| `traces` | `enrich_action_inputs`: tool payloads from detailed EvalCLI traces for high-signal entries. You supply one `apply(metrics, fetched, entry_id)`. |
+| `agentspan_query` | Shard-window and table constants, `default_date_range`, `wildcard_shard_filter`, `EVAL_ENTRY_ID_EXPR`. |
+| `evalset_entries` | `fact.*` lookups the adapters use to build focused replay sets. |
+| `tool_names` | `SKIPPED_TOOL_NAMES`, `scored_tool_sequence`, `first_tool_name`, `first_tool_mismatch_pair`. Shared with `prompt` and `run_log`. |
+| `mismatch` | Grouping near-duplicate failures for reflection. |
+
+Two shipped objectives depart from the template and say why in their module
+docstrings: `shell.py` (own aggregate query; `action_run_id`-keyed enrichment)
+and `agentic_preference.py` (no SQL, no aggregate on the frame).
+
 ### Checklist
 
-- [ ] Util module fetches, parses, logs. No adapter or objective imports.
-- [ ] Objective class sets the class attributes and implements every hook in the table.
+- [ ] One file under `objectives/`, in the template layout. Imports from `utils/`, never from another objective.
+- [ ] Class binds its frame: `SingleModelObjective[YourAnalysis]`.
 - [ ] `analyze` goes through the shared cache helper.
 - [ ] `build_reflective_example` goes through `self.reflective_example`.
 - [ ] `ObjectiveSpec` added; `uv run pytest tests/test_objectives_catalog.py` passes.

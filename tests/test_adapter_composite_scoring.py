@@ -10,8 +10,8 @@ from glean_gepa.adapter_types import PointwiseJudge
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evolutionary_proposer import pick_modules_to_edit
-from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
-from glean_gepa.objectives.utils.tool_match_util import TOOL_ALIGNMENT_OBJECTIVE
+from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.tool_match import TOOL_ALIGNMENT_OBJECTIVE
 from glean_gepa.prompt_constants import RULES_EXT_KEY
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter

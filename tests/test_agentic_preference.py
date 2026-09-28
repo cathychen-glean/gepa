@@ -21,13 +21,13 @@ from glean_gepa.objectives.agentic_preference import (
     TEACHER_PREFERRED_KEY,
     AgenticPreferenceObjective,
 )
-from glean_gepa.objectives.utils.agentic_preference_util import (
+from glean_gepa.objectives.agentic_preference import (
     AgenticPreferenceAnalysis,
     AgenticPreferenceEntry,
     fetch_paired_preference_traces,
     rationale_from_judge_entries,
 )
-from glean_gepa.objectives.utils.tool_match_util import ToolMatchEntryMetrics
+from glean_gepa.objectives.tool_match import ToolMatchEntryMetrics
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter, _StartedPair
 
 THRESHOLDS = Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000)
@@ -229,7 +229,7 @@ def test_paired_traces_join_tools_without_blocking_on_a_missing_fetch():
         }
     )
     with patch(
-        "glean_gepa.objectives.utils.agentic_preference_util.fetch_eval_run_tool_match_analysis",
+        "glean_gepa.objectives.agentic_preference.fetch_eval_run_tool_match_analysis",
         return_value=tool_analysis,
     ) as fetch_tools:
         analysis = fetch_paired_preference_traces(
@@ -239,7 +239,7 @@ def test_paired_traces_join_tools_without_blocking_on_a_missing_fetch():
     assert "evalcli" not in fetch_tools.call_args.kwargs
 
     with patch(
-        "glean_gepa.objectives.utils.agentic_preference_util.fetch_eval_run_tool_match_analysis",
+        "glean_gepa.objectives.agentic_preference.fetch_eval_run_tool_match_analysis",
         side_effect=RuntimeError("agentspan is down"),
     ):
         fallback = fetch_paired_preference_traces(
@@ -388,8 +388,8 @@ def test_focused_and_full_evals_start_agentic_and_keep_its_mean():
     assert created == [AGENTIC_JUDGE_TYPE, AGENTIC_JUDGE_TYPE]
 
     adapter._analysis_cache[("teacher-1", "student-1")] = AgenticPreferenceAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
+        aggregate=None,
         per_entry={
             "lost": AgenticPreferenceEntry("lost", student_answer="s", teacher_answer="t"),
             "tie": AgenticPreferenceEntry("tie", student_answer="s", teacher_answer="t"),

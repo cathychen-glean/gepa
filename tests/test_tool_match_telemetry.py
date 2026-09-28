@@ -6,23 +6,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from glean_gepa.objectives.utils.tool_names import SKIPPED_TOOL_NAMES, first_tool_mismatch_pair, first_tool_name, scored_tool_sequence
 from glean_gepa.objectives.tool_match import FirstToolMatchObjective
 from glean_gepa.objectives.utils.action_input_trace import extract_trace_tool_inputs
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
-from glean_gepa.objectives.utils.tool_match_util import (
-    SKIPPED_TOOL_NAMES,
-    NoComparedEvalEntriesError,
+from glean_gepa.objectives.utils.agentspan import bounds_query
+from glean_gepa.objectives.utils.agentspan_query import EXECUTE_ACTION_FILTER
+from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.objectives.tool_match import (
+    FirstToolMatchObjective,
     ToolMatchEntryMetrics,
     aggregate_tool_match_metrics,
     build_tool_match_per_entry_query,
-    build_tool_match_time_bounds_query,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
-    first_tool_mismatch_pair,
-    first_tool_name,
     parse_tool_match_entry_metrics,
-    require_compared_eval_entries,
-    scored_tool_sequence,
 )
 from glean_gepa.prompt_constants import RULES_EXT_KEY
 
@@ -109,7 +107,7 @@ def test_extract_trace_tool_inputs_reads_both_call_envelopes():
 
 
 def test_tool_match_queries_and_fetch():
-    bounds_sql = build_tool_match_time_bounds_query()
+    bounds_sql = bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", span_filter=EXECUTE_ACTION_FILTER)
     sql = build_tool_match_per_entry_query()
     assert "PARSE_DATE" not in bounds_sql
     assert "PARSE_DATE" not in sql
@@ -303,8 +301,8 @@ def test_failed_runs_are_excluded_rather_than_scored_as_mismatches():
     )
     assert all_failed.aggregate.compared_entries == 0
     assert all_failed.aggregate.excluded_failed_runs == 2
-    with pytest.raises(NoComparedEvalEntriesError, match="all 2 candidate entries were dropped"):
-        require_compared_eval_entries(all_failed)
+    with pytest.raises(NoComparedEntriesError, match="all 2 candidate entries were dropped"):
+        FirstToolMatchObjective().require_compared_entries(all_failed)
 
 
 def _reflective_example(objective, objective_scores: dict, **output_extras) -> dict:
@@ -413,8 +411,8 @@ def test_aggregate_and_empty_analysis():
     assert empty.compared_entries == 0
     assert empty.tool_match_rate == 0.0
     analysis = empty_tool_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
-        require_compared_eval_entries(analysis)
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
+        FirstToolMatchObjective().require_compared_entries(analysis)
 
 
 def test_select_mismatch_groups():

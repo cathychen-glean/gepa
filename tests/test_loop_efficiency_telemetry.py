@@ -6,7 +6,7 @@ import json
 from datetime import date
 from unittest.mock import MagicMock
 
-from glean_gepa.objectives.utils.loop_count_util import (
+from glean_gepa.objectives.loop_efficiency import (
     LoopCountEntryMetrics,
     build_loop_count_per_entry_query,
     fetch_eval_run_loop_count_analysis,

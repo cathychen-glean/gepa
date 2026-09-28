@@ -14,7 +14,7 @@ from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives import AnalysisRequest, build_objective, registry
 from glean_gepa.objectives.loop_efficiency import LoopEfficiencyObjective
 from glean_gepa.objectives.protocol import ObjectiveProtocol, check_objective_contract, scored_rows_are_normalized
-from glean_gepa.objectives.utils.loop_count_util import (
+from glean_gepa.objectives.loop_efficiency import (
     LOOP_EFFICIENCY_OBJECTIVE,
     EvalRunLoopCountAnalysis,
     LoopCountEntryMetrics,
@@ -25,7 +25,7 @@ from glean_gepa.single_model_adapter import SingleModelAdapter
 
 def _analysis(per_entry: dict[str, LoopCountEntryMetrics]) -> EvalRunLoopCountAnalysis:
     return EvalRunLoopCountAnalysis(
-        eval_id="run",
+        eval_ids=("run",),
         start_date=date(2026, 8, 1),
         end_date=date(2026, 8, 2),
         aggregate=aggregate_loop_count_metrics("run", per_entry),

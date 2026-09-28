@@ -18,8 +18,8 @@ from glean_gepa.experiment_config import (
 )
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
 from glean_gepa.objectives import AnalysisRequest, build_objective
-from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
-from glean_gepa.objectives.utils.tool_match_util import empty_tool_match_analysis
+from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.tool_match import empty_tool_match_analysis
 from glean_gepa.runner import _parse_args
 
 _POINTWISE_COMPLETENESS = (

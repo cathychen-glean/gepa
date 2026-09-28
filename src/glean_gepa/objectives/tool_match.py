@@ -1,29 +1,314 @@
-"""First-tool teacher/student alignment objective."""
+"""First-tool-match objective: does the student pick the same first tool the teacher did?
+
+Layout, top to bottom: the entry and aggregate types, row parsing, the
+``tool_spans`` SQL (with the failed-runs prelude that drops entries whose
+teacher or student run errored), the paired fetch, then the objective class
+that maps the analysis onto the contract in :mod:`glean_gepa.objectives.protocol`.
+Shared plumbing (bounds query, shard window, paired FULL OUTER JOIN scaffold,
+trace enrichment, frame) comes from ``objectives/utils``. Pure tool-name helpers
+are in ``objectives/utils/tool_names`` so ``prompt`` can import them too."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import date
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
 from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
-from glean_gepa.objectives.utils.tool_match_util import (
-    SKIPPED_TOOL_NAMES,
-    TOOL_ALIGNMENT_OBJECTIVE,
-    EvalRunToolMatchAnalysis,
-    ToolMatchEntryMetrics,
-    empty_tool_match_analysis,
-    fetch_eval_run_tool_match_analysis,
-    first_tool_mismatch_pair,
-    log_tool_match_analysis,
-    require_compared_eval_entries,
+from glean_gepa.objectives.utils.agentspan import (
+    Rows,
+    bounds_query,
+    fetch_agentspan_analysis,
+    paired_role_query,
 )
+from glean_gepa.objectives.utils.agentspan_query import (
+    AGENT_RUN_FAILURE_FILTER,
+    DEFAULT_AGENTS_SPAN_TABLE,
+    DEFAULT_LOOKBACK_DAYS,
+    EVAL_ENTRY_ID_EXPR,
+    EXECUTE_ACTION_FILTER,
+    QueryParameter,
+    default_date_range,
+    wildcard_shard_filter,
+)
+from glean_gepa.objectives.utils.core import (
+    EVIDENCE_LIMIT,
+    NoComparedEntriesError,
+    PairedRunAnalysis,
+    log_analysis,
+)
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.objectives.utils.tool_names import (
+    SKIPPED_TOOL_NAMES,
+    first_tool_mismatch_pair,
+    scored_tool_sequence,
+)
+from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
 from glean_gepa.prompt import high_signal_core_tool_keys, is_core_tool_span, tool_description_override_key
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS, EXECUTION_DISCIPLINE_KEY, RULES_EXT_KEY
 from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+
+TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
+
+
+# ---------------------------------------------------------------------------
+# Slot 1: one entry
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolMatchEntryMetrics:
+    """One entry's first-tool comparison.
+
+    This objective scores only the first tool each role picked, so the payloads are
+    likewise the first call's -- surfacing later calls would invite reflection to
+    rewrite a prompt over a decision that was never scored.
+    """
+
+    entry_id: str
+    student_tools: tuple[str, ...]
+    teacher_tools: tuple[str, ...]
+    tools_match: bool
+    student_first_tool_input: tuple[str, str] | None = None
+    teacher_first_tool_input: tuple[str, str] | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.tools_match
+
+    @property
+    def score(self) -> float:
+        return 1.0 if self.tools_match else 0.0
+
+
+@dataclass(frozen=True)
+class ToolMatchMetrics:
+    teacher_eval_id: str
+    student_eval_id: str
+    compared_entries: int
+    matching_entries: int
+    tool_match_rate: float
+    excluded_failed_runs: int = 0
+
+
+class EvalRunToolMatchAnalysis(PairedRunAnalysis[ToolMatchMetrics, ToolMatchEntryMetrics]):
+    """Agentspan analyses always carry a resolved shard window."""
+
+    start_date: date
+    end_date: date
+
+
+# ---------------------------------------------------------------------------
+# Slot 2: rows -> entry
+# ---------------------------------------------------------------------------
+
+
+def entry_run_failed(row: Mapping[str, Any]) -> bool:
+    """Whether either role's run died on this entry, leaving no comparable trajectory."""
+    return bool(row.get("run_failed"))
+
+
+def parse_tool_match_entry_metrics(
+    row: Mapping[str, Any], skip_tools: frozenset[str] | None = None
+) -> ToolMatchEntryMetrics:
+    student_tools = scored_tool_sequence(row.get("student_tools"), skip_tools=skip_tools)
+    teacher_tools = scored_tool_sequence(row.get("teacher_tools"), skip_tools=skip_tools)
+    return ToolMatchEntryMetrics(
+        entry_id=str(row.get("entry_id") or ""),
+        student_tools=student_tools,
+        teacher_tools=teacher_tools,
+        tools_match=(student_tools[:1] == teacher_tools[:1]),
+    )
+
+
+def aggregate_tool_match_metrics(
+    teacher_eval_id: str,
+    student_eval_id: str,
+    per_entry: Mapping[str, ToolMatchEntryMetrics],
+    *,
+    excluded_failed_runs: int = 0,
+) -> ToolMatchMetrics:
+    compared = len(per_entry)
+    matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
+    return ToolMatchMetrics(
+        teacher_eval_id=teacher_eval_id,
+        student_eval_id=student_eval_id,
+        compared_entries=compared,
+        matching_entries=matching,
+        tool_match_rate=(matching / compared) if compared else 0.0,
+        excluded_failed_runs=excluded_failed_runs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Slot 3: SQL
+# ---------------------------------------------------------------------------
+
+
+def build_tool_match_per_entry_query(*, agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE) -> str:
+    """Build SQL that pairs teacher and student tool sequences per eval entry."""
+    shard = wildcard_shard_filter("start_date", "end_date")
+    failed_runs = f"""
+failed_runs AS (
+  SELECT DISTINCT
+    {EVAL_ENTRY_ID_EXPR} AS entry_id
+  FROM `{agentspan_table}`
+  WHERE {shard}
+    AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
+    AND {AGENT_RUN_FAILURE_FILTER}
+    -- @eval_ids is exactly the teacher/student pair, so any hit means one of the two
+    -- roles died on this entry. A NULL here would make the IN below return NULL.
+    AND {EVAL_ENTRY_ID_EXPR} IS NOT NULL
+)"""
+    per_role = f"""
+tool_spans AS (
+  SELECT
+    jsonPayload.context.eval.eval_id AS eval_id,
+    {EVAL_ENTRY_ID_EXPR} AS entry_id,
+    REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') AS tool_name,
+    jsonPayload.context.agent_trace.trace_id AS trace_id,
+    resource.labels.project_id AS deployment_id,
+    SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
+  FROM `{agentspan_table}`
+  WHERE {shard}
+    AND jsonPayload.context.eval.eval_id IN UNNEST(@eval_ids)
+    AND {EXECUTE_ACTION_FILTER}
+    AND REGEXP_REPLACE(jsonPayload.span_info.span_name, r'^Execute Action: ', '') NOT IN UNNEST(@skipped_tools)
+),
+per_role AS (
+  SELECT
+    entry_id,
+    eval_id,
+    ARRAY_AGG(tool_name IGNORE NULLS ORDER BY start_ms) AS tools,
+    ANY_VALUE(trace_id) AS trace_id,
+    ANY_VALUE(deployment_id) AS deployment_id,
+    MIN(start_ms) AS min_start_ms,
+    MAX(start_ms) AS max_start_ms
+  FROM tool_spans
+  WHERE entry_id IS NOT NULL
+  GROUP BY entry_id, eval_id
+)"""
+    return paired_role_query(
+        per_role_cte=per_role,
+        signal_column="tools",
+        prelude_ctes=failed_runs,
+        extra_select="  COALESCE(student.entry_id, teacher.entry_id) IN (SELECT entry_id FROM failed_runs) AS run_failed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fetch
+# ---------------------------------------------------------------------------
+
+
+def empty_tool_match_analysis(
+    teacher_eval_id: str,
+    student_eval_id: str,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    end_date: date | None = None,
+) -> EvalRunToolMatchAnalysis:
+    start_date, resolved_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
+    return EvalRunToolMatchAnalysis(
+        eval_ids=(teacher_eval_id, student_eval_id),
+        aggregate=aggregate_tool_match_metrics(teacher_eval_id, student_eval_id, {}),
+        start_date=start_date,
+        end_date=resolved_end,
+    )
+
+
+def fetch_eval_run_tool_match_analysis(
+    client: Any,
+    *,
+    teacher_eval_id: str,
+    student_eval_id: str,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    end_date: date | None = None,
+    agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
+    evalcli: Any | None = None,
+    include_action_inputs: bool = True,
+    skip_tools: frozenset[str] | None = None,
+) -> EvalRunToolMatchAnalysis:
+    skipped = SKIPPED_TOOL_NAMES if skip_tools is None else skip_tools
+
+    def parse(row: Mapping[str, Any]) -> ToolMatchEntryMetrics | None:
+        metrics = parse_tool_match_entry_metrics(row, skip_tools=skip_tools)
+        return metrics if metrics.entry_id else None
+
+    def aggregate(
+        ids: tuple[str, ...], per_entry: Mapping[str, ToolMatchEntryMetrics], dropped: int
+    ) -> ToolMatchMetrics:
+        return aggregate_tool_match_metrics(ids[0], ids[-1], per_entry, excluded_failed_runs=dropped)
+
+    def enrich(
+        per_entry: Mapping[str, ToolMatchEntryMetrics], rows: Rows, high_signal: tuple[str, ...]
+    ) -> Mapping[str, ToolMatchEntryMetrics]:
+        return _enrich_action_inputs(evalcli, per_entry, rows, high_signal, skip_tools=skipped)
+
+    analysis = fetch_agentspan_analysis(
+        client,
+        eval_ids=(teacher_eval_id, student_eval_id),
+        bounds_sql=bounds_query(
+            eval_id_predicate="IN UNNEST(@eval_ids)", span_filter=EXECUTE_ACTION_FILTER, agentspan_table=agentspan_table
+        ),
+        per_entry_sql=build_tool_match_per_entry_query(agentspan_table=agentspan_table),
+        parse_row=parse,
+        aggregate=aggregate,
+        is_high_signal=lambda m: not m.tools_match,
+        filter_rows=lambda rows: [row for row in rows if not entry_run_failed(row)],
+        enrich=enrich if evalcli is not None and include_action_inputs else None,
+        extra_params=[QueryParameter("skipped_tools", "STRING", list(skipped))],
+        lookback_days=lookback_days,
+        end_date=end_date,
+    )
+    if analysis.start_date is None:
+        return empty_tool_match_analysis(
+            teacher_eval_id, student_eval_id, lookback_days=lookback_days, end_date=end_date
+        )
+    return EvalRunToolMatchAnalysis(
+        eval_ids=analysis.eval_ids,
+        aggregate=analysis.aggregate,
+        per_entry=analysis.per_entry,
+        high_signal_entry_ids=analysis.high_signal_entry_ids,
+        start_date=analysis.start_date,
+        end_date=analysis.end_date or analysis.start_date,
+    )
+
+
+def _enrich_action_inputs(
+    evalcli: Any,
+    per_entry: Mapping[str, ToolMatchEntryMetrics],
+    rows: Rows,
+    high_signal_entry_ids: tuple[str, ...],
+    *,
+    skip_tools: frozenset[str],
+) -> dict[str, ToolMatchEntryMetrics]:
+    """Attach each role's first tool call to high-signal entries from traces."""
+
+    def apply(metrics: ToolMatchEntryMetrics, fetched: FetchedByRole, entry_id: str) -> ToolMatchEntryMetrics:
+        student = fetched.get("student", {}).get(entry_id, metrics.student_first_tool_input)
+        teacher = fetched.get("teacher", {}).get(entry_id, metrics.teacher_first_tool_input)
+        return replace(metrics, student_first_tool_input=student, teacher_first_tool_input=teacher)
+
+    return enrich_action_inputs(
+        evalcli,
+        per_entry,
+        rows,
+        high_signal_entry_ids,
+        apply=apply,
+        roles=("student", "teacher"),
+        first_tool_only=True,
+        skip_tools=skip_tools,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Objective
+# ---------------------------------------------------------------------------
 
 EXECUTION_DISCIPLINE_RESPONSIBILITY = (
     "You are rewriting the bullets under '### Execution Discipline', which set how much effort "
@@ -74,7 +359,7 @@ def _rollout_output(
     return output
 
 
-class FirstToolMatchObjective(TeacherStudentObjective):
+class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis]):
     """Score the student's first tool call against the teacher's."""
 
     name = TOOL_ALIGNMENT_OBJECTIVE
@@ -128,10 +413,42 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         )
 
     def require_compared_entries(self, analysis: EvalRunToolMatchAnalysis) -> None:
-        require_compared_eval_entries(analysis)
+        """Reject an analysis with zero compared entries.
+
+        A 0/0 comparison is not a 100% match: it means neither eval produced
+        comparable Execute Action spans, so tool alignment is undefined.
+        """
+        if analysis.aggregate.compared_entries > 0:
+            return
+        excluded = analysis.aggregate.excluded_failed_runs
+        reason = (
+            f"all {excluded} candidate entries were dropped because a teacher or student run failed"
+            if excluded
+            else "wait for agentspan ingest or check that the eval runs actually executed entries"
+        )
+        raise NoComparedEntriesError(
+            f"No eval entries were compared for student {analysis.student_eval_id} vs "
+            f"teacher {analysis.teacher_eval_id}: {reason}."
+        )
 
     def validate_full_eval(self, analysis: EvalRunToolMatchAnalysis) -> None:
-        log_tool_match_analysis(analysis)
+        aggregate = analysis.aggregate
+        if aggregate.excluded_failed_runs:
+            print(
+                f"[Tool Match] Excluded {aggregate.excluded_failed_runs} entries whose teacher or "
+                "student run failed; check per-deployment error rates if this is a large share"
+            )
+        log_analysis(
+            analysis,
+            label="Tool Match",
+            headline=(
+                f"vs {analysis.teacher_eval_id}: {aggregate.tool_match_rate:.2%} first-tool match "
+                f"({aggregate.matching_entries}/{aggregate.compared_entries})"
+            ),
+            entry_line=lambda m: (
+                f"student={list(m.student_tools[:EVIDENCE_LIMIT])} teacher={list(m.teacher_tools[:EVIDENCE_LIMIT])}"
+            ),
+        )
 
     def focused_pass_rate(self, analysis: EvalRunToolMatchAnalysis, requested_entry_ids: Sequence[str]) -> float:
         matching = sum(1 for metrics in analysis.per_entry.values() if metrics.tools_match)
