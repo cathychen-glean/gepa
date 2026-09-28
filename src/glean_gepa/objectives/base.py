@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, cast
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal, cast
 
+import glean_gepa.objectives.registry as _registry
 from glean_gepa.adapter_types import JudgingMode
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
@@ -27,15 +28,56 @@ if TYPE_CHECKING:
 # objective's ``reflection_entry_limit``.
 _REFLECTION_K_DEFAULT = object()
 
-TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = {}
+# Reflection surfaces at most this many tool payloads / error strings per example.
+REFLECTION_EVIDENCE_LIMIT = 5
+
+# The catalog and registry live in ``glean_gepa.objectives.registry``. These
+# names are kept so existing imports keep working; they read from that module.
+TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = _registry._REGISTRY
 MODE_DEFAULT_PACK: dict[JudgingMode, str] = {
-    "teacher_student": "tools",
-    "single_model": "shell",
+    spec.mode: spec.default_pack for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
 }
 MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
-    "teacher_student": "tool_match",
-    "single_model": "shell_telemetry",
+    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
 }
+
+
+AnalysisDetail = Literal["aggregate", "per_entry", "traces"]
+
+
+@dataclass(frozen=True)
+class AnalysisRequest:
+    """What the adapter needs from one ``objective.analyze(...)`` call.
+
+    Built once per fetch by the adapter. Objectives read it; they are not
+    mutated between calls.
+
+    Attributes
+    ----------
+    evalcli
+        Client for eval-analysis views and detailed traces. ``None`` skips
+        every evalcli-backed enrichment.
+    detail
+        How much to fetch. ``aggregate`` is a run-level number for validation.
+        ``per_entry`` adds per-entry rows for focused evals. ``traces`` adds
+        per-entry evidence (error examples, tool payloads) for reflection.
+        An objective that has one fetch shape may ignore this.
+    hydrate_action_inputs
+        Attach tool payloads from detailed traces to high-signal entries.
+        False for validation-only batches, which never feed reflection.
+    """
+
+    evalcli: Any | None = None
+    detail: AnalysisDetail = "per_entry"
+    hydrate_action_inputs: bool = True
+
+    @property
+    def wants_per_entry(self) -> bool:
+        return self.detail != "aggregate"
+
+    @property
+    def wants_traces(self) -> bool:
+        return self.detail == "traces"
 
 
 @dataclass(frozen=True)
@@ -46,6 +88,40 @@ class ScoredRow:
     dimension_scores: dict[str, float]
     output: Mapping[str, Any]
     data_overrides: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ScoringContext:
+    """Batch-level facts every ``ScoredRow`` in one eval shares.
+
+    Built by the base ``scored_rows`` and handed to the ``entry_row`` /
+    ``aggregate_row`` hooks so objectives do not re-derive them.
+
+    Attributes
+    ----------
+    query
+        ``"{eval_set_name}:{eval_set_version}"``. Also the ``entry_id`` of an
+        aggregate row that must be keyed to the eval set.
+    deployment_id
+        First configured deployment, or ``""``.
+    is_focused
+        The batch is a focused high-signal eval, so per-entry scores are
+        pass/fail rather than rates.
+    capture_traces
+        Rows will become reflection trajectories; attach evidence.
+    student_eval_id
+        Student eval run id. Single-model only; teacher/student analyses carry
+        their run ids on the analysis object.
+    """
+
+    query: str
+    deployment_id: str
+    is_focused: bool
+    capture_traces: bool
+    student_eval_id: str = ""
+
+    def entry_query(self, entry_id: str) -> str:
+        return f"{self.query} entry={entry_id}"
 
 
 def module_responsibility(
@@ -125,6 +201,53 @@ class PackConfigurable:
                 continue
             metrics[name] = float(raw)
         return cast(ReflectiveExampleMetrics, metrics)
+
+    def reflective_example(
+        self,
+        trajectory: Mapping[str, Any],
+        *,
+        feedback: str,
+        generated: Mapping[str, Any] | None = None,
+        action_inputs: Sequence[str] = (),
+        execution_errors: Sequence[str] = (),
+    ) -> ReflectiveExample:
+        """Assemble one ``ReflectiveExample`` from the parts an objective decides.
+
+        The frame (``Inputs``, ``Metrics``, evidence caps) is the same for every
+        objective; ``build_reflective_example`` supplies the four slots here.
+        ``generated`` fills the ``Generated Outputs`` block; missing keys default
+        to empty so a student-only objective can omit it.
+        """
+        from glean_gepa.al_adapter import ReflectiveExampleInputs, ReflectiveExampleOutputs
+
+        output = trajectory["output"]
+        data = trajectory["data"]
+        inputs: ReflectiveExampleInputs = {
+            "eval_set": data["eval_set_name"],
+            "entry_id": output["entry_id"],
+            "deployment_id": output["deployment_id"],
+            "query": output["query"],
+        }
+        if eval_run_id := data.get("eval_run_id"):
+            inputs["eval_run_id"] = eval_run_id
+        if eval_trace_id := data.get("eval_trace_id"):
+            inputs["eval_trace_id"] = eval_trace_id
+        outputs: ReflectiveExampleOutputs = {
+            "student_answer": "",
+            "teacher_answer": "",
+            "student_tools": [],
+            "teacher_tools": [],
+        }
+        if generated:
+            outputs.update(cast(Any, generated))
+        return {
+            "Inputs": inputs,
+            "Generated Outputs": outputs,
+            "Action Inputs": list(action_inputs)[:REFLECTION_EVIDENCE_LIMIT],
+            "Execution Errors": list(execution_errors)[:REFLECTION_EVIDENCE_LIMIT],
+            "Feedback": feedback,
+            "Metrics": self.reflective_metrics(trajectory),
+        }
 
     def wired_signal_issues(self, objective_scores: Mapping[str, Any]) -> list[str]:
         """Feedback lines for wired judge signals that scored below their floor.
@@ -209,9 +332,8 @@ class TeacherStudentObjective(PackConfigurable, ABC):
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
     reflection_entry_limit: ClassVar[int] = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
     bigquery_client: Any | None = None
+    # Set once by the adapter after construction; used by reflection-time hydration.
     evalcli: Any | None = None
-    # Set by the adapter for each fetch. True requests action-input hydration.
-    include_action_inputs: bool = True
     lookback_days: int = 1
     _paired_analysis_cache: dict[tuple[str, str], Any]
     # Pairs stored from a call that did not request action inputs. A seeded
@@ -224,7 +346,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return getattr(self, "_paired_analysis_cache", {})
 
     @abstractmethod
-    def analyze(self, teacher_eval_id: str, student_eval_id: str) -> Any: ...
+    def analyze(self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest) -> Any: ...
 
     def _unhydrated_pair_keys(self) -> set[tuple[str, str]]:
         pairs = getattr(self, "_unhydrated_pairs", None)
@@ -245,6 +367,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         teacher_eval_id: str,
         student_eval_id: str,
         *,
+        request: AnalysisRequest,
         cache: dict[tuple[str, str], Any],
         fetch: Callable[..., Any],
         empty: Callable[[str, str], Any],
@@ -256,14 +379,14 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         so unit tests can still patch the module-level fetch function.
 
         An empty comparison is not stored. An empty refetch leaves any entry
-        already cached in place and returns that entry. ``include_action_inputs`` false marks the pair
-        unhydrated; a later call that requests action inputs fetches again and
-        replaces that entry.
+        already cached in place and returns that entry. A request without
+        ``hydrate_action_inputs`` marks the pair unhydrated; a later call that
+        requests action inputs fetches again and replaces that entry.
         """
         cache_key = (teacher_eval_id, student_eval_id)
         unhydrated = self._unhydrated_pair_keys()
         cached = cache.get(cache_key)
-        if cached is not None and (not self.include_action_inputs or cache_key not in unhydrated):
+        if cached is not None and (not request.hydrate_action_inputs or cache_key not in unhydrated):
             print(f"[Cache HIT] Using cached {label} for {teacher_eval_id} vs {student_eval_id}")
             return cached
         if self.bigquery_client is None:
@@ -274,14 +397,14 @@ class TeacherStudentObjective(PackConfigurable, ABC):
                 teacher_eval_id=teacher_eval_id,
                 student_eval_id=student_eval_id,
                 lookback_days=self.lookback_days,
-                evalcli=self.evalcli,
-                include_action_inputs=self.include_action_inputs,
+                evalcli=request.evalcli,
+                include_action_inputs=request.hydrate_action_inputs,
             )
         if not self.analysis_is_cacheable(analysis):
             print(f"[Cache] Not caching provisional empty {label} for {teacher_eval_id} vs {student_eval_id}")
             return cache.get(cache_key, analysis)
         cache[cache_key] = analysis
-        if self.include_action_inputs:
+        if request.hydrate_action_inputs:
             unhydrated.discard(cache_key)
         else:
             unhydrated.add(cache_key)
@@ -298,7 +421,6 @@ class TeacherStudentObjective(PackConfigurable, ABC):
     @abstractmethod
     def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
 
-    @abstractmethod
     def scored_rows(
         self,
         analysis: Any,
@@ -307,7 +429,29 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         capture_traces: bool,
         query: str,
         deployment_id: str,
-    ) -> list[ScoredRow]: ...
+    ) -> list[ScoredRow]:
+        """Rows for one paired eval. Objectives implement ``entry_row`` and ``aggregate_row``.
+
+        - Focused eval with no telemetry: nothing to score, return ``[]``.
+        - Validation (not focused, no traces): one aggregate row, ``entry_id=None``.
+        - Otherwise: one row per compared entry.
+        """
+        ctx = ScoringContext(
+            query=query, deployment_id=deployment_id, is_focused=focused, capture_traces=capture_traces
+        )
+        if focused and not analysis.per_entry:
+            return []
+        if not focused and not capture_traces:
+            return [self.aggregate_row(analysis, ctx)]
+        return [self.entry_row(entry_id, metrics, analysis, ctx) for entry_id, metrics in analysis.per_entry.items()]
+
+    @abstractmethod
+    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+        """Score and rollout output for one compared entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
+
+    @abstractmethod
+    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+        """Run-level score for validation batches. ``ScoredRow.entry_id`` must be ``None``."""
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
         return self._mismatch_key(output) is not None
@@ -452,17 +596,76 @@ class SingleModelObjective(PackConfigurable, ABC):
     # Aggregate count that stays 0 until scorable telemetry has landed.
     pending_count: str
     module_responsibilities: ClassVar[Mapping[str, str]] = {}
+    # Per-eval cache state. Read through ``analysis_cache`` / ``unhydrated_eval_ids``,
+    # which create these lazily so concrete ``__init__`` need not declare them.
+    _eval_analysis_cache: dict[str, Any]
+    _unhydrated_eval_ids: set[str]
 
     @abstractmethod
-    def analyze(
+    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> Any: ...
+
+    # --- shared per-eval cache -------------------------------------------
+
+    @property
+    def analysis_cache(self) -> dict[str, Any]:
+        return self.__dict__.setdefault("_eval_analysis_cache", {})
+
+    @property
+    def unhydrated_eval_ids(self) -> set[str]:
+        return self.__dict__.setdefault("_unhydrated_eval_ids", set())
+
+    def cache_hit_is_sufficient(self, cached: Any, request: AnalysisRequest) -> bool:
+        """Can ``cached`` serve ``request`` without a refetch? Override to demand more detail."""
+        del cached, request
+        return True
+
+    def analysis_is_cacheable(self, analysis: Any, request: AnalysisRequest) -> bool:
+        """False for a provisional result, so a later call fetches again."""
+        del request
+        return not self.is_pending(analysis)
+
+    def cached_eval_analysis(
         self,
         eval_id: str,
         *,
-        include_error_examples: bool = True,
-        include_per_entry: bool = True,
-        evalcli: Any | None = None,
-        include_action_inputs: bool = True,
-    ) -> Any: ...
+        request: AnalysisRequest,
+        fetch: Callable[[AnalysisRequest], Any],
+        label: str,
+    ) -> Any:
+        """Fetch (or reuse a cached) analysis for one eval with shared HIT/MISS logging.
+
+        ``fetch`` is called with the request only; the objective's closure supplies
+        its own client and parameters so tests can still patch the module fetch.
+
+        Rules, mirroring ``TeacherStudentObjective.cached_paired_analysis``:
+
+        - A hit is served unless ``cache_hit_is_sufficient`` says no, or the entry
+          was stored without action inputs and this request wants them.
+        - A result that is not cacheable is returned but not stored; if an entry
+          was already cached, that entry is returned instead.
+        - Storing records whether action inputs were hydrated so a later
+          hydrating request refetches rather than serving payload-less entries.
+        """
+        cache = self.analysis_cache
+        unhydrated = self.unhydrated_eval_ids
+        cached = cache.get(eval_id)
+        if cached is not None:
+            needs_hydration = request.hydrate_action_inputs and eval_id in unhydrated
+            if not needs_hydration and self.cache_hit_is_sufficient(cached, request):
+                print(f"[Cache HIT] Using cached {label} for eval_id: {eval_id}")
+                return cached
+            reason = "with action inputs" if needs_hydration else "with more detail"
+            print(f"[Cache] Refetching {label} {reason} for eval_id: {eval_id}")
+        analysis = fetch(request)
+        if not self.analysis_is_cacheable(analysis, request):
+            print(f"[Cache] Not caching provisional {label} for eval_id: {eval_id}")
+            return cached if cached is not None else analysis
+        cache[eval_id] = analysis
+        if request.hydrate_action_inputs:
+            unhydrated.discard(eval_id)
+        else:
+            unhydrated.add(eval_id)
+        return analysis
 
     def is_pending(self, analysis: Any) -> bool:
         """Telemetry has not landed while ``pending_count`` on the aggregate is 0."""
@@ -476,15 +679,22 @@ class SingleModelObjective(PackConfigurable, ABC):
     def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
 
     def entry_ids_to_score(self, analysis: Any, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
-        """Focused batches score the fetched entries. Full evals score the high-signal set."""
+        """Which entries get a per-entry ``ScoredRow``.
+
+        Focused eval (``requested_entry_ids`` given): the requested ids that have
+        telemetry, in request order. Never a superset of the request. Requested
+        ids with no telemetry are omitted here and count as failures in
+        ``focused_pass_rate``, which divides by the full request.
+
+        Full eval (``None``): the objective's high-signal set.
+        """
         if requested_entry_ids:
-            return tuple(analysis.per_entry) or tuple(requested_entry_ids)
+            return tuple(entry_id for entry_id in requested_entry_ids if entry_id in analysis.per_entry)
         return tuple(analysis.high_signal_entry_ids)
 
     @abstractmethod
     def log_analysis(self, analysis: Any) -> None: ...
 
-    @abstractmethod
     def scored_rows(
         self,
         analysis: Any,
@@ -497,7 +707,36 @@ class SingleModelObjective(PackConfigurable, ABC):
         requested_entry_ids: Sequence[str] | None,
         is_focused_eval: bool,
         capture_traces: bool,
-    ) -> list[ScoredRow]: ...
+    ) -> list[ScoredRow]:
+        """Rows for one student eval. Objectives implement ``entry_row`` and ``aggregate_row``.
+
+        - Validation (not focused, no traces): one aggregate row, ``entry_id=None``.
+        - Nothing to surface per entry: the aggregate row keyed to the eval set.
+        - Otherwise: one row per id from ``entry_ids_to_score``.
+        """
+        del al_data_inst
+        ctx = ScoringContext(
+            query=f"{eval_set_name}:{eval_set_version}",
+            deployment_id=deployment_ids[0] if deployment_ids else "",
+            is_focused=is_focused_eval,
+            capture_traces=capture_traces,
+            student_eval_id=student_eval_id,
+        )
+        if not is_focused_eval and not capture_traces:
+            return [self.aggregate_row(analysis, ctx)]
+        entry_ids = self.entry_ids_to_score(analysis, requested_entry_ids)
+        if not entry_ids:
+            return [replace(self.aggregate_row(analysis, ctx), entry_id=ctx.query)]
+        # ``entry_ids_to_score`` only yields ids present in ``per_entry``.
+        return [self.entry_row(entry_id, analysis.per_entry[entry_id], analysis, ctx) for entry_id in entry_ids]
+
+    @abstractmethod
+    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+        """Score and rollout output for one entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
+
+    @abstractmethod
+    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+        """Run-level score. ``ScoredRow.entry_id`` must be ``None``; the base re-keys it when needed."""
 
     @abstractmethod
     def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]: ...
@@ -517,40 +756,32 @@ class SingleModelObjective(PackConfigurable, ABC):
         del raw_cache
 
 
-def register_telemetry_source(mode: JudgingMode, source: str, cls: type) -> None:
-    TELEMETRY_SOURCES[(mode, source)] = cls
+def register_telemetry_source(
+    mode: JudgingMode,
+    source: str,
+    cls: type,
+    *,
+    replace: bool = False,
+    validate: bool = True,
+) -> None:
+    """Register an out-of-tree objective. Built-ins are listed in ``registry.BUILTIN_OBJECTIVES``."""
+    _registry.register(mode, source, cls, replace=replace, validate=validate)
 
 
 def unregister_telemetry_source(mode: JudgingMode, source: str) -> None:
-    TELEMETRY_SOURCES.pop((mode, source), None)
+    _registry.unregister(mode, source)
 
 
 def _ensure_builtin_objectives_registered() -> None:
-    from glean_gepa.objectives.agentic_preference import AgenticPreferenceObjective
-    from glean_gepa.objectives.citation_match import CitationMatchObjective
-    from glean_gepa.objectives.loop import LoopEfficiencyObjective
-    from glean_gepa.objectives.shell import ShellSuccessObjective
-    from glean_gepa.objectives.tool_match import FirstToolMatchObjective
-
-    TELEMETRY_SOURCES.setdefault(("teacher_student", "tool_match"), FirstToolMatchObjective)
-    TELEMETRY_SOURCES.setdefault(("teacher_student", "citation_match"), CitationMatchObjective)
-    TELEMETRY_SOURCES.setdefault(("teacher_student", "agentic_preference"), AgenticPreferenceObjective)
-    TELEMETRY_SOURCES.setdefault(("single_model", "shell_telemetry"), ShellSuccessObjective)
-    TELEMETRY_SOURCES.setdefault(("single_model", "loop_telemetry"), LoopEfficiencyObjective)
+    _registry.load_builtins()
 
 
 def is_registered_telemetry_source(mode: JudgingMode, source: str | None) -> bool:
-    if not source:
-        return False
-    _ensure_builtin_objectives_registered()
-    return (mode, source) in TELEMETRY_SOURCES
+    return _registry.is_registered(mode, source)
 
 
 def is_telemetry_source(source: str | None) -> bool:
-    if not source:
-        return False
-    _ensure_builtin_objectives_registered()
-    return any(registered_source == source for _mode, registered_source in TELEMETRY_SOURCES)
+    return _registry.is_known_source(source)
 
 
 def build_objective(
@@ -562,17 +793,16 @@ def build_objective(
     pack: Mapping[str, Any] | None = None,
 ) -> TeacherStudentObjective | SingleModelObjective:
     """Construct the telemetry objective registered for ``mode`` and the pack source."""
-    _ensure_builtin_objectives_registered()
-    source = MODE_DEFAULT_TELEMETRY_SOURCE[mode]
+    source = _registry.default_source(mode)
     if signals:
         for signal in signals:
             if signal.get("enabled", True) is False:
                 continue
             candidate = signal.get("source")
-            if isinstance(candidate, str) and is_registered_telemetry_source(mode, candidate):
+            if isinstance(candidate, str) and _registry.is_registered(mode, candidate):
                 source = candidate
                 break
-    cls = TELEMETRY_SOURCES[(mode, source)]
+    cls = _registry.resolve(mode, source)
     objective = cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
     configure_objective(objective, pack)
     return objective

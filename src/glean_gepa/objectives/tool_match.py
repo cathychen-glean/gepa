@@ -6,14 +6,15 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
+from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
-from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
+from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_match_util import (
     SKIPPED_TOOL_NAMES,
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
+    ToolMatchEntryMetrics,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
     first_tool_mismatch_pair,
@@ -108,7 +109,9 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             skip_tools=self._skipped_tools(),
         )
 
-    def analyze(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunToolMatchAnalysis:
+    def analyze(
+        self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest
+    ) -> EvalRunToolMatchAnalysis:
         skipped = self._skipped_tools()
 
         def fetch(client: Any, **kwargs: Any) -> EvalRunToolMatchAnalysis:
@@ -117,6 +120,7 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         return self.cached_paired_analysis(
             teacher_eval_id,
             student_eval_id,
+            request=request,
             cache=self._paired_analysis_cache,
             fetch=fetch,
             empty=empty_tool_match_analysis,
@@ -133,49 +137,38 @@ class FirstToolMatchObjective(TeacherStudentObjective):
         matching = sum(1 for metrics in analysis.per_entry.values() if metrics.tools_match)
         return matching / len(requested_entry_ids)
 
-    def scored_rows(
-        self,
-        analysis: EvalRunToolMatchAnalysis,
-        *,
-        focused: bool,
-        capture_traces: bool,
-        query: str,
-        deployment_id: str,
-    ) -> list[ScoredRow]:
-        if focused and not analysis.per_entry:
-            return []
-        if not focused and not capture_traces:
-            return [
-                ScoredRow(
-                    entry_id=None,
-                    dimension_scores={TOOL_ALIGNMENT_OBJECTIVE: analysis.aggregate.tool_match_rate},
-                    output=_rollout_output(
-                        entry_id=query,
-                        deployment_id=deployment_id,
-                        query=query,
-                        student_tools=[],
-                        teacher_tools=[],
-                        student_tool_calls=sum(len(m.student_tools) for m in analysis.per_entry.values()),
-                        teacher_tool_calls=sum(len(m.teacher_tools) for m in analysis.per_entry.values()),
-                    ),
-                )
-            ]
-        return [
-            ScoredRow(
+    def aggregate_row(self, analysis: EvalRunToolMatchAnalysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(
+            entry_id=None,
+            dimension_scores={TOOL_ALIGNMENT_OBJECTIVE: analysis.aggregate.tool_match_rate},
+            output=_rollout_output(
+                entry_id=ctx.query,
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_tools=[],
+                teacher_tools=[],
+                student_tool_calls=sum(len(m.student_tools) for m in analysis.per_entry.values()),
+                teacher_tool_calls=sum(len(m.teacher_tools) for m in analysis.per_entry.values()),
+            ),
+        )
+
+    def entry_row(
+        self, entry_id: str, metrics: ToolMatchEntryMetrics, analysis: EvalRunToolMatchAnalysis, ctx: ScoringContext
+    ) -> ScoredRow:
+        del analysis
+        return ScoredRow(
+            entry_id=entry_id,
+            dimension_scores={TOOL_ALIGNMENT_OBJECTIVE: float(metrics.tools_match)},
+            output=_rollout_output(
                 entry_id=entry_id,
-                dimension_scores={TOOL_ALIGNMENT_OBJECTIVE: float(tool_match.tools_match)},
-                output=_rollout_output(
-                    entry_id=entry_id,
-                    deployment_id=deployment_id,
-                    query=query,
-                    student_tools=list(tool_match.student_tools),
-                    teacher_tools=list(tool_match.teacher_tools),
-                    student_first_tool_input=tool_match.student_first_tool_input,
-                    teacher_first_tool_input=tool_match.teacher_first_tool_input,
-                ),
-            )
-            for entry_id, tool_match in analysis.per_entry.items()
-        ]
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_tools=list(metrics.student_tools),
+                teacher_tools=list(metrics.teacher_tools),
+                student_first_tool_input=metrics.student_first_tool_input,
+                teacher_first_tool_input=metrics.teacher_first_tool_input,
+            ),
+        )
 
     def _component_trajectories(
         self,
@@ -240,12 +233,6 @@ class FirstToolMatchObjective(TeacherStudentObjective):
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
         feedback_parts.extend(self.wired_signal_issues(objective_scores))
 
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
         action_inputs: list[str] = []
         for role in ("teacher", "student"):
             pair = output.get(f"{role}_first_tool_input")
@@ -256,24 +243,20 @@ class FirstToolMatchObjective(TeacherStudentObjective):
                     payload_text = payload_text[:240] + "... (truncated)"
                 action_inputs = [f"{role} first tool ({tool or 'unknown'}): {payload_text}"]
                 break
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
+        return self.reflective_example(
+            trajectory,
+            feedback=" ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
+            generated={
                 "student_answer": output.get("student_answer", ""),
                 "teacher_answer": output.get("teacher_answer", ""),
                 "student_tools": student_tools,
                 "teacher_tools": teacher_tools,
             },
-            "Action Inputs": action_inputs,
-            "Execution Errors": [],
-            "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
-            "Metrics": self.reflective_metrics(trajectory),
-        }
+            action_inputs=action_inputs,
+        )
 
     def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
         return high_signal_core_tool_keys(trajectories)
 
-
-register_telemetry_source("teacher_student", "tool_match", FirstToolMatchObjective)
 
 __all__ = ["FirstToolMatchObjective"]

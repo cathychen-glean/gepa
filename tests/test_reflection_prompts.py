@@ -3,7 +3,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from glean_gepa.objectives.citation_match import CitationMatchObjective
-from glean_gepa.objectives.loop import LoopEfficiencyObjective
 from glean_gepa.objectives.shell import ShellSuccessObjective
 from glean_gepa.objectives.tool_match import FirstToolMatchObjective
 from glean_gepa.prompt_constants import (
@@ -46,13 +45,9 @@ def test_reflection_prompts_route_by_module():
     # Core-tool keys always get the tool-description essay; packs that should not
     # rewrite those descriptions omit CORE_TOOLS from editable_modules.
     assert "glean_search" in citation_match("glean_search")
-    assert "glean_search" in LoopEfficiencyObjective(bigquery_client=MagicMock()).reflection_prompt("glean_search")
-
-    loop = LoopEfficiencyObjective(bigquery_client=MagicMock()).reflection_prompt
-    assert loop(WRITING_CODE_KEY) == LoopEfficiencyObjective.module_responsibilities[WRITING_CODE_KEY]
 
     # FULL_PROMPT is the render template, so no objective may claim it as a module.
-    for objective in (FirstToolMatchObjective, CitationMatchObjective, ShellSuccessObjective, LoopEfficiencyObjective):
+    for objective in (FirstToolMatchObjective, CitationMatchObjective, ShellSuccessObjective):
         assert FULL_PROMPT_KEY not in objective.module_responsibilities
 
 

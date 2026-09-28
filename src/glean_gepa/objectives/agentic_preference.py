@@ -8,13 +8,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
+from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.judge_metrics_util import PREFERENCE_TIE
-from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
+from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
 from glean_gepa.objectives.utils.agentic_preference_util import (
     AGENTIC_PREFERENCE_OBJECTIVE,
     AgenticPreferenceAnalysis,
+    AgenticPreferenceEntry,
     empty_agentic_preference_analysis,
     fetch_paired_preference_traces,
     fetch_preference_rationales,
@@ -188,10 +189,13 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         self._paired_analysis_cache: dict[tuple[str, str], AgenticPreferenceAnalysis] = {}
         self._rationale_cache: dict[tuple[str, str, str], str] = {}
 
-    def analyze(self, teacher_eval_id: str, student_eval_id: str) -> AgenticPreferenceAnalysis:
+    def analyze(
+        self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest
+    ) -> AgenticPreferenceAnalysis:
         return self.cached_paired_analysis(
             teacher_eval_id,
             student_eval_id,
+            request=request,
             cache=self._paired_analysis_cache,
             fetch=fetch_paired_preference_traces,
             empty=empty_agentic_preference_analysis,
@@ -206,49 +210,44 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         del analysis, requested_entry_ids
         return 0.0
 
-    def scored_rows(
+    # The score is a placeholder: the adapter overlays the pairwise judge's
+    # per-entry verdicts after these rows are built.
+
+    def aggregate_row(self, analysis: AgenticPreferenceAnalysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(
+            entry_id=None,
+            dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
+            output=_rollout_output(
+                entry_id=ctx.query,
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_eval_run_id=analysis.student_eval_id,
+                teacher_eval_run_id=analysis.teacher_eval_id,
+            ),
+        )
+
+    def entry_row(
         self,
+        entry_id: str,
+        metrics: AgenticPreferenceEntry,
         analysis: AgenticPreferenceAnalysis,
-        *,
-        focused: bool,
-        capture_traces: bool,
-        query: str,
-        deployment_id: str,
-    ) -> list[ScoredRow]:
-        if focused and not analysis.per_entry:
-            return []
-        if not focused and not capture_traces:
-            return [
-                ScoredRow(
-                    entry_id=None,
-                    dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
-                    output=_rollout_output(
-                        entry_id=query,
-                        deployment_id=deployment_id,
-                        query=query,
-                        student_eval_run_id=analysis.student_eval_id,
-                        teacher_eval_run_id=analysis.teacher_eval_id,
-                    ),
-                )
-            ]
-        return [
-            ScoredRow(
+        ctx: ScoringContext,
+    ) -> ScoredRow:
+        return ScoredRow(
+            entry_id=entry_id,
+            dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
+            output=_rollout_output(
                 entry_id=entry_id,
-                dimension_scores={AGENTIC_PREFERENCE_OBJECTIVE: 0.0},
-                output=_rollout_output(
-                    entry_id=entry_id,
-                    deployment_id=deployment_id,
-                    query=query,
-                    student_answer=metrics.student_answer,
-                    teacher_answer=metrics.teacher_answer,
-                    student_tools=metrics.student_tools,
-                    teacher_tools=metrics.teacher_tools,
-                    student_eval_run_id=analysis.student_eval_id,
-                    teacher_eval_run_id=analysis.teacher_eval_id,
-                ),
-            )
-            for entry_id, metrics in analysis.per_entry.items()
-        ]
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_answer=metrics.student_answer,
+                teacher_answer=metrics.teacher_answer,
+                student_tools=metrics.student_tools,
+                teacher_tools=metrics.teacher_tools,
+                student_eval_run_id=analysis.student_eval_id,
+                teacher_eval_run_id=analysis.teacher_eval_id,
+            ),
+        )
 
     def hydrate_reflective_trajectories(self, selected: list[Any]) -> None:
         """Attach the judge's prose verdict to the entries reflection will read."""
@@ -371,27 +370,16 @@ class AgenticPreferenceObjective(TeacherStudentObjective):
         rationale = output.get(f"{self.name}_feedback")
         if isinstance(rationale, str) and rationale.strip():
             feedback_parts.append(f"Judge verdict by dimension:\n{rationale.strip()}")
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
+        return self.reflective_example(
+            trajectory,
+            feedback="\n".join(feedback_parts),
+            generated={
                 "student_answer": output.get("student_answer", ""),
                 "teacher_answer": output.get("teacher_answer", ""),
                 "student_tools": list(output.get("student_tool_events") or []),
                 "teacher_tools": list(output.get("teacher_tool_events") or []),
             },
-            "Action Inputs": [],
-            "Execution Errors": [],
-            "Feedback": "\n".join(feedback_parts),
-            "Metrics": self.reflective_metrics(trajectory),
-        }
+        )
 
-
-register_telemetry_source("teacher_student", "agentic_preference", AgenticPreferenceObjective)
 
 __all__ = ["AgenticPreferenceObjective"]

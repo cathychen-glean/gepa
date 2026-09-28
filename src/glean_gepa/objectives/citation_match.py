@@ -6,11 +6,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
+from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
-from glean_gepa.objectives.base import ScoredRow, TeacherStudentObjective, register_telemetry_source
+from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
 from glean_gepa.objectives.utils.citation_match_util import (
     CITATION_MATCH_OBJECTIVE,
+    CitationMatchEntryMetrics,
     EvalRunCitationMatchAnalysis,
     citation_mismatch_pair,
     empty_citation_match_analysis,
@@ -88,10 +89,13 @@ class CitationMatchObjective(TeacherStudentObjective):
         self.params: dict[str, Any] = {}
         self._paired_analysis_cache: dict[tuple[str, str], EvalRunCitationMatchAnalysis] = {}
 
-    def analyze(self, teacher_eval_id: str, student_eval_id: str) -> EvalRunCitationMatchAnalysis:
+    def analyze(
+        self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest
+    ) -> EvalRunCitationMatchAnalysis:
         return self.cached_paired_analysis(
             teacher_eval_id,
             student_eval_id,
+            request=request,
             cache=self._paired_analysis_cache,
             fetch=fetch_eval_run_citation_match_analysis,
             empty=empty_citation_match_analysis,
@@ -108,47 +112,40 @@ class CitationMatchObjective(TeacherStudentObjective):
         matching = sum(1 for metrics in analysis.per_entry.values() if metrics.citations_match)
         return matching / len(requested_entry_ids)
 
-    def scored_rows(
+    def aggregate_row(self, analysis: EvalRunCitationMatchAnalysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(
+            entry_id=None,
+            dimension_scores={CITATION_MATCH_OBJECTIVE: analysis.aggregate.citation_match_rate},
+            output=_rollout_output(
+                entry_id=ctx.query,
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_citations=[],
+                teacher_citations=[],
+            ),
+        )
+
+    def entry_row(
         self,
+        entry_id: str,
+        metrics: CitationMatchEntryMetrics,
         analysis: EvalRunCitationMatchAnalysis,
-        *,
-        focused: bool,
-        capture_traces: bool,
-        query: str,
-        deployment_id: str,
-    ) -> list[ScoredRow]:
-        if focused and not analysis.per_entry:
-            return []
-        if not focused and not capture_traces:
-            return [
-                ScoredRow(
-                    entry_id=None,
-                    dimension_scores={CITATION_MATCH_OBJECTIVE: analysis.aggregate.citation_match_rate},
-                    output=_rollout_output(
-                        entry_id=query,
-                        deployment_id=deployment_id,
-                        query=query,
-                        student_citations=[],
-                        teacher_citations=[],
-                    ),
-                )
-            ]
-        return [
-            ScoredRow(
+        ctx: ScoringContext,
+    ) -> ScoredRow:
+        del analysis
+        return ScoredRow(
+            entry_id=entry_id,
+            dimension_scores={CITATION_MATCH_OBJECTIVE: float(metrics.citations_match)},
+            output=_rollout_output(
                 entry_id=entry_id,
-                dimension_scores={CITATION_MATCH_OBJECTIVE: float(citation_match.citations_match)},
-                output=_rollout_output(
-                    entry_id=entry_id,
-                    deployment_id=deployment_id,
-                    query=query,
-                    student_citations=list(citation_match.student_citations),
-                    teacher_citations=list(citation_match.teacher_citations),
-                    student_action_inputs=list(citation_match.student_action_inputs),
-                    teacher_action_inputs=list(citation_match.teacher_action_inputs),
-                ),
-            )
-            for entry_id, citation_match in analysis.per_entry.items()
-        ]
+                deployment_id=ctx.deployment_id,
+                query=ctx.query,
+                student_citations=list(metrics.student_citations),
+                teacher_citations=list(metrics.teacher_citations),
+                student_action_inputs=list(metrics.student_action_inputs),
+                teacher_action_inputs=list(metrics.teacher_action_inputs),
+            ),
+        )
 
     def failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         del component_name
@@ -179,19 +176,10 @@ class CitationMatchObjective(TeacherStudentObjective):
         if citation_match < 1.0:
             feedback_parts.append(f"Citation match issue: score={citation_match:.2f}.")
         feedback_parts.extend(self.wired_signal_issues(objective_scores))
-
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        # The raw user query is scrubbed, so surface the teacher's tool payloads
-        # (the searches it ran) as the intent signal behind the cited sources.
-        teacher_action_inputs = output.get("teacher_action_inputs") or []
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
+        return self.reflective_example(
+            trajectory,
+            feedback=" ".join(feedback_parts) if feedback_parts else "General teacher/student citation divergence.",
+            generated={
                 "student_answer": output.get("student_answer", ""),
                 "teacher_answer": output.get("teacher_answer", ""),
                 "student_tools": student_citations,
@@ -199,13 +187,10 @@ class CitationMatchObjective(TeacherStudentObjective):
                 "student_citations": student_citations,
                 "teacher_citations": teacher_citations,
             },
-            "Action Inputs": list(teacher_action_inputs[:5]),
-            "Execution Errors": [],
-            "Feedback": " ".join(feedback_parts) if feedback_parts else "General teacher/student citation divergence.",
-            "Metrics": self.reflective_metrics(trajectory),
-        }
+            # The raw user query is scrubbed, so surface the teacher's tool payloads
+            # (the searches it ran) as the intent signal behind the cited sources.
+            action_inputs=output.get("teacher_action_inputs") or [],
+        )
 
-
-register_telemetry_source("teacher_student", "citation_match", CitationMatchObjective)
 
 __all__ = ["CitationMatchObjective"]

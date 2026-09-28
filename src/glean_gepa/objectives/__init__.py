@@ -1,9 +1,10 @@
 """Eval-topology-agnostic scoring plugins for the Glean adapters.
 
-The base contracts and registry live in :mod:`glean_gepa.objectives.base`; each
-concrete metric is a sibling module (e.g. ``tool_match``, ``shell``) that
-self-registers on import. This package re-exports the
-base API so ``from glean_gepa.objectives import build_objective`` keeps working.
+The base contracts live in :mod:`glean_gepa.objectives.base` and the shared
+member contract in :mod:`glean_gepa.objectives.protocol`. Every objective is
+listed once in ``registry.BUILTIN_OBJECTIVES``; add a row there to register a
+new one. This package re-exports the base API so
+``from glean_gepa.objectives import build_objective`` keeps working.
 """
 
 from __future__ import annotations
@@ -12,7 +13,10 @@ from glean_gepa.objectives.base import (
     MODE_DEFAULT_PACK,
     MODE_DEFAULT_TELEMETRY_SOURCE,
     TELEMETRY_SOURCES,
+    AnalysisDetail,
+    AnalysisRequest,
     ScoredRow,
+    ScoringContext,
     SingleModelObjective,
     TeacherStudentObjective,
     TelemetryPendingError,
@@ -27,7 +31,10 @@ from glean_gepa.objectives.base import (
 __all__ = [
     "MODE_DEFAULT_PACK",
     "MODE_DEFAULT_TELEMETRY_SOURCE",
+    "AnalysisDetail",
+    "AnalysisRequest",
     "ScoredRow",
+    "ScoringContext",
     "SingleModelObjective",
     "TelemetryPendingError",
     "TELEMETRY_SOURCES",

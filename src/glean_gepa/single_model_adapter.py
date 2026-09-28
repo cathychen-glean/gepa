@@ -17,7 +17,7 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
-from glean_gepa.objectives import SingleModelObjective, TelemetryPendingError
+from glean_gepa.objectives import AnalysisDetail, AnalysisRequest, SingleModelObjective, TelemetryPendingError
 from glean_gepa.objectives.shell import ShellSuccessObjective
 from glean_gepa.objectives.utils.shell_tool_error_util import fetch_high_signal_evalset_entries
 from glean_gepa.prompt import compile_encoded_prompt
@@ -163,17 +163,15 @@ class SingleModelAdapter(GleanAdapterBase):
         self,
         eval_id: str,
         *,
-        include_error_examples: bool = True,
-        include_per_entry: bool = True,
-        include_action_inputs: bool = True,
+        detail: AnalysisDetail = "per_entry",
+        hydrate_action_inputs: bool = True,
     ):
-        analysis = self.objective.analyze(
-            eval_id,
-            include_error_examples=include_error_examples,
-            include_per_entry=include_per_entry,
+        request = AnalysisRequest(
             evalcli=self.runner.evalcli,
-            include_action_inputs=include_action_inputs,
+            detail=detail,
+            hydrate_action_inputs=hydrate_action_inputs,
         )
+        analysis = self.objective.analyze(eval_id, request=request)
         if eval_id in self._eval_analysis_cache:
             self._save_cache()
         return analysis
@@ -266,11 +264,18 @@ class SingleModelAdapter(GleanAdapterBase):
                     f"{'eval-set' if capture_traces else 'full-validation'} {label} results for "
                     f"{eval_set_name} {eval_set_version}: {student_eval_id}"
                 )
+            # Full trace evals need per-entry evidence; focused evals need per-entry
+            # scores only; validation needs the aggregate.
+            if capture_traces and not is_focused_eval:
+                detail: AnalysisDetail = "traces"
+            elif is_focused_eval or capture_traces:
+                detail = "per_entry"
+            else:
+                detail = "aggregate"
             analysis = self._get_or_fetch_analysis(
                 student_eval_id,
-                include_error_examples=capture_traces and not is_focused_eval,
-                include_per_entry=is_focused_eval or capture_traces,
-                include_action_inputs=not bool(al_data_inst.get("validation_only")),
+                detail=detail,
+                hydrate_action_inputs=not bool(al_data_inst.get("validation_only")),
             )
             if self.objective.is_pending(analysis):
                 label = self.objective.pending_telemetry_label or self.objective.name

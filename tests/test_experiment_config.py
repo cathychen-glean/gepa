@@ -17,7 +17,7 @@ from glean_gepa.experiment_config import (
     runner_arg_defaults,
 )
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
-from glean_gepa.objectives import build_objective
+from glean_gepa.objectives import AnalysisRequest, build_objective
 from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.objectives.utils.tool_match_util import empty_tool_match_analysis
 from glean_gepa.runner import _parse_args
@@ -142,7 +142,7 @@ def test_mode_yaml_overlays_the_pack(tmp_path):
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         return_value=empty_tool_match_analysis("teacher-1", "student-1"),
     ) as fetch:
-        fetch_objective.analyze("teacher-1", "student-1")
+        fetch_objective.analyze("teacher-1", "student-1", request=AnalysisRequest())
     skipped = fetch.call_args.kwargs["skip_tools"]
     assert skipped == frozenset({"Shell"})
 

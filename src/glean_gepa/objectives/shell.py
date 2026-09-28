@@ -8,12 +8,13 @@ from datetime import date
 from typing import Any, ClassVar
 
 from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTrajectory
-from glean_gepa.al_adapter import ReflectiveExample, ReflectiveExampleInputs
+from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE
-from glean_gepa.objectives.base import ScoredRow, SingleModelObjective, register_telemetry_source
+from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, SingleModelObjective
 from glean_gepa.objectives.utils.shell_tool_error_util import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
+    ShellToolErrorEntryMetrics,
     enrich_shell_error_action_inputs,
     fetch_eval_run_shell_tool_error_analysis,
     log_shell_tool_error_analysis,
@@ -109,40 +110,30 @@ class ShellSuccessObjective(SingleModelObjective):
         self.params: dict[str, Any] = {}
         self._eval_analysis_cache: dict[str, EvalRunShellToolErrorAnalysis] = {}
 
-    def analyze(
-        self,
-        eval_id: str,
-        *,
-        include_error_examples: bool = True,
-        include_per_entry: bool = True,
-        evalcli: Any | None = None,
-        include_action_inputs: bool = True,
-    ) -> EvalRunShellToolErrorAnalysis:
-        del include_action_inputs
-        cached = self._eval_analysis_cache.get(eval_id)
-        if cached is not None:
-            missing_entry_breakdown = (
-                include_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0
+    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> EvalRunShellToolErrorAnalysis:
+        def fetch(req: AnalysisRequest) -> EvalRunShellToolErrorAnalysis:
+            # Error examples are trace-level evidence; the adapter asks for them only on
+            # full trace evals, not focused ones.
+            analysis = fetch_eval_run_shell_tool_error_analysis(
+                self.bigquery_client,
+                eval_id=eval_id,
+                lookback_days=self.lookback_days,
+                include_error_examples=req.wants_traces,
+                include_per_entry=req.wants_per_entry,
             )
-            if not missing_entry_breakdown:
-                print(f"[Cache HIT] Using cached shell error analysis for eval_id: {eval_id}")
-                return cached
-            print(f"[Cache] Refetching shell error analysis with per-entry metrics for eval_id: {eval_id}")
-        analysis = fetch_eval_run_shell_tool_error_analysis(
-            self.bigquery_client,
-            eval_id=eval_id,
-            lookback_days=self.lookback_days,
-            include_error_examples=include_error_examples,
-            include_per_entry=include_per_entry,
-        )
-        if include_error_examples:
-            if evalcli is not None:
-                analysis = enrich_shell_error_action_inputs(evalcli, analysis)
-            if analysis.aggregate.shell_executions == 0:
-                print(f"[Cache] Not caching provisional 0/0 shell analysis for eval_id: {eval_id}")
-                return analysis
-            self._eval_analysis_cache[eval_id] = analysis
-        return analysis
+            if req.wants_traces and req.evalcli is not None:
+                analysis = enrich_shell_error_action_inputs(req.evalcli, analysis)
+            return analysis
+
+        return self.cached_eval_analysis(eval_id, request=request, fetch=fetch, label="shell error analysis")
+
+    def cache_hit_is_sufficient(self, cached: EvalRunShellToolErrorAnalysis, request: AnalysisRequest) -> bool:
+        """An aggregate-only entry cannot serve a request that needs per-entry rows."""
+        return not (request.wants_per_entry and not cached.per_entry and cached.aggregate.shell_executions > 0)
+
+    def analysis_is_cacheable(self, analysis: EvalRunShellToolErrorAnalysis, request: AnalysisRequest) -> bool:
+        """Only the full trace fetch is worth keeping; it carries the error examples reflection needs."""
+        return request.wants_traces and not self.is_pending(analysis)
 
     def focused_pass_rate(self, analysis: EvalRunShellToolErrorAnalysis, requested_entry_ids: Sequence[str]) -> float:
         passed_entries = sum(1 for entry_metrics in analysis.per_entry.values() if entry_metrics.shell_errors == 0)
@@ -151,122 +142,60 @@ class ShellSuccessObjective(SingleModelObjective):
     def log_analysis(self, analysis: EvalRunShellToolErrorAnalysis) -> None:
         log_shell_tool_error_analysis(analysis)
 
-    def scored_rows(
+    def aggregate_row(self, analysis: EvalRunShellToolErrorAnalysis, ctx: ScoringContext) -> ScoredRow:
+        aggregate = analysis.aggregate
+        output: SingleModelALRolloutOutput = {
+            "deployment_id": ctx.deployment_id,
+            "query": ctx.query,
+            "entry_id": ctx.query,
+            "student_tool_calls": aggregate.shell_executions,
+            "student_tool_errors": aggregate.shell_errors,
+            "shell_error_messages": [e.error_str for e in aggregate.recent_error_examples if e.error_str],
+            "student_eval_run_id": ctx.student_eval_id,
+        }
+        if action_inputs := [e.action_input for e in aggregate.recent_error_examples if e.action_input]:
+            output["shell_action_inputs"] = action_inputs
+        return ScoredRow(
+            entry_id=None,
+            dimension_scores={SHELL_SUCCESS_OBJECTIVE: aggregate.shell_success_rate},
+            output=output,
+        )
+
+    def entry_row(
         self,
+        entry_id: str,
+        metrics: ShellToolErrorEntryMetrics,
         analysis: EvalRunShellToolErrorAnalysis,
-        *,
-        al_data_inst: Mapping[str, Any],
-        student_eval_id: str,
-        eval_set_name: str,
-        eval_set_version: str,
-        deployment_ids: Sequence[str],
-        requested_entry_ids: Sequence[str] | None,
-        is_focused_eval: bool,
-        capture_traces: bool,
-    ) -> list[ScoredRow]:
-        del al_data_inst
-        query = f"{eval_set_name}:{eval_set_version}"
-        deployment_id = deployment_ids[0] if deployment_ids else ""
-        if not is_focused_eval and not capture_traces:
-            output: SingleModelALRolloutOutput = {
-                "deployment_id": deployment_id,
-                "query": query,
-                "student_tool_calls": analysis.aggregate.shell_executions,
-                "student_tool_errors": analysis.aggregate.shell_errors,
-                "entry_id": query,
-                "shell_error_messages": [
-                    example.error_str for example in analysis.aggregate.recent_error_examples if example.error_str
-                ],
-                "student_eval_run_id": student_eval_id,
-            }
-            shell_action_inputs = [
-                example.action_input for example in analysis.aggregate.recent_error_examples if example.action_input
-            ]
-            if shell_action_inputs:
-                output["shell_action_inputs"] = shell_action_inputs
-            return [
-                ScoredRow(
-                    entry_id=None,
-                    dimension_scores={SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate},
-                    output=output,
-                )
-            ]
-
-        high_signal_entry_ids = self.entry_ids_to_score(analysis, requested_entry_ids)
-        if not high_signal_entry_ids:
-            shell_error_messages = [
-                example.error_str for example in analysis.aggregate.recent_error_examples if example.error_str
-            ]
-            shell_action_inputs = [
-                example.action_input for example in analysis.aggregate.recent_error_examples if example.action_input
-            ]
-            output = {
-                "deployment_id": deployment_id,
-                "query": query,
-                "student_tool_calls": analysis.aggregate.shell_executions,
-                "student_tool_errors": analysis.aggregate.shell_errors,
-                "entry_id": query,
-                "shell_error_messages": shell_error_messages,
-                "student_eval_run_id": student_eval_id,
-            }
-            if shell_action_inputs:
-                output["shell_action_inputs"] = shell_action_inputs
-            return [
-                ScoredRow(
-                    entry_id=query,
-                    dimension_scores={SHELL_SUCCESS_OBJECTIVE: analysis.aggregate.shell_success_rate},
-                    output=output,
-                )
-            ]
-
-        rows: list[ScoredRow] = []
-        for entry_id in high_signal_entry_ids:
-            entry_metrics = analysis.per_entry.get(entry_id, analysis.aggregate)
-            failed_eval_example = next(
-                (example for example in entry_metrics.recent_error_examples if example.trace_id),
-                None,
-            )
-            eval_trace_id = failed_eval_example.trace_id if failed_eval_example else None
-            eval_trace_examples = [
-                example
-                for example in entry_metrics.recent_error_examples
-                if eval_trace_id is None or example.trace_id == eval_trace_id
-            ]
-            shell_error_messages = [example.error_str for example in eval_trace_examples if example.error_str]
-            shell_action_inputs = [example.action_input for example in eval_trace_examples if example.action_input]
-            entry_output: SingleModelALRolloutOutput = {
-                "deployment_id": deployment_id,
-                "query": f"{query} entry={entry_id}",
-                "student_tool_calls": entry_metrics.shell_executions,
-                "student_tool_errors": entry_metrics.shell_errors,
-                "entry_id": entry_id,
-                "shell_error_messages": shell_error_messages,
-                "student_eval_run_id": student_eval_id,
-            }
-            if shell_action_inputs:
-                entry_output["shell_action_inputs"] = shell_action_inputs
-            if eval_trace_id:
-                entry_output["eval_trace_id"] = eval_trace_id
-            data_overrides: dict[str, Any] = {
-                "eval_entry_id": entry_id,
-                "eval_run_id": student_eval_id,
-            }
-            if eval_trace_id:
-                data_overrides["eval_trace_id"] = eval_trace_id
-            shell_success = (
-                float(entry_id in analysis.per_entry and entry_metrics.shell_errors == 0)
-                if is_focused_eval
-                else entry_metrics.shell_success_rate
-            )
-            rows.append(
-                ScoredRow(
-                    entry_id=entry_id,
-                    dimension_scores={SHELL_SUCCESS_OBJECTIVE: shell_success},
-                    output=entry_output,
-                    data_overrides=data_overrides,
-                )
-            )
-        return rows
+        ctx: ScoringContext,
+    ) -> ScoredRow:
+        del analysis
+        # Surface evidence from the one failed eval trace, when there is one.
+        failed = next((e for e in metrics.recent_error_examples if e.trace_id), None)
+        eval_trace_id = failed.trace_id if failed else None
+        examples = [e for e in metrics.recent_error_examples if eval_trace_id is None or e.trace_id == eval_trace_id]
+        output: SingleModelALRolloutOutput = {
+            "deployment_id": ctx.deployment_id,
+            "query": ctx.entry_query(entry_id),
+            "entry_id": entry_id,
+            "student_tool_calls": metrics.shell_executions,
+            "student_tool_errors": metrics.shell_errors,
+            "shell_error_messages": [e.error_str for e in examples if e.error_str],
+            "student_eval_run_id": ctx.student_eval_id,
+        }
+        if action_inputs := [e.action_input for e in examples if e.action_input]:
+            output["shell_action_inputs"] = action_inputs
+        data_overrides: dict[str, Any] = {"eval_entry_id": entry_id, "eval_run_id": ctx.student_eval_id}
+        if eval_trace_id:
+            output["eval_trace_id"] = eval_trace_id
+            data_overrides["eval_trace_id"] = eval_trace_id
+        # Focused evals are pass/fail per entry; full evals keep the call-level rate.
+        score = float(metrics.shell_errors == 0) if ctx.is_focused else metrics.shell_success_rate
+        return ScoredRow(
+            entry_id=entry_id,
+            dimension_scores={SHELL_SUCCESS_OBJECTIVE: score},
+            output=output,
+            data_overrides=data_overrides,
+        )
 
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name
@@ -286,40 +215,19 @@ class ShellSuccessObjective(SingleModelObjective):
     ) -> ReflectiveExample:
         del component_name, candidate
         output = trajectory["output"]
-        shell_error_messages = [
-            sanitized for error in output.get("shell_error_messages", []) if (sanitized := strip_stdout_sections(error))
-        ]
-        if shell_error_messages:
+        errors = [s for e in output.get("shell_error_messages", []) if (s := strip_stdout_sections(e))]
+        if errors:
             feedback = "Resolve the shell execution failures shown above."
         elif output.get("student_tool_errors", 0) > 0:
             feedback = f"Tool errors: Student encountered {output.get('student_tool_errors', 0)} shell tool errors."
         else:
             feedback = "General shell tool reliability issue."
-
-        inputs: ReflectiveExampleInputs = {
-            "eval_set": trajectory["data"]["eval_set_name"],
-            "entry_id": output["entry_id"],
-            "deployment_id": output["deployment_id"],
-            "query": output["query"],
-        }
-        if eval_run_id := trajectory["data"].get("eval_run_id"):
-            inputs["eval_run_id"] = eval_run_id
-        if eval_trace_id := trajectory["data"].get("eval_trace_id"):
-            inputs["eval_trace_id"] = eval_trace_id
-
-        return {
-            "Inputs": inputs,
-            "Generated Outputs": {
-                "student_answer": "",
-                "teacher_answer": "",
-                "student_tools": [],
-                "teacher_tools": [],
-            },
-            "Action Inputs": output.get("shell_action_inputs", [])[:5],
-            "Execution Errors": shell_error_messages[:5],
-            "Feedback": feedback,
-            "Metrics": self.reflective_metrics(trajectory),
-        }
+        return self.reflective_example(
+            trajectory,
+            feedback=feedback,
+            action_inputs=output.get("shell_action_inputs", []),
+            execution_errors=errors,
+        )
 
     def cache_payload(self) -> dict[str, Any]:
         return {eval_id: _serialize_eval_analysis(analysis) for eval_id, analysis in self._eval_analysis_cache.items()}
@@ -327,8 +235,6 @@ class ShellSuccessObjective(SingleModelObjective):
     def load_cache(self, raw_cache: Any) -> None:
         self._eval_analysis_cache = _parse_eval_analysis_cache(raw_cache)
 
-
-register_telemetry_source("single_model", "shell_telemetry", ShellSuccessObjective)
 
 __all__ = [
     "EVAL_ANALYSIS_CACHE_SCHEMA_VERSION",
