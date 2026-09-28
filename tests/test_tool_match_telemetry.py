@@ -403,11 +403,11 @@ def test_aggregate_and_empty_analysis():
         "a": ToolMatchEntryMetrics("a", ("search",), ("search",), True),
         "b": ToolMatchEntryMetrics("b", ("read",), ("search",), False),
     }
-    aggregate = aggregate_tool_match_metrics("teacher", "student", per_entry)
+    aggregate = aggregate_tool_match_metrics(per_entry)
     assert aggregate.compared_entries == 2
     assert aggregate.matching_entries == 1
     assert aggregate.tool_match_rate == 0.5
-    empty = aggregate_tool_match_metrics("teacher", "student", {})
+    empty = aggregate_tool_match_metrics({})
     assert empty.compared_entries == 0
     assert empty.tool_match_rate == 0.0
     analysis = empty_tool_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))

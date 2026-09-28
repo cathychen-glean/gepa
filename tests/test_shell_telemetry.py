@@ -269,7 +269,6 @@ def test_parse_shell_tool_error_metrics_from_bigquery_row():
 
     metrics = parse_shell_tool_error_metrics(row)
 
-    assert metrics.eval_id == "run_123"
     assert metrics.shell_executions == 10
     assert metrics.shell_errors == 2
     assert metrics.shell_error_rate == 0.2
@@ -306,10 +305,9 @@ def test_parse_shell_tool_error_example_handles_missing_fields():
 
 
 def test_empty_shell_tool_error_metrics_defaults_to_zero():
-    metrics = empty_shell_tool_error_metrics("run_123")
+    metrics = empty_shell_tool_error_metrics()
 
     assert metrics == ShellToolErrorMetrics(
-        eval_id="run_123",
         shell_executions=0,
         shell_errors=0,
         shell_error_rate=0.0,

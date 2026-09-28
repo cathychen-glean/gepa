@@ -107,8 +107,6 @@ def _tool_match_analysis(
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id=teacher_eval_id,
-            student_eval_id=student_eval_id,
             compared_entries=len(per_entry),
             matching_entries=matching,
             tool_match_rate=(matching / len(per_entry)) if per_entry else 0.0,
@@ -279,8 +277,6 @@ def test_get_or_fetch_analysis_caches_fetch():
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
             tool_match_rate=0.0,
@@ -452,8 +448,6 @@ def test_finish_batch_evals_uses_tool_match_and_correctness():
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
             tool_match_rate=0.5,
@@ -605,8 +599,6 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=4,
             matching_entries=3,
             tool_match_rate=0.75,
@@ -677,8 +669,6 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=2,
             matching_entries=1,
             tool_match_rate=0.5,

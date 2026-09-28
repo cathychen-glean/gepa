@@ -87,8 +87,6 @@ class ToolMatchEntryMetrics:
 
 @dataclass(frozen=True)
 class ToolMatchMetrics:
-    teacher_eval_id: str
-    student_eval_id: str
     compared_entries: int
     matching_entries: int
     tool_match_rate: float
@@ -126,17 +124,11 @@ def parse_tool_match_entry_metrics(
 
 
 def aggregate_tool_match_metrics(
-    teacher_eval_id: str,
-    student_eval_id: str,
-    per_entry: Mapping[str, ToolMatchEntryMetrics],
-    *,
-    excluded_failed_runs: int = 0,
+    per_entry: Mapping[str, ToolMatchEntryMetrics], *, excluded_failed_runs: int = 0
 ) -> ToolMatchMetrics:
     compared = len(per_entry)
     matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
     return ToolMatchMetrics(
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
         compared_entries=compared,
         matching_entries=matching,
         tool_match_rate=(matching / compared) if compared else 0.0,
@@ -215,7 +207,7 @@ def empty_tool_match_analysis(
     start_date, resolved_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
     return EvalRunToolMatchAnalysis(
         eval_ids=(teacher_eval_id, student_eval_id),
-        aggregate=aggregate_tool_match_metrics(teacher_eval_id, student_eval_id, {}),
+        aggregate=aggregate_tool_match_metrics({}),
         start_date=start_date,
         end_date=resolved_end,
     )
@@ -240,9 +232,9 @@ def fetch_eval_run_tool_match_analysis(
         return metrics if metrics.entry_id else None
 
     def aggregate(
-        ids: tuple[str, ...], per_entry: Mapping[str, ToolMatchEntryMetrics], dropped: int
+        _ids: tuple[str, ...], per_entry: Mapping[str, ToolMatchEntryMetrics], dropped: int
     ) -> ToolMatchMetrics:
-        return aggregate_tool_match_metrics(ids[0], ids[-1], per_entry, excluded_failed_runs=dropped)
+        return aggregate_tool_match_metrics(per_entry, excluded_failed_runs=dropped)
 
     def enrich(
         per_entry: Mapping[str, ToolMatchEntryMetrics], rows: Rows, high_signal: tuple[str, ...]

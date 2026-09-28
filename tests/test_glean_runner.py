@@ -412,8 +412,9 @@ def test_val_version_selection_picks_fully_published_dated_versions():
             "20260830",
         ]
     )
-    with pytest.raises(SystemExit, match="not published to"):
-        _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS)
+    # TEMP: pinned val versions skip the customer publication check.
+    assert _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS) == (["20260901"], ["20260830"])
+    evalcli.list_eval_set_versions.assert_not_called()
 
 
 def _experiment_with_validation(entries):

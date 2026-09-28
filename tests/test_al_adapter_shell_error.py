@@ -25,7 +25,6 @@ from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPending
 
 def _shell_analysis(*, executions: int, per_entry: bool) -> EvalRunShellToolErrorAnalysis:
     aggregate = ShellToolErrorMetrics(
-        eval_id="run",
         shell_executions=executions,
         shell_errors=0,
         shell_error_rate=0.0,
@@ -106,7 +105,6 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=8,
             shell_errors=2,
             shell_error_rate=0.25,
@@ -568,7 +566,6 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=4,
             shell_errors=1,
             shell_error_rate=0.25,
@@ -640,7 +637,6 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         start_date=date(2026, 8, 11),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=1,
             shell_errors=1,
             shell_error_rate=1.0,
@@ -724,7 +720,6 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_cached",
             shell_executions=10,
             shell_errors=3,
             shell_error_rate=0.3,
@@ -784,7 +779,6 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -818,7 +812,6 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -857,17 +850,16 @@ def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
         start_date=date(2026, 9, 2),
         end_date=date(2026, 9, 2),
         aggregate=ShellToolErrorMetrics(
-            eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
             shell_executions=560,
             shell_errors=38,
             shell_error_rate=0.0679,
             shell_error_pct=6.79,
             recent_error_examples=(
                 ShellToolErrorExample(
+                    eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
                     started_at="2026-09-02T05:27:00Z",
                     project_id="scio-prod",
                     entry_id="entry-1",
-                    eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
                     run_id="execution-1",
                     trace_id="trace-1",
                     span_id="span-1",
@@ -954,7 +946,6 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=1,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -1008,7 +999,6 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_legacy",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,

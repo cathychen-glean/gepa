@@ -103,7 +103,6 @@ class ShellToolErrorEntryMetrics:
 
 @dataclass(frozen=True)
 class ShellToolErrorMetrics:
-    eval_id: str
     shell_executions: int
     shell_errors: int
     shell_error_rate: float
@@ -447,7 +446,6 @@ def parse_shell_tool_error_metrics(row: dict[str, Any]) -> ShellToolErrorMetrics
     shell_error_rate = float(row.get("shell_error_rate") or 0.0)
     shell_error_pct = float(row.get("shell_error_pct") or (shell_error_rate * 100))
     return ShellToolErrorMetrics(
-        eval_id=str(row.get("eval_id") or ""),
         shell_executions=shell_executions,
         shell_errors=shell_errors,
         shell_error_rate=shell_error_rate,
@@ -456,12 +454,9 @@ def parse_shell_tool_error_metrics(row: dict[str, Any]) -> ShellToolErrorMetrics
     )
 
 
-def aggregate_entry_metrics(
-    eval_id: str,
-    per_entry: dict[str, ShellToolErrorEntryMetrics],
-) -> ShellToolErrorMetrics:
+def aggregate_entry_metrics(per_entry: Mapping[str, ShellToolErrorEntryMetrics]) -> ShellToolErrorMetrics:
     if not per_entry:
-        return empty_shell_tool_error_metrics(eval_id)
+        return empty_shell_tool_error_metrics()
     shell_executions = sum(entry.shell_executions for entry in per_entry.values())
     shell_errors = sum(entry.shell_errors for entry in per_entry.values())
     shell_error_rate = shell_errors / shell_executions if shell_executions else 0.0
@@ -470,7 +465,6 @@ def aggregate_entry_metrics(
         recent_examples.extend(entry.recent_error_examples)
     recent_examples = recent_examples[:25]
     return ShellToolErrorMetrics(
-        eval_id=eval_id,
         shell_executions=shell_executions,
         shell_errors=shell_errors,
         shell_error_rate=shell_error_rate,
@@ -520,7 +514,7 @@ def fetch_eval_run_shell_tool_error_analysis(
         return metrics if metrics.entry_id else None
 
     def parse_aggregate(row: Mapping[str, Any] | None) -> ShellToolErrorMetrics:
-        return parse_shell_tool_error_metrics(dict(row)) if row else empty_shell_tool_error_metrics(eval_id)
+        return parse_shell_tool_error_metrics(dict(row)) if row else empty_shell_tool_error_metrics()
 
     analysis = fetch_agentspan_analysis(
         client,
@@ -537,7 +531,7 @@ def fetch_eval_run_shell_tool_error_analysis(
         ),
         include_per_entry=include_per_entry,
         parse_row=parse,
-        aggregate=lambda ids, per_entry, _dropped: aggregate_entry_metrics(ids[-1], dict(per_entry)),
+        aggregate=lambda _ids, per_entry, _dropped: aggregate_entry_metrics(per_entry),
         lookback_days=lookback_days,
         end_date=end_date,
     )
@@ -653,9 +647,8 @@ def enrich_shell_error_action_inputs(
     )
 
 
-def empty_shell_tool_error_metrics(eval_id: str) -> ShellToolErrorMetrics:
+def empty_shell_tool_error_metrics() -> ShellToolErrorMetrics:
     return ShellToolErrorMetrics(
-        eval_id=eval_id,
         shell_executions=0,
         shell_errors=0,
         shell_error_rate=0.0,
@@ -682,7 +675,7 @@ WRITING_CODE_RESPONSIBILITY = (
     f"Use shell error examples as evidence. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
 )
 
-EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
+EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 10
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +686,6 @@ EVAL_ANALYSIS_CACHE_SCHEMA_VERSION = 9
 def _serialize_eval_analysis(analysis: EvalRunShellToolErrorAnalysis) -> dict[str, Any]:
     def metrics_dict(metrics: Any) -> dict[str, Any]:
         return {
-            "eval_id": getattr(metrics, "eval_id", None),
             "entry_id": getattr(metrics, "entry_id", None),
             "shell_executions": metrics.shell_executions,
             "shell_errors": metrics.shell_errors,

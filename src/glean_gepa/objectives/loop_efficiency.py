@@ -74,7 +74,6 @@ class LoopCountEntryMetrics:
 
 @dataclass(frozen=True)
 class LoopCountMetrics:
-    eval_id: str
     compared_entries: int
     matching_entries: int
     mean_loop_count: float
@@ -128,14 +127,13 @@ def parse_loop_count_entry_metrics(
     )
 
 
-def aggregate_loop_count_metrics(eval_id: str, per_entry: Mapping[str, LoopCountEntryMetrics]) -> LoopCountMetrics:
+def aggregate_loop_count_metrics(per_entry: Mapping[str, LoopCountEntryMetrics]) -> LoopCountMetrics:
     compared = len(per_entry)
     matching = sum(1 for metrics in per_entry.values() if metrics.loop_efficiency >= 1.0)
     mean_loops = (sum(metrics.loop_count for metrics in per_entry.values()) / compared) if compared else 0.0
     mean_correctness = (sum(metrics.correctness for metrics in per_entry.values()) / compared) if compared else 0.0
     efficiency = (sum(metrics.loop_efficiency for metrics in per_entry.values()) / compared) if compared else 0.0
     return LoopCountMetrics(
-        eval_id=eval_id,
         compared_entries=compared,
         matching_entries=matching,
         mean_loop_count=mean_loops,
@@ -199,7 +197,7 @@ def empty_loop_count_analysis(
     start_date, resolved_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
     return EvalRunLoopCountAnalysis(
         eval_ids=(eval_id,),
-        aggregate=aggregate_loop_count_metrics(eval_id, {}),
+        aggregate=aggregate_loop_count_metrics({}),
         start_date=start_date,
         end_date=resolved_end,
     )
@@ -234,7 +232,7 @@ def fetch_eval_run_loop_count_analysis(
         bounds_sql=bounds_query(eval_id_predicate="= @eval_id", agentspan_table=agentspan_table),
         per_entry_sql=build_loop_count_per_entry_query(agentspan_table=agentspan_table),
         parse_row=parse,
-        aggregate=lambda ids, per_entry, _dropped: aggregate_loop_count_metrics(ids[-1], per_entry),
+        aggregate=lambda _ids, per_entry, _dropped: aggregate_loop_count_metrics(per_entry),
         is_high_signal=lambda m: m.loop_efficiency < 1.0,
         post_parse=overlay if evalcli is not None else None,
         enrich=enrich if evalcli is not None and include_action_inputs else None,
@@ -556,7 +554,7 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
         per_entry = {entry_id: replace(m, target_loops=self.target_loops) for entry_id, m in per_entry.items()}
         return EvalRunLoopCountAnalysis(
             eval_ids=(eval_id,),
-            aggregate=aggregate_loop_count_metrics(eval_id, per_entry),
+            aggregate=aggregate_loop_count_metrics(per_entry),
             per_entry=per_entry,
             high_signal_entry_ids=tuple(sorted(e for e, m in per_entry.items() if m.loop_efficiency < 1.0)),
             start_date=date.fromisoformat(raw["start_date"]),

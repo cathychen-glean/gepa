@@ -78,8 +78,6 @@ class CitationMatchEntryMetrics:
 
 @dataclass(frozen=True)
 class CitationMatchMetrics:
-    teacher_eval_id: str
-    student_eval_id: str
     compared_entries: int
     matching_entries: int
     citation_match_rate: float
@@ -136,16 +134,10 @@ def parse_citation_match_entry_metrics(row: Mapping[str, Any]) -> CitationMatchE
     )
 
 
-def aggregate_citation_match_metrics(
-    teacher_eval_id: str,
-    student_eval_id: str,
-    per_entry: Mapping[str, CitationMatchEntryMetrics],
-) -> CitationMatchMetrics:
+def aggregate_citation_match_metrics(per_entry: Mapping[str, CitationMatchEntryMetrics]) -> CitationMatchMetrics:
     compared = len(per_entry)
     matching = sum(1 for metrics in per_entry.values() if metrics.citations_match)
     return CitationMatchMetrics(
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
         compared_entries=compared,
         matching_entries=matching,
         citation_match_rate=(matching / compared) if compared else 0.0,
@@ -228,7 +220,7 @@ def empty_citation_match_analysis(
     start_date, resolved_end = default_date_range(lookback_days=lookback_days, end_date=end_date)
     return EvalRunCitationMatchAnalysis(
         eval_ids=(teacher_eval_id, student_eval_id),
-        aggregate=aggregate_citation_match_metrics(teacher_eval_id, student_eval_id, {}),
+        aggregate=aggregate_citation_match_metrics({}),
         start_date=start_date,
         end_date=resolved_end,
     )
@@ -249,11 +241,6 @@ def fetch_eval_run_citation_match_analysis(
         metrics = parse_citation_match_entry_metrics(row)
         return metrics if metrics.entry_id else None
 
-    def aggregate(
-        ids: tuple[str, ...], per_entry: Mapping[str, CitationMatchEntryMetrics], _dropped: int
-    ) -> CitationMatchMetrics:
-        return aggregate_citation_match_metrics(ids[0], ids[-1], per_entry)
-
     def enrich(
         per_entry: Mapping[str, CitationMatchEntryMetrics], rows: Rows, high_signal: tuple[str, ...]
     ) -> Mapping[str, CitationMatchEntryMetrics]:
@@ -265,7 +252,7 @@ def fetch_eval_run_citation_match_analysis(
         bounds_sql=bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", agentspan_table=agentspan_table),
         per_entry_sql=build_citation_match_per_entry_query(agentspan_table=agentspan_table),
         parse_row=parse,
-        aggregate=aggregate,
+        aggregate=lambda _ids, per_entry, _dropped: aggregate_citation_match_metrics(per_entry),
         is_high_signal=lambda m: not m.citations_match,
         enrich=enrich if evalcli is not None and include_action_inputs else None,
         lookback_days=lookback_days,

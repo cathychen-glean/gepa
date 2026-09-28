@@ -141,7 +141,7 @@ def test_aggregate_and_empty_analysis():
         "a": CitationMatchEntryMetrics("a", ("doc-1",), ("doc-1",), True),
         "b": CitationMatchEntryMetrics("b", (), ("doc-1",), False),
     }
-    aggregate = aggregate_citation_match_metrics("teacher", "student", per_entry)
+    aggregate = aggregate_citation_match_metrics(per_entry)
     assert aggregate.compared_entries == 2
     assert aggregate.matching_entries == 1
     assert aggregate.citation_match_rate == 0.5

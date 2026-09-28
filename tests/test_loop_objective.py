@@ -28,7 +28,7 @@ def _analysis(per_entry: dict[str, LoopCountEntryMetrics]) -> EvalRunLoopCountAn
         eval_ids=("run",),
         start_date=date(2026, 8, 1),
         end_date=date(2026, 8, 2),
-        aggregate=aggregate_loop_count_metrics("run", per_entry),
+        aggregate=aggregate_loop_count_metrics(per_entry),
         per_entry=per_entry,
         high_signal_entry_ids=tuple(sorted(e for e, m in per_entry.items() if m.loop_efficiency < 1.0)),
     )
