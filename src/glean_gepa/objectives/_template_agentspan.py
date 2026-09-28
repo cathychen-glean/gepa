@@ -14,7 +14,7 @@ Four decisions, top to bottom:
    locator columns if you want tool payloads for reflection.
    (``build_example_per_entry_query``)
 4. **The feedback.** One sentence telling the reflector what the prompt should
-   do differently for a failing entry. (``example_feedback``)
+   do differently for a failing entry. (inline in ``build_reflective_example``)
 
 Everything else (shard window, bounds query, high-signal selection, trace
 enrichment, cache, console log, reflective-example frame) is inherited or
@@ -190,15 +190,6 @@ def fetch_example_analysis(
 
 
 # ---------------------------------------------------------------------------
-# 4. Feedback for the reflector
-# ---------------------------------------------------------------------------
-
-
-def example_feedback(metrics: ExampleEntryMetrics) -> str:
-    return f"TODO: what the prompt should do differently (value={metrics.value})."
-
-
-# ---------------------------------------------------------------------------
 # Objective
 # ---------------------------------------------------------------------------
 
@@ -298,10 +289,8 @@ class ExampleObjective(SingleModelObjective[ExampleAnalysis]):
     ) -> ReflectiveExample:
         del component_name, candidate
         output = trajectory["output"]
-        # TODO: rebuild the entry metrics you need from ``output`` (or stash them there in entry_row).
-        metrics = ExampleEntryMetrics(entry_id=str(output.get("entry_id", "")), value=int(not output.get("passed", 0)))
-        return self.reflective_example(
-            trajectory,
-            feedback=example_feedback(metrics),
-            action_inputs=output.get("action_inputs", []),
-        )
+        # 4. Feedback: one sentence. State what happened on this entry, then what
+        # better looks like. No query text or ids; those go in the evidence slots.
+        value = int(not output.get("passed", 0))  # TODO: read what entry_row stashed on ``output``
+        feedback = f"TODO: what the prompt should do differently (value={value})."
+        return self.reflective_example(trajectory, feedback=feedback, action_inputs=output.get("action_inputs", []))

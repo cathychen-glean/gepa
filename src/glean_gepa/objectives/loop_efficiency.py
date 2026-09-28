@@ -48,12 +48,6 @@ TARGET_LOOP_COUNT = 2
 # ---------------------------------------------------------------------------
 
 
-def loop_efficiency_score(loop_count: int, *, target_loops: int = TARGET_LOOP_COUNT) -> float:
-    """Higher-is-better score: 1.0 at or below the loop cap, decaying as loops grow."""
-    extra = max(0, int(loop_count) - target_loops)
-    return 1.0 / (1.0 + extra)
-
-
 @dataclass(frozen=True)
 class LoopCountEntryMetrics:
     entry_id: str
@@ -65,7 +59,9 @@ class LoopCountEntryMetrics:
 
     @property
     def loop_efficiency(self) -> float:
-        return loop_efficiency_score(self.loop_count, target_loops=self.target_loops)
+        """Higher-is-better score: 1.0 at or below the loop cap, decaying as loops grow."""
+        extra = max(0, self.loop_count - self.target_loops)
+        return 1.0 / (1.0 + extra)
 
     @property
     def passed(self) -> bool:
@@ -91,15 +87,6 @@ class EvalRunLoopCountAnalysis(RunAnalysis[LoopCountMetrics, LoopCountEntryMetri
 
     start_date: date
     end_date: date
-
-
-def loop_reflection_feedback(*, loops: int, target_loops: int) -> str:
-    if loops > target_loops:
-        return (
-            f"Used {loops} loops; stay at or below {target_loops} by batching independent calls "
-            "and stopping once the answer is grounded."
-        )
-    return "Reduce extra agent loops."
 
 
 # ---------------------------------------------------------------------------
@@ -498,13 +485,15 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
     ) -> ReflectiveExample:
         del component_name, candidate
         output = trajectory["output"]
-        return self.reflective_example(
-            trajectory,
-            feedback=loop_reflection_feedback(
-                loops=int(output.get("student_loops", 0)), target_loops=self.target_loops
-            ),
-            action_inputs=output.get("action_inputs", []),
-        )
+        loops = int(output.get("student_loops", 0))
+        if loops > self.target_loops:
+            feedback = (
+                f"Used {loops} loops; stay at or below {self.target_loops} by batching independent calls "
+                "and stopping once the answer is grounded."
+            )
+        else:
+            feedback = "Reduce extra agent loops."
+        return self.reflective_example(trajectory, feedback=feedback, action_inputs=output.get("action_inputs", []))
 
     # --- cache -------------------------------------------------------------
 

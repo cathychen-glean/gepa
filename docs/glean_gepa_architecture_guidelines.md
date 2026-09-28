@@ -133,8 +133,8 @@ the same layout as the five shipped objectives, top to bottom:
    `aggregate(eval_ids, per_entry) -> Aggregate`.
 3. **Source.** Agentspan: one SQL query returning one row per entry, passed to
    `fetch_agentspan_analysis`. EvalCLI: one call, then `build_analysis`.
-4. **Feedback.** One function returning the sentence the reflector reads for a
-   failing entry.
+4. **Feedback.** The sentence the reflector reads for a failing entry, built
+   inline in `build_reflective_example`.
 5. **Objective class.** `SingleModelObjective[Analysis]` or
    `TeacherStudentObjective[Analysis]`, with the hooks below.
 
@@ -148,7 +148,7 @@ template marks where each goes.
 | What is one entry, and when has it passed? | `EntryMetrics.passed` / `.score` |
 | What does the run score, and which field is `0` while telemetry is still landing? | the aggregate dataclass; `pending_count` on the class |
 | Where do the rows come from? | `build_*_per_entry_query` + `fetch_agentspan_analysis`, or one EvalCLI call + `build_analysis` |
-| What should the prompt do differently for a failing entry? | `*_feedback` → `build_reflective_example` |
+| What should the prompt do differently for a failing entry? | the `feedback` string built inline in `build_reflective_example` |
 
 ### Files you touch
 

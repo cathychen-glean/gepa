@@ -14,7 +14,7 @@ Three decisions, top to bottom:
    ``passed`` / ``score``? (``ExampleEntryMetrics``)
 2. **The aggregate.** What does the run score, and which field is 0 while the
    eval is still running? (``ExampleMetrics``, ``pending_count``)
-3. **The feedback.** One sentence for the reflector. (``example_feedback``)
+3. **The feedback.** One sentence for the reflector. (inline in ``build_reflective_example``)
 
 For a teacher/student pair backed by EvalCLI, see
 ``objectives/agentic_preference.py``.
@@ -110,15 +110,6 @@ def fetch_example_analysis(evalcli: Any, *, eval_id: str) -> ExampleAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# 3. Feedback for the reflector
-# ---------------------------------------------------------------------------
-
-
-def example_feedback(metrics: ExampleEntryMetrics) -> str:
-    return f"TODO: what the prompt should do differently (value={metrics.value:.2f})."
-
-
-# ---------------------------------------------------------------------------
 # Objective
 # ---------------------------------------------------------------------------
 
@@ -206,7 +197,8 @@ class ExampleObjective(SingleModelObjective[ExampleAnalysis]):
         self, component_name: str, trajectory: SingleModelALTrajectory, candidate: dict[str, str]
     ) -> ReflectiveExample:
         del component_name, candidate
-        output = trajectory["output"]
+        # 3. Feedback: one sentence. State what happened on this entry, then what
+        # better looks like. No query text or ids; those go in the evidence slots.
         score = float(trajectory.get("objective_scores", {}).get(self.name, 0.0))
-        metrics = ExampleEntryMetrics(entry_id=str(output.get("entry_id", "")), value=score)
-        return self.reflective_example(trajectory, feedback=example_feedback(metrics))
+        feedback = f"TODO: what the prompt should do differently (score={score:.2f})."
+        return self.reflective_example(trajectory, feedback=feedback)
