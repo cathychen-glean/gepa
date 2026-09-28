@@ -11,7 +11,7 @@ A new util module supplies:
 
 * an ``EntryMetrics`` dataclass satisfying :class:`EntryMetricsLike`
 * ``parse_row(row) -> EntryMetrics | None``
-* ``aggregate(eval_ids, per_entry) -> A`` for its own aggregate dataclass
+* ``aggregate(per_entry) -> A`` for its own aggregate dataclass
 * ``is_high_signal(metrics) -> bool``
 
 and calls :func:`build_analysis`. Everything else here is reused as-is.
@@ -168,6 +168,16 @@ def parse_rows(rows: Iterable[Mapping[str, Any]], parse_row: Callable[[Mapping[s
     return per_entry
 
 
+def pass_rate(per_entry: Mapping[str, E]) -> float:
+    """Fraction of entries that ``passed``; ``0.0`` for an empty run."""
+    return (sum(1 for m in per_entry.values() if m.passed) / len(per_entry)) if per_entry else 0.0
+
+
+def mean_score(per_entry: Mapping[str, E]) -> float:
+    """Mean of per-entry ``score``; ``0.0`` for an empty run."""
+    return (sum(m.score for m in per_entry.values()) / len(per_entry)) if per_entry else 0.0
+
+
 def select_high_signal(
     per_entry: Mapping[str, E], is_high_signal: Callable[[E], bool] | None = None
 ) -> tuple[str, ...]:
@@ -180,7 +190,7 @@ def build_analysis(
     *,
     eval_ids: Sequence[str],
     per_entry: Mapping[str, E],
-    aggregate: Callable[[tuple[str, ...], Mapping[str, E]], A],
+    aggregate: Callable[[Mapping[str, E]], A],
     is_high_signal: Callable[[E], bool] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -196,7 +206,7 @@ def build_analysis(
     cls: type[RunAnalysis[A, E]] = PairedRunAnalysis if paired else RunAnalysis
     return cls(
         eval_ids=ids,
-        aggregate=aggregate(ids, entries),
+        aggregate=aggregate(entries),
         per_entry=entries,
         high_signal_entry_ids=select_high_signal(entries, is_high_signal),
         start_date=start_date,
@@ -207,7 +217,7 @@ def build_analysis(
 def empty_analysis(
     *,
     eval_ids: Sequence[str],
-    aggregate: Callable[[tuple[str, ...], Mapping[str, E]], A],
+    aggregate: Callable[[Mapping[str, E]], A],
     start_date: date | None = None,
     end_date: date | None = None,
     paired: bool = False,

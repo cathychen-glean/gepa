@@ -41,7 +41,7 @@ from glean_gepa.objectives.utils.agentspan_query import (
     EVAL_ENTRY_ID_EXPR,
     wildcard_shard_filter,
 )
-from glean_gepa.objectives.utils.core import RunAnalysis, log_analysis
+from glean_gepa.objectives.utils.core import RunAnalysis, log_analysis, pass_rate
 from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
@@ -75,7 +75,6 @@ class ExampleEntryMetrics:
 class ExampleMetrics:
     """TODO: the whole-run aggregate. ``example_rate`` must match ``EXAMPLE_OBJECTIVE``."""
 
-    eval_id: str
     compared_entries: int
     passed_entries: int
     example_rate: float
@@ -101,19 +100,14 @@ def parse_example_entry(row: Mapping[str, Any]) -> ExampleEntryMetrics | None:
     return ExampleEntryMetrics(entry_id=entry_id, value=int(row.get("value") or 0))  # TODO
 
 
-def aggregate_example_metrics(
-    eval_ids: tuple[str, ...], per_entry: Mapping[str, ExampleEntryMetrics], dropped_rows: int = 0
-) -> ExampleMetrics:
+def aggregate_example_metrics(per_entry: Mapping[str, ExampleEntryMetrics], dropped_rows: int = 0) -> ExampleMetrics:
     # ``dropped_rows`` is how many rows ``filter_rows`` removed. Surface it on the
     # aggregate if it matters for your signal; tool_match does.
     del dropped_rows
-    compared = len(per_entry)
-    passed = sum(1 for m in per_entry.values() if m.passed)
     return ExampleMetrics(
-        eval_id=eval_ids[-1],
-        compared_entries=compared,
-        passed_entries=passed,
-        example_rate=(passed / compared) if compared else 0.0,
+        compared_entries=len(per_entry),
+        passed_entries=sum(1 for m in per_entry.values() if m.passed),
+        example_rate=pass_rate(per_entry),  # or mean_score(per_entry) for a continuous score
     )
 
 

@@ -130,7 +130,8 @@ the same layout as the five shipped objectives, top to bottom:
 1. **Types.** One `EntryMetrics` dataclass with `entry_id`, `passed`, `score`;
    one aggregate dataclass; the `Analysis` frame alias.
 2. **Parse and reduce.** `parse_row(row) -> EntryMetrics | None` and
-   `aggregate(eval_ids, per_entry) -> Aggregate`.
+   `aggregate(per_entry) -> Aggregate`; `pass_rate` and `mean_score` in `utils.core`
+   cover the two common reductions.
 3. **Source.** Agentspan: one SQL query returning one row per entry, passed to
    `fetch_agentspan_analysis`. EvalCLI: one call, then `build_analysis`.
 4. **Feedback.** The sentence the reflector reads for a failing entry, built

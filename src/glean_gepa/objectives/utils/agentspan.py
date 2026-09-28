@@ -160,7 +160,7 @@ def fetch_agentspan_analysis(
     bounds_sql: str,
     per_entry_sql: str,
     parse_row: Callable[[Row], E | None],
-    aggregate: Callable[[tuple[str, ...], Mapping[str, E], int], A],
+    aggregate: Callable[[Mapping[str, E], int], A],
     aggregate_sql: str | None = None,
     parse_aggregate_row: Callable[[Row | None], A] | None = None,
     include_per_entry: bool = True,
@@ -180,7 +180,7 @@ def fetch_agentspan_analysis(
     source, e.g. EvalCLI judge scores) when given; pick ``is_high_signal`` ids;
     ``enrich`` those entries from traces when given; ``aggregate``.
 
-    ``aggregate`` receives ``(eval_ids, per_entry, dropped_rows)`` so
+    ``aggregate`` receives ``(per_entry, dropped_rows)`` so
     objectives that exclude rows can report how many. All SQL strings get the
     date parameters and :func:`eval_id_params` automatically; pass anything
     else via ``extra_params``.
@@ -201,10 +201,10 @@ def fetch_agentspan_analysis(
         raise ValueError("aggregate_sql and parse_aggregate_row must be given together")
     split_aggregate: dict[str, A] = {}
 
-    def agg(eval_ids_: tuple[str, ...], per_entry: Mapping[str, E], dropped: int = 0) -> A:
+    def agg(per_entry: Mapping[str, E], dropped: int = 0) -> A:
         if "value" in split_aggregate:
             return split_aggregate["value"]
-        return aggregate(eval_ids_, per_entry, dropped)
+        return aggregate(per_entry, dropped)
 
     def per_entry_params(s: date, e: date) -> list[QueryParameter]:
         return [*id_params, *date_params("start_date", "end_date", s, e), *extras]
@@ -225,14 +225,14 @@ def fetch_agentspan_analysis(
         )
         if window is None:
             split_aggregate["value"] = parse_aggregate_row(None)
-            return empty_analysis(eval_ids=ids, aggregate=lambda i, p: agg(i, p, 0), paired=paired)
+            return empty_analysis(eval_ids=ids, aggregate=agg, paired=paired)
         start_date, resolved_end, agg_rows = window
         split_aggregate["value"] = parse_aggregate_row(agg_rows[0] if agg_rows else None)
         if not include_per_entry:
             return build_analysis(
                 eval_ids=ids,
                 per_entry={},
-                aggregate=lambda i, p: agg(i, p, 0),
+                aggregate=agg,
                 start_date=start_date,
                 end_date=resolved_end,
                 paired=paired,
@@ -249,7 +249,7 @@ def fetch_agentspan_analysis(
             end_date=end_date,
         )
         if result is None:
-            return empty_analysis(eval_ids=ids, aggregate=lambda i, p: agg(i, p, 0), paired=paired)
+            return empty_analysis(eval_ids=ids, aggregate=agg, paired=paired)
         start_date, resolved_end, rows = result
     kept = filter_rows(rows) if filter_rows is not None else rows
     dropped = len(rows) - len(kept)
@@ -262,7 +262,7 @@ def fetch_agentspan_analysis(
     return build_analysis(
         eval_ids=ids,
         per_entry=per_entry,
-        aggregate=lambda i, p: agg(i, p, dropped),
+        aggregate=lambda p: agg(p, dropped),
         is_high_signal=is_high_signal,
         start_date=start_date,
         end_date=resolved_end,

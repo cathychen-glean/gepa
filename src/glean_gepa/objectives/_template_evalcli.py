@@ -30,7 +30,7 @@ from glean_gepa.adapter_types import SingleModelALRolloutOutput, SingleModelALTr
 from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
 from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, SingleModelObjective
-from glean_gepa.objectives.utils.core import RunAnalysis, build_analysis, empty_analysis, log_analysis
+from glean_gepa.objectives.utils.core import RunAnalysis, build_analysis, empty_analysis, log_analysis, pass_rate
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
 # TODO: the score key. Also the signal name in the pack YAML.
@@ -62,7 +62,6 @@ class ExampleEntryMetrics:
 class ExampleMetrics:
     """TODO: the whole-run aggregate. ``example_rate`` must match ``EXAMPLE_OBJECTIVE``."""
 
-    eval_id: str
     compared_entries: int
     passed_entries: int
     example_rate: float
@@ -87,16 +86,11 @@ def parse_example_entry(run_entry: Mapping[str, Any]) -> ExampleEntryMetrics | N
     return ExampleEntryMetrics(entry_id=entry_id, value=float(raw))
 
 
-def aggregate_example_metrics(
-    eval_ids: tuple[str, ...], per_entry: Mapping[str, ExampleEntryMetrics]
-) -> ExampleMetrics:
-    compared = len(per_entry)
-    passed = sum(1 for m in per_entry.values() if m.passed)
+def aggregate_example_metrics(per_entry: Mapping[str, ExampleEntryMetrics]) -> ExampleMetrics:
     return ExampleMetrics(
-        eval_id=eval_ids[-1],
-        compared_entries=compared,
-        passed_entries=passed,
-        example_rate=(passed / compared) if compared else 0.0,
+        compared_entries=len(per_entry),
+        passed_entries=sum(1 for m in per_entry.values() if m.passed),
+        example_rate=pass_rate(per_entry),  # or mean_score(per_entry) for a continuous score
     )
 
 

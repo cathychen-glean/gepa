@@ -28,8 +28,8 @@ class _Entry:
         return 1.0 if self.passed else 0.5
 
 
-def _agg(ids: tuple[str, ...], per_entry: Any, dropped: int = 0) -> dict[str, Any]:
-    return {"ids": ids, "n": len(per_entry), "dropped": dropped}
+def _agg(per_entry: Any, dropped: int = 0) -> dict[str, Any]:
+    return {"n": len(per_entry), "dropped": dropped}
 
 
 # --- core -------------------------------------------------------------------
@@ -51,7 +51,7 @@ def test_build_analysis_frame_and_derived_properties():
     analysis = core.build_analysis(
         eval_ids=("t", "s"),
         per_entry=per_entry,
-        aggregate=lambda ids, pe: _agg(ids, pe),
+        aggregate=_agg,
         start_date=date(2026, 1, 1),
         end_date=date(2026, 1, 2),
         paired=True,
@@ -61,14 +61,14 @@ def test_build_analysis_frame_and_derived_properties():
     assert analysis.high_signal_entry_ids == ("b", "c")  # default = not passed, sorted
     assert (analysis.compared_entries, analysis.passed_entries) == (3, 1)
     assert analysis.pass_rate == pytest.approx(1 / 3)
-    assert analysis.aggregate == {"ids": ("t", "s"), "n": 3, "dropped": 0}
+    assert analysis.aggregate == {"n": 3, "dropped": 0}
 
 
 def test_build_analysis_honours_custom_high_signal_predicate():
     analysis = core.build_analysis(
         eval_ids=("s",),
         per_entry={"a": _Entry("a", 0), "b": _Entry("b", 5)},
-        aggregate=lambda ids, pe: None,
+        aggregate=lambda pe: None,
         is_high_signal=lambda m: m.value > 3,
     )
     assert analysis.high_signal_entry_ids == ("b",)
@@ -76,7 +76,7 @@ def test_build_analysis_honours_custom_high_signal_predicate():
 
 
 def test_empty_analysis_is_pending_shaped():
-    analysis = core.empty_analysis(eval_ids=("s",), aggregate=lambda ids, pe: _agg(ids, pe))
+    analysis = core.empty_analysis(eval_ids=("s",), aggregate=_agg)
     assert analysis.compared_entries == 0
     assert analysis.pass_rate == 0.0
     assert analysis.high_signal_entry_ids == ()
@@ -90,16 +90,16 @@ def test_parse_rows_skips_none_and_keeps_last_per_entry():
 
 
 def test_require_compared_entries_raises_with_hint():
-    empty = core.empty_analysis(eval_ids=("t", "s"), aggregate=lambda ids, pe: None, paired=True)
+    empty = core.empty_analysis(eval_ids=("t", "s"), aggregate=lambda pe: None, paired=True)
     with pytest.raises(core.NoComparedEntriesError, match=r"eval\(s\) t, s\. wait for ingest"):
         core.require_compared_entries(empty, hint="wait for ingest")
-    full = core.build_analysis(eval_ids=("s",), per_entry={"a": _Entry("a", 0)}, aggregate=lambda i, p: None)
+    full = core.build_analysis(eval_ids=("s",), per_entry={"a": _Entry("a", 0)}, aggregate=lambda p: None)
     core.require_compared_entries(full, hint="unused")  # no raise
 
 
 def test_log_analysis_caps_entries_at_evidence_limit(capsys):
     per_entry = {f"e{i}": _Entry(f"e{i}", 1) for i in range(core.EVIDENCE_LIMIT + 3)}
-    analysis = core.build_analysis(eval_ids=("run",), per_entry=per_entry, aggregate=lambda i, p: None)
+    analysis = core.build_analysis(eval_ids=("run",), per_entry=per_entry, aggregate=lambda p: None)
     core.log_analysis(analysis, label="X", headline="hello", entry_line=lambda m: f"v={m.value}")
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "[X] run: hello"
@@ -188,7 +188,7 @@ def test_fetch_agentspan_analysis_runs_every_hook_in_order():
         end_date=date(2026, 8, 10),
     )
     assert calls == ["filter", "parse", "parse", "post_parse", "enrich:b,z"]
-    assert analysis.aggregate == {"ids": ("s",), "n": 3, "dropped": 1}
+    assert analysis.aggregate == {"n": 3, "dropped": 1}
     assert analysis.high_signal_entry_ids == ("b", "z")
     assert analysis.per_entry["b"].action_inputs == ("cmd",)
     assert analysis.per_entry["a"].action_inputs == ()

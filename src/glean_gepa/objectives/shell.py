@@ -531,7 +531,7 @@ def fetch_eval_run_shell_tool_error_analysis(
         ),
         include_per_entry=include_per_entry,
         parse_row=parse,
-        aggregate=lambda _ids, per_entry, _dropped: aggregate_entry_metrics(per_entry),
+        aggregate=lambda per_entry, _dropped: aggregate_entry_metrics(per_entry),
         lookback_days=lookback_days,
         end_date=end_date,
     )

@@ -32,7 +32,7 @@ from glean_gepa.objectives.utils.agentspan_query import (
     default_date_range,
     wildcard_shard_filter,
 )
-from glean_gepa.objectives.utils.core import RunAnalysis, log_analysis
+from glean_gepa.objectives.utils.core import RunAnalysis, log_analysis, mean_score
 from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.reflection_prompts import CONDITIONAL_PRESERVE_RULE
@@ -129,16 +129,12 @@ def parse_loop_count_entry_metrics(
 
 def aggregate_loop_count_metrics(per_entry: Mapping[str, LoopCountEntryMetrics]) -> LoopCountMetrics:
     compared = len(per_entry)
-    matching = sum(1 for metrics in per_entry.values() if metrics.loop_efficiency >= 1.0)
-    mean_loops = (sum(metrics.loop_count for metrics in per_entry.values()) / compared) if compared else 0.0
-    mean_correctness = (sum(metrics.correctness for metrics in per_entry.values()) / compared) if compared else 0.0
-    efficiency = (sum(metrics.loop_efficiency for metrics in per_entry.values()) / compared) if compared else 0.0
     return LoopCountMetrics(
         compared_entries=compared,
-        matching_entries=matching,
-        mean_loop_count=mean_loops,
-        loop_efficiency=efficiency,
-        mean_correctness=mean_correctness,
+        matching_entries=sum(1 for m in per_entry.values() if m.passed),
+        mean_loop_count=(sum(m.loop_count for m in per_entry.values()) / compared) if compared else 0.0,
+        loop_efficiency=mean_score(per_entry),
+        mean_correctness=(sum(m.correctness for m in per_entry.values()) / compared) if compared else 0.0,
     )
 
 
@@ -232,7 +228,7 @@ def fetch_eval_run_loop_count_analysis(
         bounds_sql=bounds_query(eval_id_predicate="= @eval_id", agentspan_table=agentspan_table),
         per_entry_sql=build_loop_count_per_entry_query(agentspan_table=agentspan_table),
         parse_row=parse,
-        aggregate=lambda _ids, per_entry, _dropped: aggregate_loop_count_metrics(per_entry),
+        aggregate=lambda per_entry, _dropped: aggregate_loop_count_metrics(per_entry),
         is_high_signal=lambda m: m.loop_efficiency < 1.0,
         post_parse=overlay if evalcli is not None else None,
         enrich=enrich if evalcli is not None and include_action_inputs else None,

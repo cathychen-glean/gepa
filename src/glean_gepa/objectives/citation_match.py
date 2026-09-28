@@ -35,6 +35,7 @@ from glean_gepa.objectives.utils.core import (
     NoComparedEntriesError,
     PairedRunAnalysis,
     log_analysis,
+    pass_rate,
 )
 from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
 from glean_gepa.prompt_constants import RULES_EXT_KEY, WRITING_CODE_KEY
@@ -135,12 +136,10 @@ def parse_citation_match_entry_metrics(row: Mapping[str, Any]) -> CitationMatchE
 
 
 def aggregate_citation_match_metrics(per_entry: Mapping[str, CitationMatchEntryMetrics]) -> CitationMatchMetrics:
-    compared = len(per_entry)
-    matching = sum(1 for metrics in per_entry.values() if metrics.citations_match)
     return CitationMatchMetrics(
-        compared_entries=compared,
-        matching_entries=matching,
-        citation_match_rate=(matching / compared) if compared else 0.0,
+        compared_entries=len(per_entry),
+        matching_entries=sum(1 for m in per_entry.values() if m.passed),
+        citation_match_rate=pass_rate(per_entry),
     )
 
 
@@ -252,7 +251,7 @@ def fetch_eval_run_citation_match_analysis(
         bounds_sql=bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", agentspan_table=agentspan_table),
         per_entry_sql=build_citation_match_per_entry_query(agentspan_table=agentspan_table),
         parse_row=parse,
-        aggregate=lambda _ids, per_entry, _dropped: aggregate_citation_match_metrics(per_entry),
+        aggregate=lambda per_entry, _dropped: aggregate_citation_match_metrics(per_entry),
         is_high_signal=lambda m: not m.citations_match,
         enrich=enrich if evalcli is not None and include_action_inputs else None,
         lookback_days=lookback_days,

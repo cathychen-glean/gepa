@@ -40,6 +40,7 @@ from glean_gepa.objectives.utils.core import (
     NoComparedEntriesError,
     PairedRunAnalysis,
     log_analysis,
+    pass_rate,
 )
 from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
 from glean_gepa.objectives.utils.tool_names import (
@@ -126,12 +127,10 @@ def parse_tool_match_entry_metrics(
 def aggregate_tool_match_metrics(
     per_entry: Mapping[str, ToolMatchEntryMetrics], *, excluded_failed_runs: int = 0
 ) -> ToolMatchMetrics:
-    compared = len(per_entry)
-    matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
     return ToolMatchMetrics(
-        compared_entries=compared,
-        matching_entries=matching,
-        tool_match_rate=(matching / compared) if compared else 0.0,
+        compared_entries=len(per_entry),
+        matching_entries=sum(1 for m in per_entry.values() if m.passed),
+        tool_match_rate=pass_rate(per_entry),
         excluded_failed_runs=excluded_failed_runs,
     )
 
@@ -231,9 +230,7 @@ def fetch_eval_run_tool_match_analysis(
         metrics = parse_tool_match_entry_metrics(row, skip_tools=skip_tools)
         return metrics if metrics.entry_id else None
 
-    def aggregate(
-        _ids: tuple[str, ...], per_entry: Mapping[str, ToolMatchEntryMetrics], dropped: int
-    ) -> ToolMatchMetrics:
+    def aggregate(per_entry: Mapping[str, ToolMatchEntryMetrics], dropped: int) -> ToolMatchMetrics:
         return aggregate_tool_match_metrics(per_entry, excluded_failed_runs=dropped)
 
     def enrich(
