@@ -1,12 +1,23 @@
 """Template: a single-model objective whose signal comes from EvalCLI, not BigQuery.
 
-Use this when the eval run already carries the signal (a judge dimension, a
-per-entry flag, a downvote count) and you only need to read it out of the
-analysis view. There is no SQL, no shard window, and no trace hydration.
+Which template?
 
-Copy to ``objectives/<signal>.py`` and fill every ``TODO``. The file is
-importable and pyright-clean as-is. Nothing here is registered; add an
-``ObjectiveSpec`` to ``objectives/registry.py`` and a pack YAML when ready.
+    Does the eval run's analysis view already have your number?
+
+      yes -> _template_evalcli.py    a judge score, a count, or a yes/no the run
+                                     already recorded per entry. No SQL.
+      no  -> _template_agentspan.py  the signal is in span telemetry: which tools
+                                     ran, how many loops, errors, citations. One
+                                     SQL query.
+
+    Not sure? Call ``evalcli.get_analysis_view(eval_id)`` on a recent run. If the
+    field you would score is in an entry's ``metadata`` or a judge's ``outputs``,
+    it is evalcli.
+
+Copy to ``objectives/<signal>.py`` and fill every ``TODO``. There is no SQL,
+no shard window, and no trace hydration. The file is importable and
+pyright-clean as-is. Nothing here is registered; add an ``ObjectiveSpec`` to
+``objectives/registry.py`` and a pack YAML when ready.
 
 Three decisions, top to bottom:
 

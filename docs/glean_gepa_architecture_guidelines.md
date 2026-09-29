@@ -119,10 +119,17 @@ reflection frame are shared; you write the parts that know your signal.
 Two complete, importable objectives live beside the real ones. Copy the one
 that matches where your signal comes from, rename, and fill the `TODO`s:
 
-| Template | Source | Lines | Use when |
+Start from the template that matches where the signal lives. The question is:
+does the eval run's analysis view already have your number?
+
+| Answer | Template | Lines | Examples |
 |---|---|---|---|
-| `objectives/_template_agentspan.py` | BigQuery `agentspan_*` spans | ~300 | The signal is in span telemetry: tool calls, loop counts, errors, citations. |
-| `objectives/_template_evalcli.py` | EvalCLI analysis view | ~210 | The eval run already carries the signal: a judge dimension, a per-entry flag, a downvote. |
+| Yes: a judge score, a count, or a yes/no the run already recorded per entry | `objectives/_template_evalcli.py` | ~210 | agentic_preference; a downvote rate; any judge dimension |
+| No: the signal is in span telemetry | `objectives/_template_agentspan.py` | ~300 | tool_match, citation_match, loop_efficiency, shell |
+
+Not sure? Call `evalcli.get_analysis_view(eval_id)` on a recent run. If the field
+you would score is in an entry's `metadata` or a judge's `outputs`, it is evalcli.
+Both templates open with this same question.
 
 Both pass `check_objective_contract` and pyright as-is. Each is one file in
 the same layout as the five shipped objectives, top to bottom:
