@@ -180,5 +180,9 @@ search:
   offspring_count: 5
   reflection_samples: 25
   reflection_hamming_distance_k: null
-  # Live Waldo prompt is ~6.3k tokens; runner raises this to the module budgets anyway.
-  global_token_cap: 8192
+  # Whole-prompt cap over WALDO_SYSTEM (5919 tok, not editable) + WALDO_TOOL_USAGE
+  # (2025 tok seed, 2560 budget). The seed is 7944 tok, so 8192 left 248 tok of growth
+  # and rejected every variant the module budget allowed ("No children passed budget
+  # check"). 9216 > 5919 + 2560, so the per-module budget and the 1.2 growth rule are
+  # the binding limits, as intended. The runner only raises this to max(module budgets).
+  global_token_cap: 9216

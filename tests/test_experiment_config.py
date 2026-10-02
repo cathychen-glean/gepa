@@ -414,3 +414,27 @@ def test_waldo_config_runs_post_search_eval_on_pinned_internal_val():
     # Two pinned train versions so a childless generation does not exhaust the schedule.
     assert config.data["train_eval_versions"] == [20261001, 20260908]
     assert not set(config.data["train_eval_versions"]) & set(config.data["val_eval_versions"])
+
+
+def test_waldo_global_token_cap_leaves_room_for_the_tool_module_budget():
+    """The global cap must not bind before the per-module budget does."""
+    import json
+
+    from glean_gepa.al_adapter import approx_token_len
+    from glean_gepa.waldo_prompt_constants import WALDO_TOOL_USAGE_TOKEN_BUDGET
+
+    config = load_experiment_config("teacher_student_waldo")
+    seed = json.loads(Path(config.run["seed_candidate"]).read_text())
+
+    def find(obj, key):
+        if isinstance(obj, dict):
+            if isinstance(obj.get(key), str):
+                return obj[key]
+            for value in obj.values():
+                found = find(value, key)
+                if found:
+                    return found
+        return None
+
+    system_tokens = approx_token_len(find(seed, "WALDO_SYSTEM"))
+    assert config.search["global_token_cap"] >= system_tokens + WALDO_TOOL_USAGE_TOKEN_BUDGET
