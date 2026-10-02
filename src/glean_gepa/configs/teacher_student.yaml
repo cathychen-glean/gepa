@@ -19,7 +19,10 @@ run:
 models:
   student: claude_sonnet
   teacher: claude_opus
-  reflection: OPEN_AI:GPT5_LATEST
+  # glean-dev QE is on customer key + LiteLLM custom provider since 2026-09-30; OPEN_AI:*
+  # is not enabled there ("GPT5_LATEST not enabled in any provider"). GPT5_6_LUNA is
+  # aliased to gpt-5.1 on that proxy. Use OPEN_AI:GPT5_LATEST only on a Glean-key instance.
+  reflection: CUSTOM:GPT5_6_LUNA
 
 data:
   eval_set_name: Glean Chat V2 Medium

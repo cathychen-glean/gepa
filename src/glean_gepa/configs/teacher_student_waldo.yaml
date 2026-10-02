@@ -41,7 +41,10 @@ models:
   # TODO(gap-1): confirm with the team which deployment they are tuning for.
   student: waldo:OPEN_AI:GPT6_LUNA:none
   teacher: waldo:OPEN_AI:GPT6_1_SOL:high
-  reflection: OPEN_AI:GPT5_LATEST
+  # glean-dev QE is on customer key + LiteLLM custom provider since 2026-09-30; OPEN_AI:*
+  # is not enabled there ("GPT5_LATEST not enabled in any provider"). GPT5_6_LUNA is
+  # aliased to gpt-5.1 on that proxy. Use OPEN_AI:GPT5_LATEST only on a Glean-key instance.
+  reflection: CUSTOM:GPT5_6_LUNA
 
 eval:
   # EvalCLI --runner-type. Waldo evals run on the standard Glean Chat runner.
