@@ -285,7 +285,7 @@ def test_length_rule_states_a_character_count():
 
 
 def test_module_char_budget_allows_thirty_percent_growth():
-    """Waldo's 8102-char module: consolidated variants landed 9091-10594 chars."""
+    """Dense ~8k-char rule modules: consolidated variants land 10-30% over the seed."""
     current = "x" * 8102
     assert module_char_budget(current) == int(8102 * 1.3) == 10532
     # Token cap still wins when it is lower.

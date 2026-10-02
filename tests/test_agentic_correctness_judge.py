@@ -38,7 +38,38 @@ from glean_gepa.judge_metrics_util import (
 )
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
-WALDO_CONFIG = Path(__file__).resolve().parents[1] / "src/glean_gepa/configs/teacher_student_waldo.yaml"
+# Minimal teacher_student experiment: telemetry primary, agentic-correctness judge used
+# only as a validation gate (not in composite or screening).
+_GATE_ONLY_CONFIG = """schema_version: 1
+mode: teacher_student
+signals:
+  - name: tool_alignment
+    source: tool_match
+    lookback_days: 7
+  - name: agentic_correctness_rate
+    source: cortex_judge
+    type: AGENTIC_CORRECTNESS_JUDGE
+    kind: pairwise
+objective:
+  primary: tool_alignment
+  composite:
+    tool_alignment: 1.0
+  params:
+    tool_alignment: {}
+  validation:
+    - metric: agentic_correctness_rate
+      min: 0.48
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: tool_alignment
+"""
+
+
+def _gate_only_config(tmp_path: Path):
+    path = tmp_path / "gate_only.yaml"
+    path.write_text(_GATE_ONLY_CONFIG)
+    return load_experiment_config(path)
 
 
 def test_spec_is_registered_as_pairwise_gate():
@@ -86,25 +117,12 @@ def test_per_entry_scores_normalize_on_0_10():
     assert scores == {"e1": 0.7, "e2": 0.5}
 
 
-def test_waldo_config_wires_gate_and_screen():
-    config = load_experiment_config(WALDO_CONFIG)
-    judges = {j.name: j for j in pairwise_judges(config)}
-    judge = judges[CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-    assert judge.judge_type == AGENTIC_CORRECTNESS_JUDGE_TYPE
-    assert judge.cortex_judge_type == AGENTIC_JUDGE_TYPE
-    assert judge.judge_skill_name == AGENTIC_CORRECTNESS_JUDGE_NAME
-    assert json.loads(judge.run_params)["judge_skill_name"] == AGENTIC_CORRECTNESS_JUDGE_NAME
-    # 4.8 on the judge's 0-10 scale (5 = parity) -> 0.48 normalized. Validation only.
-    assert customer_validation_gates(config) == {CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.48}
-    assert screening_weights(config) == {}
-    assert "floors" not in config.screening
 
-
-def test_teacher_student_adapter_asks_cortex_for_agentic_judge_with_correctness_skill():
+def test_teacher_student_adapter_asks_cortex_for_agentic_judge_with_correctness_skill(tmp_path):
     evalcli = MagicMock()
     evalcli.find_judge_run_id.return_value = None
     evalcli.create_judge_run.return_value = "judge-corr"
-    config = load_experiment_config(WALDO_CONFIG)
+    config = _gate_only_config(tmp_path)
     adapter = TeacherStudentAdapter(
         runner=ALRunner(evalcli=evalcli),
         teacher_model="gpt",
@@ -214,8 +232,8 @@ def _pair(*, focused: bool = False, validation: bool = False):
     return _StartedPair(al_data_inst=inst, teacher_eval_id="t", student_eval_id="s")  # type: ignore[arg-type]
 
 
-def _waldo_adapter(**overrides) -> TeacherStudentAdapter:
-    config = load_experiment_config(WALDO_CONFIG)
+def _gate_only_adapter(tmp_path: Path, **overrides) -> TeacherStudentAdapter:
+    config = _gate_only_config(tmp_path)
     kwargs = dict(
         runner=ALRunner(evalcli=MagicMock()),
         teacher_model="gpt",
@@ -232,23 +250,23 @@ def _judge_names(adapter: TeacherStudentAdapter, pair) -> list[str]:
     return [j.name for j in adapter._pairwise_judges_for_pair(pair)]
 
 
-def test_validation_only_judge_runs_on_val_evals_only():
+def test_validation_only_judge_runs_on_val_evals_only(tmp_path):
     """A judge used only as a validation gate costs one run per candidate: on val."""
-    adapter = _waldo_adapter()
+    adapter = _gate_only_adapter(tmp_path)
     assert _judge_names(adapter, _pair(validation=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
     assert _judge_names(adapter, _pair()) == []  # full-train eval
     assert _judge_names(adapter, _pair(focused=True)) == []  # focused screen slice
 
 
-def test_judge_in_composite_runs_on_train_evals():
-    adapter = _waldo_adapter(composite_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
+def test_judge_in_composite_runs_on_train_evals(tmp_path):
+    adapter = _gate_only_adapter(tmp_path, composite_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
     assert _judge_names(adapter, _pair()) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
     assert _judge_names(adapter, _pair(validation=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
     # Composite is scored on full evals, not on the screen slice.
     assert _judge_names(adapter, _pair(focused=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
 
 
-def test_weighted_screen_keeps_named_judge_on_focused_slice():
-    adapter = _waldo_adapter(screening_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
+def test_weighted_screen_keeps_named_judge_on_focused_slice(tmp_path):
+    adapter = _gate_only_adapter(tmp_path, screening_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
     assert _judge_names(adapter, _pair(focused=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
     assert _judge_names(adapter, _pair()) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]

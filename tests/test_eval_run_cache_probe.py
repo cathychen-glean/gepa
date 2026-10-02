@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 from glean_gepa.al_adapter import ALRunner
 
-KEY = ["waldo:m", "h", "Set", "v1", "gepa", "scio-prod"]
+KEY = ["gpt", "h", "Set", "v1", "gepa", "scio-prod"]
 COMPLETED_ID = "gepa_old_completed"
 INFLIGHT_ID = "gepa_old_inflight"
 
