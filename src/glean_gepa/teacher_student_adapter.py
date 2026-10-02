@@ -178,6 +178,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         pairwise_judges: Sequence[PairwiseJudge] | None = None,
         objective: TeacherStudentObjective | None = None,
         screening_kind: str | None = None,
+        screening_weights: Mapping[str, float] | None = None,
     ):
         self.pointwise_judges = tuple(pointwise_judges) if pointwise_judges is not None else POINTWISE_JUDGES
         self.pairwise_judges = tuple(pairwise_judges) if pairwise_judges is not None else PAIRWISE_JUDGES
@@ -219,6 +220,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             },
             cache_file=cache_file,
         )
+        self.screening_weights = {str(name): float(weight) for name, weight in (screening_weights or {}).items()}
 
     @property
     def bigquery_client(self) -> Any | None:
@@ -455,12 +457,24 @@ class TeacherStudentAdapter(GleanAdapterBase):
         run_params: str,
         base_eval_run_id: str | None = None,
         input_mappings: str | None = None,
+        cortex_judge_type: str | None = None,
+        judge_skill_name: str | None = None,
     ) -> str:
+        """Start or reuse a judge run.
+
+        ``judge_type`` is the adapter's cache key. ``cortex_judge_type`` (default: the
+        same) is what Cortex is asked for; ``judge_skill_name`` disambiguates reuse when
+        several judges share one Cortex type.
+        """
+        cortex_type = cortex_judge_type or judge_type
         cache_key = self._judge_key(eval_id, judge_type, base_eval_run_id)
         judge_run_id = self._judge_runs.get(cache_key)
         if not judge_run_id:
+            # Only pass the skill filter when set, so the call shape (and existing
+            # callers' expectations) stay unchanged for single-skill judge types.
+            skill_filter = {"judge_skill_name": judge_skill_name} if judge_skill_name else {}
             existing = self.runner.evalcli.find_judge_run_id(
-                eval_id, judge_type=judge_type, base_eval_run_id=base_eval_run_id
+                eval_id, judge_type=cortex_type, base_eval_run_id=base_eval_run_id, **skill_filter
             )
             if isinstance(existing, str) and existing:
                 print(f"[{judge_type}] Reusing judge run {existing} for eval {eval_id}")
@@ -468,7 +482,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             else:
                 judge_run_id = self.runner.evalcli.create_judge_run(
                     eval_run_id=eval_id,
-                    judge_type=judge_type,
+                    judge_type=cortex_type,
                     run_params=run_params,
                     base_eval_run_id=base_eval_run_id,
                     input_mappings=input_mappings,
@@ -482,16 +496,23 @@ class TeacherStudentAdapter(GleanAdapterBase):
         return judge_run_id
 
     def _pairwise_judges_for_pair(self, pair: _StartedPair) -> tuple[PairwiseJudge, ...]:
-        """Start every configured pairwise judge, except the correctness-floor split.
+        """Pairwise judges to start for this eval pair.
 
-        ``screening.kind=correctness_floor`` still runs CORRECTNESS on focused
-        screens and AGENTIC on full/val evals. The agentic pack screens with
-        AGENTIC_JUDGE on the high-signal slice instead, so it does not split.
+        Full-train and val evals start every configured judge. Focused screen
+        slices (``eval_entry_ids`` set) start a judge only when the screen reads
+        it: ``screening.kind=correctness_floor`` runs CORRECTNESS there, a pairwise
+        primary (agentic preference) runs itself there, and ``screening.weights`` runs
+        whatever it names. A telemetry primary with a plain fix-rate screen starts
+        no judge on the slice; correctness is gated at validation instead.
         """
-        if self.screening_kind != "correctness_floor":
+        is_focused = bool(pair.al_data_inst.get("eval_entry_ids"))
+        if self.screening_kind == "correctness_floor":
+            wanted_type = CORRECTNESS_JUDGE_TYPE if is_focused else AGENTIC_JUDGE_TYPE
+            return tuple(judge for judge in self.pairwise_judges if judge.judge_type == wanted_type)
+        if not is_focused:
             return self.pairwise_judges
-        wanted_type = CORRECTNESS_JUDGE_TYPE if pair.al_data_inst.get("eval_entry_ids") else AGENTIC_JUDGE_TYPE
-        return tuple(judge for judge in self.pairwise_judges if judge.judge_type == wanted_type)
+        needed = {self.objective.name, *self.screening_weights}
+        return tuple(judge for judge in self.pairwise_judges if judge.name in needed)
 
     def _start_judges(
         self,
@@ -519,6 +540,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
                         run_params=judge.run_params,
                         base_eval_run_id=pair.teacher_eval_id,
                         input_mappings=judge.input_mappings,
+                        cortex_judge_type=judge.cortex_judge_type,
+                        judge_skill_name=judge.judge_skill_name,
                     )
                     pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
@@ -565,9 +588,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
         all_started: list[list[_StartedPair]] = []
         pending_waits: dict[str, str] = {}
         for candidate, batch in items:
-            started, candidate_pending = self._start_batch_evals(
-                cast(list[TeacherStudentALDataInst], batch), candidate
-            )
+            started, candidate_pending = self._start_batch_evals(cast(list[TeacherStudentALDataInst], batch), candidate)
             all_started.append(started)
             pending_waits.update(candidate_pending)
         self._await_judge_metrics(self._wait_pending_evals(pending_waits, all_started))
@@ -640,9 +661,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
             self.objective.build_reflective_example,
             k=k,
         )
-
-    def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
-        return self.objective.high_signal_core_tool_keys(trajectories)
 
     def _finish_batch_evals(
         self,

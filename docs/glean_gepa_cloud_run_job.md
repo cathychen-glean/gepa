@@ -153,7 +153,9 @@ gcloud storage cp data/seed_candidate.json "gs://${RUN_BUCKET}/configs/writing-c
 ```
 
 Then pass the normal runner arguments as a JSON array. The train/validation
-versions are pinned so retries and comparisons remain reproducible.
+versions are pinned so retries and comparisons remain reproducible. A
+`--config <experiment>` argument works here too and supplies these defaults from
+the YAML; any flag listed after it overrides the YAML value.
 
 ```bash
 export RUN_ID=writing-code-20260831-01

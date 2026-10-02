@@ -4,7 +4,7 @@ import pytest
 
 from glean_gepa.al_adapter import Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.objectives.utils.shell_tool_error_util import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.reflection_sampling import (
     deduplicate_reflective_examples,
     is_within_hamming_distance,

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
-from glean_gepa.objectives.utils.tool_match_util import (
+from glean_gepa.objectives.utils.tool_names import (
     first_tool_mismatch_pair,
     first_tool_name,
     scored_tool_sequence,
@@ -128,11 +128,20 @@ def format_high_signal_selection_report(
     if justification:
         lines.append(justification)
     lines.append(f"Selected {selected_count} of {total_mismatch_count} high-signal entries (cap {limit}).")
-    lines.extend(["", "Groups (most frequent first):"])
-    if not selected_groups:
-        lines.append("  (none — every compared entry already matched on first tool)")
-    for index, (teacher_tool, student_tool, count) in enumerate(selected_groups, start=1):
-        lines.append(f"  {index}. teacher={teacher_tool or '(none)'}  student={student_tool or '(none)'}  n={count}")
+    if selected_groups:
+        lines.extend(["", "Groups (most frequent first):"])
+        for index, (teacher_tool, student_tool, count) in enumerate(selected_groups, start=1):
+            lines.append(
+                f"  {index}. teacher={teacher_tool or '(none)'}  student={student_tool or '(none)'}  n={count}"
+            )
+    elif selected_count == 0:
+        lines.extend(
+            [
+                "",
+                "Groups (most frequent first):",
+                "  (none — every compared entry already matched on first tool)",
+            ]
+        )
     lines.append("")
     lines.append("Selected entry_ids: " + (", ".join(selected_entry_ids) if selected_entry_ids else "(none)"))
     if module_entry_ids:

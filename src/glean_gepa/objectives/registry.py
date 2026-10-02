@@ -4,7 +4,7 @@ To add an objective:
 
 1. Implement a ``TeacherStudentObjective`` or ``SingleModelObjective`` subclass.
 2. Append one :class:`ObjectiveSpec` to :data:`BUILTIN_OBJECTIVES` below.
-3. Add a pack YAML under ``configs/packs/`` whose ``signals[].source`` is the spec's ``source``.
+3. Declare a signal in an experiment YAML (``configs/*.yaml``) whose ``signals[].source`` is the spec's ``source``.
 
 Nothing else needs editing. ``base.build_objective`` resolves through this
 module, and :func:`register` rejects a class that does not satisfy the shared
@@ -43,13 +43,13 @@ class ObjectiveSpec:
     mode
         Eval topology that can score this objective.
     source
-        Value a pack YAML puts in ``signals[].source`` to select it.
+        Value an experiment YAML puts in ``signals[].source`` to select it.
     class_path
         ``module:ClassName``. Imported lazily so the catalog can be read
         without importing BigQuery helpers.
-    default_pack
-        Pack loaded when a config names ``mode`` but no ``packs``. Exactly one
-        spec per mode may set this.
+    default
+        Objective used when a config for ``mode`` declares no scorable signal.
+        Exactly one spec per mode must set this.
     summary
         One line for humans and ``--list-objectives`` style output.
     """
@@ -58,7 +58,7 @@ class ObjectiveSpec:
     source: str
     class_path: str
     summary: str
-    default_pack: str | None = None
+    default: bool = False
 
     def load(self) -> type:
         module_name, _, class_name = self.class_path.partition(":")
@@ -76,7 +76,7 @@ BUILTIN_OBJECTIVES: tuple[ObjectiveSpec, ...] = (
         source="tool_match",
         class_path="glean_gepa.objectives.tool_match:FirstToolMatchObjective",
         summary="First tool the student called matches the teacher's.",
-        default_pack="tools",
+        default=True,
     ),
     ObjectiveSpec(
         mode="teacher_student",
@@ -95,13 +95,13 @@ BUILTIN_OBJECTIVES: tuple[ObjectiveSpec, ...] = (
         source="shell_telemetry",
         class_path="glean_gepa.objectives.shell:ShellSuccessObjective",
         summary="Shell tool calls succeed (Agentspan telemetry).",
-        default_pack="shell",
+        default=True,
     ),
     ObjectiveSpec(
         mode="single_model",
         source="loop_telemetry",
-        class_path="glean_gepa.objectives.loop_efficiency:LoopEfficiencyObjective",
-        summary="Student answers within target_loop_count agent loops.",
+        class_path="glean_gepa.objectives.loop:LoopEfficiencyObjective",
+        summary="Student uses fewer agent loops; every loop lowers the score.",
     ),
 )
 
@@ -187,12 +187,12 @@ def load_builtins() -> None:
         return
     defaults_per_mode: dict[str, list[str]] = {}
     for spec in BUILTIN_OBJECTIVES:
-        if spec.default_pack:
+        if spec.default:
             defaults_per_mode.setdefault(spec.mode, []).append(spec.source)
     bad_defaults = {mode: sources for mode, sources in defaults_per_mode.items() if len(sources) != 1}
     if bad_defaults or set(defaults_per_mode) != VALID_MODES:
         raise ObjectiveRegistrationError(
-            f"BUILTIN_OBJECTIVES must set default_pack on exactly one spec per mode; got {defaults_per_mode}"
+            f"BUILTIN_OBJECTIVES must set default=True on exactly one spec per mode; got {defaults_per_mode}"
         )
     for spec in BUILTIN_OBJECTIVES:
         register(spec.mode, spec.source, spec.load())
@@ -230,19 +230,14 @@ def sources_for_mode(mode: JudgingMode) -> list[str]:
 
 def _default_spec(mode: JudgingMode) -> ObjectiveSpec:
     for spec in BUILTIN_OBJECTIVES:
-        if spec.mode == mode and spec.default_pack:
+        if spec.mode == mode and spec.default:
             return spec
-    raise ObjectiveRegistrationError(f"no BUILTIN_OBJECTIVES spec sets default_pack for mode {mode!r}")
+    raise ObjectiveRegistrationError(f"no BUILTIN_OBJECTIVES spec sets default=True for mode {mode!r}")
 
 
 def default_source(mode: JudgingMode) -> str:
     """Source used when a config for ``mode`` names no scorable signal."""
     return _default_spec(mode).source
-
-
-def default_pack(mode: JudgingMode) -> str:
-    """Pack loaded when a config for ``mode`` names no ``packs``."""
-    return _default_spec(mode).default_pack or ""
 
 
 def iter_specs() -> Iterator[ObjectiveSpec]:
@@ -251,9 +246,9 @@ def iter_specs() -> Iterator[ObjectiveSpec]:
 
 def describe() -> str:
     """Human-readable table of the catalog, for CLI help or docs."""
-    lines = [f"{'mode':<16} {'source':<20} {'default pack':<13} summary"]
+    lines = [f"{'mode':<16} {'source':<20} {'default':<8} summary"]
     for spec in BUILTIN_OBJECTIVES:
-        lines.append(f"{spec.mode:<16} {spec.source:<20} {spec.default_pack or '-':<13} {spec.summary}")
+        lines.append(f"{spec.mode:<16} {spec.source:<20} {'yes' if spec.default else '-':<8} {spec.summary}")
     return "\n".join(lines)
 
 
@@ -269,7 +264,6 @@ __all__ = [
     "VALID_MODES",
     "ObjectiveRegistrationError",
     "ObjectiveSpec",
-    "default_pack",
     "default_source",
     "describe",
     "is_known_source",

@@ -6,27 +6,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from glean_gepa.bigquery_client import BigQueryClient, BigQueryError
-from glean_gepa.objectives.utils.shell_tool_error_util import (
+from glean_gepa.objectives.utils.agentspan_query import default_date_range, resolve_eval_run_date_range
+from glean_gepa.objectives.utils.evalset_entries import (
+    build_eval_entry_uuid_tracking_query,
+    build_high_signal_source_entries_query,
+    fetch_evalset_entry_tracking,
+    fetch_high_signal_evalset_entries,
+)
+from glean_gepa.objectives.shell import (
     SHELL_ACTION_IDS,
     SHELL_SPAN_NAMES,
     ShellToolErrorEntryMetrics,
     ShellToolErrorMetrics,
-    build_eval_entry_uuid_tracking_query,
-    build_eval_run_search_params,
-    build_high_signal_source_entries_query,
     build_shell_tool_error_per_entry_query,
-    build_shell_tool_error_query_params,
     build_shell_tool_error_rate_query,
-    default_date_range,
     empty_shell_tool_error_metrics,
     fetch_eval_run_shell_tool_error_analysis,
-    fetch_evalset_entry_tracking,
-    fetch_high_signal_evalset_entries,
-    fetch_shell_tool_error_metrics,
     is_shell_tool_error,
     parse_shell_tool_error_example,
     parse_shell_tool_error_metrics,
-    resolve_eval_run_date_range,
     shell_error_free_rate,
 )
 
@@ -144,33 +142,6 @@ def test_fetch_high_signal_evalset_entries_resolves_source_trace_by_entry_id():
     source_params = client.query.call_args_list[0].kwargs["params"]
     assert next(param.value for param in source_params if param.name == "entry_uuids") == ["entry-1"]
     assert next(param.value for param in source_params if param.name == "eval_run_id") == "parent-eval-run"
-
-
-def test_build_shell_tool_error_query_params_uses_eval_run_date_range():
-    params = build_shell_tool_error_query_params(
-        eval_id="run_123",
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-    )
-    param_map = {param.name: param.value for param in params}
-
-    assert param_map["eval_id"] == "run_123"
-    assert params[0].type_ == "STRING"
-    assert param_map["start_date"] == "2026-08-08"
-    assert param_map["end_date"] == "2026-08-11"
-
-
-def test_build_eval_run_search_params_uses_lookback_window():
-    params = build_eval_run_search_params(
-        eval_id="run_123",
-        lookback_days=3,
-        end_date=date(2026, 8, 11),
-    )
-    param_map = {param.name: param.value for param in params}
-
-    assert param_map["eval_id"] == "run_123"
-    assert param_map["search_start_date"] == "2026-08-08"
-    assert param_map["search_end_date"] == "2026-08-12"
 
 
 def test_default_date_range_uses_utc_today_and_pads_the_next_shard():
@@ -298,7 +269,6 @@ def test_parse_shell_tool_error_metrics_from_bigquery_row():
 
     metrics = parse_shell_tool_error_metrics(row)
 
-    assert metrics.eval_id == "run_123"
     assert metrics.shell_executions == 10
     assert metrics.shell_errors == 2
     assert metrics.shell_error_rate == 0.2
@@ -310,7 +280,7 @@ def test_parse_shell_tool_error_metrics_from_bigquery_row():
 
 
 def test_parse_shell_tool_error_entry_metrics_includes_trace_ids():
-    from glean_gepa.objectives.utils.shell_tool_error_util import parse_shell_tool_error_entry_metrics
+    from glean_gepa.objectives.shell import parse_shell_tool_error_entry_metrics
 
     metrics = parse_shell_tool_error_entry_metrics(
         {
@@ -335,10 +305,9 @@ def test_parse_shell_tool_error_example_handles_missing_fields():
 
 
 def test_empty_shell_tool_error_metrics_defaults_to_zero():
-    metrics = empty_shell_tool_error_metrics("run_123")
+    metrics = empty_shell_tool_error_metrics()
 
     assert metrics == ShellToolErrorMetrics(
-        eval_id="run_123",
         shell_executions=0,
         shell_errors=0,
         shell_error_rate=0.0,
@@ -397,11 +366,11 @@ def test_fetch_shell_tool_error_metrics_returns_parsed_row():
         ],
     ]
 
-    metrics = fetch_shell_tool_error_metrics(
+    metrics = fetch_eval_run_shell_tool_error_analysis(
         mock_client,
         eval_id="run_123",
         end_date=date(2026, 8, 12),
-    )
+    ).aggregate
 
     assert metrics.shell_error_rate == pytest.approx(1 / 3)
     assert metrics.shell_errors == 2
@@ -425,11 +394,11 @@ def test_fetch_shell_error_metrics_keeps_unattributed_shell_spans_in_aggregate()
         [],
     ]
 
-    metrics = fetch_shell_tool_error_metrics(
+    metrics = fetch_eval_run_shell_tool_error_analysis(
         mock_client,
         eval_id="run_123",
         end_date=date(2026, 8, 12),
-    )
+    ).aggregate
 
     assert metrics.shell_executions == 3
     assert metrics.shell_errors == 1
@@ -441,7 +410,7 @@ def test_fetch_shell_tool_error_metrics_returns_empty_when_no_rows():
     mock_client = MagicMock()
     mock_client.query.return_value = []
 
-    metrics = fetch_shell_tool_error_metrics(mock_client, eval_id="run_123")
+    metrics = fetch_eval_run_shell_tool_error_analysis(mock_client, eval_id="run_123").aggregate
 
     assert metrics.shell_executions == 0
     assert metrics.shell_error_rate == 0.0

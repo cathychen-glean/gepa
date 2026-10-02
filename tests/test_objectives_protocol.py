@@ -76,7 +76,7 @@ def test_reflective_example_helper_builds_the_shared_frame() -> None:
     from unittest.mock import MagicMock
 
     from glean_gepa.objectives.base import REFLECTION_EVIDENCE_LIMIT
-    from glean_gepa.objectives.loop_efficiency import LoopEfficiencyObjective
+    from glean_gepa.objectives.loop import LoopEfficiencyObjective
 
     objective = LoopEfficiencyObjective(bigquery_client=MagicMock())
     trajectory = {

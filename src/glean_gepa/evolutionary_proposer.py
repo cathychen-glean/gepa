@@ -6,8 +6,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
+import re
 import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
@@ -29,11 +30,21 @@ from glean_gepa.al_adapter import (
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS, PROMPT_MODULE_DEFAULTS
+from glean_gepa.reflection_prompts import parse_chosen_tool_keys, tool_description_choice_prompt
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
 from glean_gepa.utils import apply_single_module_edit
 
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 0.5
 SKIP_CHILD_SCREENING_KINDS = frozenset({"none", "skip"})
+# How many tool descriptions one reflection pass may nominate, most useful first.
+_TOOL_CHOICE_LIMIT = 3
+# A tool description is only worth rewriting when the examples show the tool being invoked
+# (by the student, or by the teacher where the student skipped it) in at least this many
+# examples. The student asks, offers, and hedges mostly in its final message, so a rarely
+# invoked tool's description cannot steer that; those rules belong in Execution Discipline.
+MIN_TOOL_EVIDENCE_EXAMPLES = 3
+
+_TOOL_NAME_CHARS = re.compile(r"[^a-z0-9]")
 
 
 def _skips_child_screening(adapter: Any) -> bool:
@@ -55,22 +66,117 @@ def pick_modules_to_edit(
     adapter: GleanAdapterBase,
     eval_batch: GleanEvaluationBatch | None = None,
 ) -> list[str]:
-    """Return modules the proposer should rewrite this generation.
+    """Return modules eligible for a rewrite this generation.
 
-    Non-core modules listed in ``editable_modules`` (including ``RULES_EXT``) are
-    always rewritten. Core-tool descriptions are eligible only when listed, and
-    the proposer only rewrites those that appear in the high-signal first-tool
-    mismatch set.
+    Non-core modules listed in ``editable_modules`` are always eligible. Every
+    listed core-tool description is eligible too; the reflector later names
+    which of those descriptions to rewrite.
     """
+    del eval_batch
     eligible = list(adapter.editable_modules)
     modules = [module for module in eligible if module not in CORE_TOOL_KEYS]
-    extra_keys: list[str] = []
-    keys_fn = getattr(adapter, "high_signal_core_tool_keys", None)
-    if callable(keys_fn):
-        extra_keys = list(cast(list[str], keys_fn(eval_batch.trajectories if eval_batch is not None else None)))
-    extra = [key for key in extra_keys if key in eligible]
-    modules.extend(key for key in extra if key not in modules)
+    modules.extend(module for module in eligible if module in CORE_TOOL_KEYS)
     return modules
+
+
+def _choice_example_blocks(examples: Sequence[Mapping[str, Any]]) -> str:
+    blocks: list[str] = []
+    for example in examples:
+        inputs = example["Inputs"]
+        outputs = example["Generated Outputs"]
+        teacher_tools = outputs.get("teacher_tools") or []
+        student_tools = outputs.get("student_tools") or []
+        teacher = ", ".join(str(name) for name in teacher_tools) or "(none)"
+        student = ", ".join(str(name) for name in student_tools) or "(none)"
+        action_lines = "".join(f"ACTION_INPUT: {line}\n" for line in example.get("Action Inputs") or [])
+        blocks.append(
+            f"---\nQUERY: {inputs.get('query', '')}\n"
+            f"TEACHER_TOOLS: {teacher}\nSTUDENT_TOOLS: {student}\n"
+            f"{action_lines}"
+            f"FEEDBACK: {example.get('Feedback', '')}\n"
+        )
+    return "".join(blocks)
+
+
+def _tool_key_matches(tool_key: str, event_name: Any) -> bool:
+    """Whether a trace tool event (``"Glean Document Reader"``) is the core tool ``glean_document_reader``."""
+    return _TOOL_NAME_CHARS.sub("", str(event_name).lower()) == _TOOL_NAME_CHARS.sub("", tool_key.lower())
+
+
+def tool_usage_in_examples(
+    tool_keys: Sequence[str], examples: Sequence[Mapping[str, Any]]
+) -> dict[str, tuple[int, int]]:
+    """Count, per core tool, the examples in which the student and the teacher invoked it."""
+    usage: dict[str, tuple[int, int]] = {}
+    for tool_key in tool_keys:
+        student = teacher = 0
+        for example in examples:
+            outputs = example.get("Generated Outputs") or {}
+            if any(_tool_key_matches(tool_key, name) for name in outputs.get("student_tools") or []):
+                student += 1
+            if any(_tool_key_matches(tool_key, name) for name in outputs.get("teacher_tools") or []):
+                teacher += 1
+        usage[tool_key] = (student, teacher)
+    return usage
+
+
+def tools_with_evidence(usage: Mapping[str, tuple[int, int]], example_count: int) -> list[str]:
+    """Core tools invoked, by either side, in enough examples for a description edit to matter."""
+    required = min(MIN_TOOL_EVIDENCE_EXAMPLES, example_count)
+    return [tool for tool, (student, teacher) in usage.items() if max(student, teacher) >= required]
+
+
+def modules_after_tool_choice(
+    reflection_llm: Any,
+    parent: Candidate,
+    modules_to_edit: list[str],
+    high_signal: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[str]:
+    """Keep non-core modules, and only the core tools the reflector names.
+
+    Tools that neither side invoked in enough examples are dropped before the
+    reflector chooses: their descriptions cannot have caused those losses.
+    Non-core modules come first: Execution Discipline and RULES_EXT govern the
+    final message the judge scores, so they must not lose their offspring slot
+    to a third rewording of a tool description.
+    """
+    non_core = [module for module in modules_to_edit if module not in CORE_TOOL_KEYS]
+    core = [module for module in modules_to_edit if module in CORE_TOOL_KEYS]
+    if not core:
+        return non_core
+    examples: Sequence[Mapping[str, Any]] = ()
+    for module in core:
+        if high_signal.get(module):
+            examples = high_signal[module]
+            break
+    if not examples:
+        print("Reflection skipped core-tool edits: no high-signal examples.")
+        return non_core
+    usage = tool_usage_in_examples(core, examples)
+    evidenced = tools_with_evidence(usage, len(examples))
+    skipped = [tool for tool in core if tool not in evidenced]
+    if skipped:
+        print(
+            "Reflection skipped tool descriptions without invocation evidence: "
+            + ", ".join(f"{tool} (student {usage[tool][0]}, teacher {usage[tool][1]})" for tool in skipped)
+        )
+    if not evidenced:
+        return non_core
+    descriptions = {
+        module: parent.prompt_modules.get(module) or PROMPT_MODULE_DEFAULTS.get(module, "") for module in evidenced
+    }
+    raw = reflection_llm(
+        tool_description_choice_prompt(
+            tools=descriptions,
+            example_blocks=_choice_example_blocks(examples),
+            limit=_TOOL_CHOICE_LIMIT,
+            usage={tool: usage[tool] for tool in evidenced},
+            example_count=len(examples),
+        )
+    ).strip()
+    chosen = parse_chosen_tool_keys(raw, evidenced)[:_TOOL_CHOICE_LIMIT]
+    print("Reflector chose tool descriptions: " + (", ".join(chosen) if chosen else "(none)"))
+    return non_core + chosen
 
 
 def _format_child_delta(parent: Candidate, child: Candidate, module: str) -> str:
@@ -86,6 +192,23 @@ def _format_child_delta(parent: Candidate, child: Candidate, module: str) -> str
     return "".join(diff) or "(no prompt changes)\n"
 
 
+def _offspring_quotas(
+    parents: Sequence[Candidate],
+    *,
+    scores: Mapping[str, float],
+    offspring_count: int,
+) -> list[tuple[Candidate, int]]:
+    """Split ``offspring_count`` across parents. Extra slots go to higher scores.
+
+    Ties break on candidate id so a resumed run assigns the same extras.
+    """
+    ranked = sorted(parents, key=lambda parent: (-scores[parent.candidate_id], parent.candidate_id))
+    if not ranked or offspring_count <= 0:
+        return [(parent, 0) for parent in ranked]
+    base, remainder = divmod(offspring_count, len(ranked))
+    return [(parent, base + (1 if index < remainder else 0)) for index, parent in enumerate(ranked)]
+
+
 def make_children_for_generation(
     adapter: GleanAdapterBase,
     frontier_candidates: list[Candidate],
@@ -99,6 +222,8 @@ def make_children_for_generation(
 ) -> list[Candidate]:
     """Create children by applying reflection-generated edits to one module.
 
+    Offspring slots are split evenly across frontier parents. When the count
+    does not divide evenly, the higher-scoring parents get the extra slots.
     ``children_by_root`` retains the children already reflected from a parent.
     Reusing those candidates is intentional: a root's traces and prompt are
     unchanged while it remains on the frontier, so reflecting on it again only
@@ -116,49 +241,38 @@ def make_children_for_generation(
         children.append(child)
         return True
 
-    # Pick a main parent using the concrete adapter's primary objective.
-    best_quality_parent = max(
-        frontier_candidates,
-        key=lambda c: adapter.get_screening_score(frontier_evals[c.candidate_id]),
-    )
-    print(f"Best quality parent: {best_quality_parent}")
+    if not frontier_candidates or offspring_count <= 0 or max_attempts < 1:
+        return []
 
-    # A cached root is never reflected again. Reuse cached children first, in
-    # quality order, before generating mutations for roots we have not seen.
-    # This also makes the cache useful when a parent disappears and later
-    # returns to the Pareto frontier.
-    if children_by_root is not None:
-        ordered_roots = [best_quality_parent] + [
-            parent for parent in frontier_candidates if parent.candidate_id != best_quality_parent.candidate_id
-        ]
-        for parent in ordered_roots:
-            for child in children_by_root.get(parent.candidate_id, []):
-                append_child(child)
-            if len(children) >= offspring_count:
-                return children
-
-    attempts = 0
-    while len(children) < offspring_count and attempts < max_attempts:
-        attempts += 1
-        uncached_roots = [
-            parent
-            for parent in frontier_candidates
-            if children_by_root is None or parent.candidate_id not in children_by_root
-        ]
-        if not uncached_roots:
-            break
-        parent = (
-            best_quality_parent
-            if best_quality_parent in uncached_roots and random.random() < 0.7
-            else random.choice(uncached_roots)
+    scores = {
+        parent.candidate_id: adapter.get_screening_score(frontier_evals[parent.candidate_id])
+        for parent in frontier_candidates
+    }
+    allocation = _offspring_quotas(frontier_candidates, scores=scores, offspring_count=offspring_count)
+    print(f"Best quality parent: {allocation[0][0]}")
+    print(
+        "Offspring slots by parent: "
+        + ", ".join(
+            f"{parent.candidate_id}={quota} (score={scores[parent.candidate_id]:.4f})" for parent, quota in allocation
         )
-        parent_eval = frontier_evals[parent.candidate_id]
-        if not parent_eval.trajectories:
-            # Need traces to reflect; skip mutation if missing.
-            if children_by_root is not None:
-                children_by_root.setdefault(parent.candidate_id, [])
-            continue
+    )
 
+    def take_cached(parent: Candidate, quota: int) -> int:
+        if children_by_root is None or quota <= 0:
+            return 0
+        taken = 0
+        for child in children_by_root.get(parent.candidate_id, []):
+            if taken >= quota or len(children) >= offspring_count:
+                break
+            if append_child(child):
+                taken += 1
+        return taken
+
+    def reflect_parent(parent: Candidate, slot_budget: int) -> int:
+        """Reflect once and keep up to ``slot_budget`` children. Returns how many were added."""
+        if slot_budget <= 0 or len(children) >= offspring_count:
+            return 0
+        parent_eval = frontier_evals[parent.candidate_id]
         # Presence in the cache means this root has already had its one
         # reflection attempt for the current training slice. Record that before
         # calling the reflector so an empty/invalid response is cached too.
@@ -177,11 +291,22 @@ def make_children_for_generation(
             k=reflect_k,
             error_hamming_distance_k=reflection_hamming_distance_k,
         )
+        if any(module in CORE_TOOL_KEYS for module in modules_to_edit):
+            modules_to_edit = modules_after_tool_choice(reflection_llm, parent, modules_to_edit, high_signal)
+            log_section(
+                f"REFLECTION TOOL CHOICE parent={parent.candidate_id}",
+                "modules_to_edit: " + (", ".join(modules_to_edit) if modules_to_edit else "(none)"),
+            )
 
-        # Ask the reflection model for one to three small rewrite variants.
-        for module in modules_to_edit:
-            if len(children) >= offspring_count:
-                break
+        # Ask the reflection model for one to three small rewrite variants per module, then
+        # fill this parent's slots round-robin across modules. Rewordings of one module's
+        # edit score within judge noise of each other, so a generation spent on three
+        # variants of a tool description and none of Execution Discipline learns nothing
+        # about the module that governs the student's final message.
+        modules_this_round = modules_to_edit[:slot_budget]
+        variants_by_module: dict[str, list[str]] = {}
+        diagnosis_by_module: dict[str, str] = {}
+        for module in modules_this_round:
             proposed = adapter.propose_new_texts(
                 reflection_llm=reflection_llm,
                 candidate=parent,
@@ -189,31 +314,79 @@ def make_children_for_generation(
                 reflective_examples=high_signal[module],
             )
             variants = proposed[0]
-            diagnosis = proposed[2] if len(proposed) > 2 else ""
+            diagnosis_by_module[module] = proposed[2] if len(proposed) > 2 else ""
             if not variants:
                 print(f"Reflection produced no variants for module {module}")
                 continue
+            variants_by_module[module] = list(variants)
 
-            for variant in variants[: offspring_count - len(children)]:
-                child = apply_single_module_edit(parent, module, variant)
-                if not append_child(child):
-                    continue
-                if cached_children is not None and all(
-                    existing.prompt_modules != child.prompt_modules for existing in cached_children
-                ):
-                    cached_children.append(child)
-                log_section(
-                    f"CHILD PROPOSAL {child.candidate_id}",
-                    format_child_proposal_report(
-                        parent_id=parent.candidate_id,
-                        child_id=child.candidate_id,
-                        module=module,
-                        delta=_format_child_delta(parent, child, module),
-                        justification=diagnosis,
-                    ),
-                )
+        added = 0
+        for module, variant in _round_robin_variants(modules_this_round, variants_by_module):
+            if added >= slot_budget or len(children) >= offspring_count:
+                break
+            child = apply_single_module_edit(parent, module, variant)
+            if not append_child(child):
+                continue
+            added += 1
+            if cached_children is not None and all(
+                existing.prompt_modules != child.prompt_modules for existing in cached_children
+            ):
+                cached_children.append(child)
+            log_section(
+                f"CHILD PROPOSAL {child.candidate_id}",
+                format_child_proposal_report(
+                    parent_id=parent.candidate_id,
+                    child_id=child.candidate_id,
+                    module=module,
+                    delta=_format_child_delta(parent, child, module),
+                    justification=diagnosis_by_module.get(module, ""),
+                ),
+            )
+        return added
+
+    # A cached root is never reflected again. Take only that parent's quota, so
+    # one parent's cached children cannot crowd the others out of the generation.
+    shortfall = 0
+    pending: list[tuple[Candidate, int]] = []
+    for parent, quota in allocation:
+        if quota <= 0:
+            continue
+        remaining = quota - take_cached(parent, quota)
+        if remaining <= 0:
+            continue
+        already_reflected = children_by_root is not None and parent.candidate_id in children_by_root
+        parent_eval = frontier_evals[parent.candidate_id]
+        if already_reflected or not parent_eval.trajectories:
+            if not already_reflected and children_by_root is not None:
+                children_by_root.setdefault(parent.candidate_id, [])
+            shortfall += remaining
+            continue
+        pending.append((parent, remaining))
+
+    # Reflect lower-scoring parents first. Slots they do not fill, plus any
+    # quota held by a parent that cannot reflect, go to the highest-scoring
+    # parent that still can.
+    reflections = 0
+    for index, (parent, remaining) in enumerate(reversed(pending)):
+        if reflections >= max_attempts:
+            break
+        budget = remaining + shortfall if index == len(pending) - 1 else remaining
+        produced = reflect_parent(parent, budget)
+        reflections += 1
+        if index != len(pending) - 1:
+            shortfall += max(0, remaining - produced)
 
     return children
+
+
+def _round_robin_variants(modules: Sequence[str], variants_by_module: Mapping[str, Sequence[str]]):
+    """Yield ``(module, variant)`` taking one variant per module per pass, in module order."""
+    depth = max((len(variants) for variants in variants_by_module.values()), default=0)
+    for index in range(depth):
+        for module in modules:
+            variants = variants_by_module.get(module) or ()
+            if index < len(variants):
+                yield module, variants[index]
 
 
 def _eval_entry_ids(eval_batch: GleanEvaluationBatch) -> list[str]:
@@ -888,7 +1061,12 @@ class EvolutionaryProposer:
         elif screen_evals:
             for child, _screen_eval, score in zip(valid_children, screen_evals, screen_scores, strict=True):
                 detail = f"score={score:.4f}"
-                if use_high_signal_gate and getattr(self.al_adapter, "screening_kind", None) != "correctness_floor":
+                weighted_gate = bool(getattr(self.al_adapter, "screening_weights", None))
+                if (
+                    use_high_signal_gate
+                    and not weighted_gate
+                    and getattr(self.al_adapter, "screening_kind", None) != "correctness_floor"
+                ):
                     detail = f"fix_rate={score:.3f}"
                 screening_rows.append((child.candidate_id, score, child.candidate_id in passed_ids, detail))
         if skipped_screening:
@@ -912,6 +1090,11 @@ class EvolutionaryProposer:
                 if getattr(self.al_adapter, "screening_kind", None) == "correctness_floor":
                     self.logger.log(
                         f"Iteration {i}: No child reached the correctness floor "
+                        f"{self.high_signal_screen_threshold:.0%} (best={best_score:.1%})"
+                    )
+                elif getattr(self.al_adapter, "screening_weights", None):
+                    self.logger.log(
+                        f"Iteration {i}: No child reached the screening gate "
                         f"{self.high_signal_screen_threshold:.0%} (best={best_score:.1%})"
                     )
                 else:
@@ -977,10 +1160,14 @@ class EvolutionaryProposer:
             screening_kind_meta = "screening_score"
             screening_threshold_meta = None
             proposal_tag = "evolutionary"
+        # Children come from every frontier parent that received offspring slots, so each
+        # proposal names its own root; falling back to the best parent only for a child whose
+        # root is no longer in the pool.
+        cand_id_to_prog_idx = {cand_id: idx for idx, cand_id in prog_idx_to_cand_id.items()}
         return [
             CandidateProposal(
                 candidate=child.prompt_modules,
-                parent_program_ids=[best_parent_idx],
+                parent_program_ids=[cand_id_to_prog_idx.get(child.parent_id or "", best_parent_idx)],
                 subsample_indices=subsample_ids,
                 subsample_scores_before=[proposal_score_before],
                 subsample_scores_after=[screen_score],

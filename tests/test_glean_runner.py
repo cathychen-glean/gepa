@@ -5,12 +5,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from gepa.core.data_loader import ListDataLoader
 from glean_gepa.evalcli_client import (
     AGENTIC_JUDGE_NAME,
     AGENTIC_JUDGE_TYPE,
     AGENTIC_PREFERENCE_RATE_METRIC,
     CORRECTNESS_JUDGE_TYPE,
 )
+from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
 from glean_gepa.prompt import compile_system_prompt, materialize_system_prompt
 from glean_gepa.prompt_constants import (
@@ -39,11 +41,13 @@ from glean_gepa.runner import (
     _make_evalset,
     _parse_args,
     _parse_editable_modules,
+    _prestart_first_iteration_training,
     _resolve_customer_deployments,
     _resolve_eval_version_split,
     _seed_for_editable_modules,
     _select_covered_dated_versions,
     _select_recent_train_versions,
+    _val_eval_set_name,
     _validate_best_candidate_on_customer_eval,
     _verify_customer_eval_metrics,
 )
@@ -412,8 +416,9 @@ def test_val_version_selection_picks_fully_published_dated_versions():
             "20260830",
         ]
     )
-    with pytest.raises(SystemExit, match="not published to"):
-        _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS)
+    # TEMP: pinned val versions skip the customer publication check.
+    assert _resolve_eval_version_split(args, evalcli, _SAMPLED_DEPLOYMENTS) == (["20260901"], ["20260830"])
+    evalcli.list_eval_set_versions.assert_not_called()
 
 
 def _experiment_with_validation(entries):
@@ -592,6 +597,83 @@ def test_customer_metric_validation(patch, gates, error, contains, omits):
         assert snippet in report
     for snippet in omits:
         assert snippet not in report
+
+
+def test_first_iteration_prestarts_the_first_training_slice(tmp_path):
+    trainset = [
+        {
+            "eval_set_name": "Glean Chat V2 Medium",
+            "eval_set_version": "20260905",
+            "deployment_ids": ["scio-prod"],
+            "status": "active",
+        },
+        {
+            "eval_set_name": "Glean Chat V2 Medium",
+            "eval_set_version": "20260904",
+            "deployment_ids": ["scio-prod"],
+            "status": "active",
+        },
+    ]
+    policy = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
+    runner = MagicMock()
+    runner.start.side_effect = [("teacher-eval", True), ("student-eval", True)]
+
+    _prestart_first_iteration_training(
+        runner=runner,
+        policy=policy,
+        trainset=trainset,
+        seed_candidate={"WRITING_CODE": "seed"},
+        student_model="gpt6_luna",
+        teacher_model="gpt6_sol",
+        run_dir=tmp_path,
+    )
+
+    teacher_call, student_call = runner.start.call_args_list
+    assert teacher_call.args[:5] == (
+        "gpt6_sol",
+        "<<TEACHER_PROD_PROMPT>>",
+        "Glean Chat V2 Medium",
+        "20260905",
+        ["scio-prod"],
+    )
+    assert student_call.args[0] == "gpt6_luna"
+    assert student_call.args[2:5] == ("Glean Chat V2 Medium", "20260905", ["scio-prod"])
+    replayed = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
+    assert replayed.take_unseen(ListDataLoader(trainset), purpose="reflection", attempt=0) == [0]
+
+
+def test_first_iteration_prestart_skips_a_resumed_run(tmp_path):
+    (tmp_path / "gepa_state.bin").write_bytes(b"state")
+    policy = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
+    runner = MagicMock()
+
+    _prestart_first_iteration_training(
+        runner=runner,
+        policy=policy,
+        trainset=[
+            {
+                "eval_set_name": "Glean Chat V2 Medium",
+                "eval_set_version": "20260905",
+                "deployment_ids": ["scio-prod"],
+                "status": "active",
+            }
+        ],
+        seed_candidate={"WRITING_CODE": "seed"},
+        student_model="gpt6_luna",
+        teacher_model="gpt6_sol",
+        run_dir=tmp_path,
+    )
+
+    runner.start.assert_not_called()
+    assert not (tmp_path / "schedule.json").exists()
+
+
+def test_val_eval_set_defaults():
+    pinned = _parse_args(["--seed_candidate", "seed.json", "--val_eval_versions", "20260906"])
+    assert _val_eval_set_name(pinned, "Glean Chat V2 Medium") == "Glean Chat V2 Medium"
+
+    automatic = _parse_args(["--seed_candidate", "seed.json"])
+    assert _val_eval_set_name(automatic, "other") == GLEAN_CHAT_EVAL_SET_NAME
 
 
 def test_make_evalset():

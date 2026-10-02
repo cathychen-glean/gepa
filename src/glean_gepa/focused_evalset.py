@@ -15,7 +15,7 @@ from typing import Any
 
 from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.evalcli_client import EvalCliClient, EvalCliError, min_ingested_eval_set_entries
-from glean_gepa.objectives.utils.shell_tool_error_util import fetch_evalset_entry_tracking
+from glean_gepa.objectives.utils.evalset_entries import fetch_evalset_entry_tracking
 
 SESSION_BUCKET_TYPE = "SESSION"
 QUERY_CANONICAL_BUCKET_TYPE = "QUERY_CANONICAL"

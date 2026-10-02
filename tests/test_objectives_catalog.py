@@ -6,7 +6,6 @@ import pytest
 
 from glean_gepa.objectives import registry
 from glean_gepa.objectives.base import (
-    MODE_DEFAULT_PACK,
     MODE_DEFAULT_TELEMETRY_SOURCE,
     TELEMETRY_SOURCES,
     TeacherStudentObjective,
@@ -29,9 +28,8 @@ def test_every_catalog_spec_loads_and_registers() -> None:
 
 
 def test_catalog_has_one_default_per_mode_and_base_aliases_follow_it() -> None:
-    defaults = {spec.mode for spec in BUILTIN_OBJECTIVES if spec.default_pack}
+    defaults = {spec.mode for spec in BUILTIN_OBJECTIVES if spec.default}
     assert defaults == VALID_MODES
-    assert MODE_DEFAULT_PACK == {"teacher_student": "tools", "single_model": "shell"}
     assert MODE_DEFAULT_TELEMETRY_SOURCE == {"teacher_student": "tool_match", "single_model": "shell_telemetry"}
     assert TELEMETRY_SOURCES is registry.registered()
 

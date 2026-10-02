@@ -11,10 +11,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Literal, TypeVar, cast
 
 import glean_gepa.objectives.registry as _registry
 from glean_gepa.adapter_types import JudgingMode
+from glean_gepa.objectives.utils.core import EVIDENCE_LIMIT, RunAnalysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import DEFAULT_MODULE_RESPONSIBILITY, core_tool_reflection_prompt
@@ -29,17 +30,21 @@ if TYPE_CHECKING:
 _REFLECTION_K_DEFAULT = object()
 
 # Reflection surfaces at most this many tool payloads / error strings per example.
-REFLECTION_EVIDENCE_LIMIT = 5
+# Same cap the utils use for console logging; one number, defined in core.
+REFLECTION_EVIDENCE_LIMIT = EVIDENCE_LIMIT
 
 # The catalog and registry live in ``glean_gepa.objectives.registry``. These
 # names are kept so existing imports keep working; they read from that module.
 TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = _registry._REGISTRY
-MODE_DEFAULT_PACK: dict[JudgingMode, str] = {
-    spec.mode: spec.default_pack for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
-}
 MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
-    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
+    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default
 }
+
+
+# The frame a concrete objective's ``analyze()`` returns. Subclasses bind it:
+# ``class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis])``
+# and every hook below then receives that type instead of ``Any``.
+AnalysisT = TypeVar("AnalysisT", bound=RunAnalysis[Any, Any])
 
 
 AnalysisDetail = Literal["aggregate", "per_entry", "traces"]
@@ -138,15 +143,15 @@ def module_responsibility(
     return DEFAULT_MODULE_RESPONSIBILITY
 
 
-class PackConfigurable:
-    """Pack YAML knobs overlaid onto an objective instance after construction."""
+class ExperimentConfigurable:
+    """Experiment YAML knobs overlaid onto an objective instance after construction."""
 
     params: dict[str, Any]
     # Set from ``screening.high_signal`` and ``signals[].name`` by ``configure_objective``.
     high_signal: str | None = None
     signal_names: tuple[str, ...] = ()
 
-    def pack_param(self, key: str, default: Any) -> Any:
+    def experiment_param(self, key: str, default: Any) -> Any:
         return (getattr(self, "params", None) or {}).get(key, default)
 
     def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
@@ -177,7 +182,7 @@ class PackConfigurable:
         """Score plus each signal this run is configured to report.
 
         The objective's own metric is always included. Any other ``signals.name``
-        from the pack YAML, such as a pairwise correctness judge, is included
+        from the experiment YAML, such as a pairwise correctness judge, is included
         only when that trajectory actually scored it.
         """
         from glean_gepa.al_adapter import ReflectiveExampleMetrics
@@ -210,6 +215,7 @@ class PackConfigurable:
         generated: Mapping[str, Any] | None = None,
         action_inputs: Sequence[str] = (),
         execution_errors: Sequence[str] = (),
+        action_input_limit: int | None = None,
     ) -> ReflectiveExample:
         """Assemble one ``ReflectiveExample`` from the parts an objective decides.
 
@@ -243,7 +249,7 @@ class PackConfigurable:
         return {
             "Inputs": inputs,
             "Generated Outputs": outputs,
-            "Action Inputs": list(action_inputs)[:REFLECTION_EVIDENCE_LIMIT],
+            "Action Inputs": list(action_inputs)[: action_input_limit or REFLECTION_EVIDENCE_LIMIT],
             "Execution Errors": list(execution_errors)[:REFLECTION_EVIDENCE_LIMIT],
             "Feedback": feedback,
             "Metrics": self.reflective_metrics(trajectory),
@@ -277,14 +283,14 @@ class PackConfigurable:
         )
 
 
-def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
-    """Apply pack YAML knobs. Class attributes stay the unconfigured defaults."""
+def configure_objective(objective: Any, experiment: Mapping[str, Any] | None) -> None:
+    """Apply experiment YAML knobs. Class attributes stay the unconfigured defaults."""
     if not hasattr(objective, "params"):
         objective.params = {}
-    if not pack:
+    if not experiment:
         return
-    objective_cfg = pack.get("objective") or {}
-    reflection = pack.get("reflection") or {}
+    objective_cfg = experiment.get("objective") or {}
+    reflection = experiment.get("reflection") or {}
     bucket = objective_cfg.get("focused_bucket_type")
     if bucket is not None:
         from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
@@ -307,18 +313,18 @@ def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
         base = dict(getattr(type(objective), "module_responsibilities", {}) or {})
         base.update({str(name): str(text) for name, text in modules.items()})
         objective.module_responsibilities = base
-    screening = pack.get("screening") or {}
+    screening = experiment.get("screening") or {}
     high_signal = screening.get("high_signal")
     if high_signal:
         objective.high_signal = str(high_signal)
-    signals = pack.get("signals")
+    signals = experiment.get("signals")
     if isinstance(signals, Sequence) and not isinstance(signals, str | bytes):
         objective.signal_names = tuple(
             str(signal["name"]) for signal in signals if isinstance(signal, Mapping) and signal.get("name")
         )
 
 
-class TeacherStudentObjective(PackConfigurable, ABC):
+class TeacherStudentObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     """Paired teacher-vs-student trace comparison."""
 
     name: str
@@ -346,7 +352,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return getattr(self, "_paired_analysis_cache", {})
 
     @abstractmethod
-    def analyze(self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest) -> Any: ...
+    def analyze(self, teacher_eval_id: str, student_eval_id: str, *, request: AnalysisRequest) -> AnalysisT: ...
 
     def _unhydrated_pair_keys(self) -> set[tuple[str, str]]:
         pairs = getattr(self, "_unhydrated_pairs", None)
@@ -355,7 +361,7 @@ class TeacherStudentObjective(PackConfigurable, ABC):
             self._unhydrated_pairs = pairs
         return pairs
 
-    def analysis_is_cacheable(self, analysis: Any) -> bool:
+    def analysis_is_cacheable(self, analysis: AnalysisT) -> bool:
         """False for a provisional empty comparison, so a later call can fetch again."""
         aggregate = getattr(analysis, "aggregate", None)
         if aggregate is not None and hasattr(aggregate, "compared_entries"):
@@ -368,11 +374,11 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         student_eval_id: str,
         *,
         request: AnalysisRequest,
-        cache: dict[tuple[str, str], Any],
-        fetch: Callable[..., Any],
-        empty: Callable[[str, str], Any],
+        cache: dict[tuple[str, str], AnalysisT],
+        fetch: Callable[..., AnalysisT],
+        empty: Callable[[str, str], AnalysisT],
         label: str,
-    ) -> Any:
+    ) -> AnalysisT:
         """Fetch (or reuse a cached) paired analysis with shared HIT/MISS logging.
 
         ``fetch`` and ``empty`` are passed in from the concrete objective's module
@@ -411,19 +417,19 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         print(f"[Cache MISS] Fetched {label} for {teacher_eval_id} vs {student_eval_id}")
         return analysis
 
-    def require_compared_entries(self, analysis: Any) -> None:
+    def require_compared_entries(self, analysis: AnalysisT) -> None:
         """Reject a 0/0 comparison. Objectives without a compared-entry count do nothing."""
         del analysis
 
     @abstractmethod
-    def validate_full_eval(self, analysis: Any) -> None: ...
+    def validate_full_eval(self, analysis: AnalysisT) -> None: ...
 
     @abstractmethod
-    def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
+    def focused_pass_rate(self, analysis: AnalysisT, requested_entry_ids: Sequence[str]) -> float: ...
 
     def scored_rows(
         self,
-        analysis: Any,
+        analysis: AnalysisT,
         *,
         focused: bool,
         capture_traces: bool,
@@ -446,11 +452,11 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         return [self.entry_row(entry_id, metrics, analysis, ctx) for entry_id, metrics in analysis.per_entry.items()]
 
     @abstractmethod
-    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def entry_row(self, entry_id: str, metrics: Any, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Score and rollout output for one compared entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
 
     @abstractmethod
-    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def aggregate_row(self, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Run-level score for validation batches. ``ScoredRow.entry_id`` must be ``None``."""
 
     def is_high_signal(self, output: Mapping[str, Any]) -> bool:
@@ -575,16 +581,12 @@ class TeacherStudentObjective(PackConfigurable, ABC):
         candidate: dict[str, str],
     ) -> ReflectiveExample: ...
 
-    def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
-        del trajectories
-        return []
-
 
 class TelemetryPendingError(RuntimeError):
     """Raised when an eval has no scorable telemetry yet; callers should retry, not score 0/0."""
 
 
-class SingleModelObjective(PackConfigurable, ABC):
+class SingleModelObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     """Student-only BigQuery / agentspan metric."""
 
     name: str
@@ -602,7 +604,7 @@ class SingleModelObjective(PackConfigurable, ABC):
     _unhydrated_eval_ids: set[str]
 
     @abstractmethod
-    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> Any: ...
+    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> AnalysisT: ...
 
     # --- shared per-eval cache -------------------------------------------
 
@@ -619,7 +621,7 @@ class SingleModelObjective(PackConfigurable, ABC):
         del cached, request
         return True
 
-    def analysis_is_cacheable(self, analysis: Any, request: AnalysisRequest) -> bool:
+    def analysis_is_cacheable(self, analysis: AnalysisT, request: AnalysisRequest) -> bool:
         """False for a provisional result, so a later call fetches again."""
         del request
         return not self.is_pending(analysis)
@@ -629,9 +631,9 @@ class SingleModelObjective(PackConfigurable, ABC):
         eval_id: str,
         *,
         request: AnalysisRequest,
-        fetch: Callable[[AnalysisRequest], Any],
+        fetch: Callable[[AnalysisRequest], AnalysisT],
         label: str,
-    ) -> Any:
+    ) -> AnalysisT:
         """Fetch (or reuse a cached) analysis for one eval with shared HIT/MISS logging.
 
         ``fetch`` is called with the request only; the objective's closure supplies
@@ -667,18 +669,18 @@ class SingleModelObjective(PackConfigurable, ABC):
             unhydrated.add(eval_id)
         return analysis
 
-    def is_pending(self, analysis: Any) -> bool:
+    def is_pending(self, analysis: AnalysisT) -> bool:
         """Telemetry has not landed while ``pending_count`` on the aggregate is 0."""
         return getattr(analysis.aggregate, self.pending_count) == 0
 
-    def aggregate_score(self, analysis: Any) -> float:
+    def aggregate_score(self, analysis: AnalysisT) -> float:
         """The objective ``name`` is the float field on ``analysis.aggregate``."""
         return float(getattr(analysis.aggregate, self.name))
 
     @abstractmethod
-    def focused_pass_rate(self, analysis: Any, requested_entry_ids: Sequence[str]) -> float: ...
+    def focused_pass_rate(self, analysis: AnalysisT, requested_entry_ids: Sequence[str]) -> float: ...
 
-    def entry_ids_to_score(self, analysis: Any, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
+    def entry_ids_to_score(self, analysis: AnalysisT, requested_entry_ids: Sequence[str] | None) -> tuple[str, ...]:
         """Which entries get a per-entry ``ScoredRow``.
 
         Focused eval (``requested_entry_ids`` given): the requested ids that have
@@ -693,11 +695,11 @@ class SingleModelObjective(PackConfigurable, ABC):
         return tuple(analysis.high_signal_entry_ids)
 
     @abstractmethod
-    def log_analysis(self, analysis: Any) -> None: ...
+    def log_analysis(self, analysis: AnalysisT) -> None: ...
 
     def scored_rows(
         self,
-        analysis: Any,
+        analysis: AnalysisT,
         *,
         al_data_inst: Mapping[str, Any],
         student_eval_id: str,
@@ -731,11 +733,11 @@ class SingleModelObjective(PackConfigurable, ABC):
         return [self.entry_row(entry_id, analysis.per_entry[entry_id], analysis, ctx) for entry_id in entry_ids]
 
     @abstractmethod
-    def entry_row(self, entry_id: str, metrics: Any, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def entry_row(self, entry_id: str, metrics: Any, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Score and rollout output for one entry. ``ScoredRow.entry_id`` must be ``entry_id``."""
 
     @abstractmethod
-    def aggregate_row(self, analysis: Any, ctx: ScoringContext) -> ScoredRow:
+    def aggregate_row(self, analysis: AnalysisT, ctx: ScoringContext) -> ScoredRow:
         """Run-level score. ``ScoredRow.entry_id`` must be ``None``; the base re-keys it when needed."""
 
     @abstractmethod
@@ -790,9 +792,9 @@ def build_objective(
     *,
     bigquery_client: Any | None = None,
     lookback_days: int = 1,
-    pack: Mapping[str, Any] | None = None,
+    experiment: Mapping[str, Any] | None = None,
 ) -> TeacherStudentObjective | SingleModelObjective:
-    """Construct the telemetry objective registered for ``mode`` and the pack source."""
+    """Construct the telemetry objective registered for ``mode`` and the first scorable signal's source."""
     source = _registry.default_source(mode)
     if signals:
         for signal in signals:
@@ -804,12 +806,11 @@ def build_objective(
                 break
     cls = _registry.resolve(mode, source)
     objective = cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
-    configure_objective(objective, pack)
+    configure_objective(objective, experiment)
     return objective
 
 
 __all__ = [
-    "MODE_DEFAULT_PACK",
     "MODE_DEFAULT_TELEMETRY_SOURCE",
     "ScoredRow",
     "SingleModelObjective",

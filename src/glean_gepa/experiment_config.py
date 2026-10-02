@@ -1,4 +1,4 @@
-"""Load packaged Glean GEPA experiment YAML and merge the mode with its signal pack."""
+"""Load a self-contained Glean GEPA experiment YAML."""
 
 from __future__ import annotations
 
@@ -8,22 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from glean_gepa.adapter_types import JudgingMode, PairwiseJudge, PointwiseJudge
+from glean_gepa.adapter_types import EvalHarness, JudgingMode, PairwiseJudge, PointwiseJudge
 from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
 from glean_gepa.judge_metrics_util import CUSTOMER_AGENTIC_PREFERENCE_METRIC, JUDGE_SPEC_NAMES, JUDGE_SPECS
-from glean_gepa.objectives import (
-    MODE_DEFAULT_PACK,
-    is_registered_telemetry_source,
-    is_telemetry_source,
-)
+from glean_gepa.objectives import is_registered_telemetry_source, is_telemetry_source
 
 CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
-PACKS_DIR = CONFIGS_DIR / "packs"
 DEFAULT_EVAL_SET_NAME = "Glean Chat V2 Medium"
 DEFAULT_DEPLOYMENT_IDS = ("scio-prod",)
 
 # Mode is the eval topology. Telemetry sources are registered per mode in
-# glean_gepa.objectives; a pack is valid when its telemetry sources are.
+# glean_gepa.objectives; a signal is scorable when its source is registered for the mode.
 SUPPORTED_MODES: tuple[JudgingMode, ...] = ("single_model", "teacher_student")
 
 # Sources whose signal value is read straight from telemetry or the config, as
@@ -48,11 +43,12 @@ class ExperimentConfigError(ValueError):
 class ExperimentConfig:
     schema_version: int
     mode: JudgingMode
-    packs: tuple[str, ...]
     source_path: Path
     run: dict[str, Any]
     models: dict[str, Any]
     data: dict[str, Any]
+    #: Eval-run creation overrides: ``runner_type``, ``sc_params``.
+    eval: dict[str, Any]
     signals: tuple[dict[str, Any], ...]
     objective: dict[str, Any]
     screening: dict[str, Any]
@@ -85,7 +81,7 @@ def resolve_config_path(value: str | Path) -> Path:
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    """Load a mode YAML, merge its signal pack, and return the resolved experiment."""
+    """Load and validate one experiment YAML. Every section is read from this file."""
     source_path = resolve_config_path(path)
     raw = _load_yaml(source_path)
     if not isinstance(raw, dict):
@@ -96,12 +92,17 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     mode = raw.get("mode")
     if mode not in SUPPORTED_MODES:
         raise ExperimentConfigError(f"mode must be one of {', '.join(sorted(SUPPORTED_MODES))}, got {mode!r}")
-    pack_names, pack = _load_mode_packs(raw.get("packs"), mode=mode, mode_path=source_path)
-    merged_signals = _merge_signals(pack.get("signals") or [], raw.get("signals") or [])
-    merged_objective = _overlay_keeping(pack.get("objective") or {}, raw.get("objective") or {}, ("params",))
-    merged_screening = _overlay(pack.get("screening") or {}, raw.get("screening") or {})
-    merged_reflection = _overlay_keeping(pack.get("reflection") or {}, raw.get("reflection") or {}, ("modules",))
+    if "packs" in raw:
+        raise ExperimentConfigError(
+            f"{source_path} sets `packs`, which is no longer supported; inline the signals, objective, "
+            "screening, and reflection sections into this file"
+        )
+    merged_signals = _parse_signals(raw.get("signals"), mode=mode)
+    merged_objective = dict(raw.get("objective") or {})
+    merged_screening = dict(raw.get("screening") or {})
+    merged_reflection = dict(raw.get("reflection") or {})
     _require_mode_primary_objective(merged_objective.get("primary"), merged_signals, mode=mode)
+    _require_screening_weights(merged_screening, merged_signals, mode=mode)
     _require_scorable_composite_signals(merged_objective, merged_signals, mode=mode)
     _require_normalized_composite_weights(merged_objective.get("composite"))
     _require_unit_valued_weighted_constants(merged_objective, merged_signals)
@@ -110,16 +111,63 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     return ExperimentConfig(
         schema_version=schema_version,
         mode=mode,
-        packs=pack_names,
         source_path=source_path,
         run=dict(raw.get("run") or {}),
         models=dict(raw.get("models") or {}),
         data=dict(raw.get("data") or {}),
+        eval=_parse_eval_section(raw.get("eval")),
         signals=tuple(merged_signals),
         objective=merged_objective,
         screening=merged_screening,
         reflection=merged_reflection,
         search=dict(raw.get("search") or {}),
+    )
+
+
+_EVAL_KEYS = frozenset({"runner_type", "sc_params"})
+
+
+def _parse_eval_section(raw: Any) -> dict[str, Any]:
+    """Validate ``eval:``. ``sc_params`` may be a string or a list of ``key=value``
+    strings (joined with commas). Values are kept verbatim: nested scParams carry
+    their own percent-encoding."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ExperimentConfigError("eval must be a mapping")
+    unknown = set(raw) - _EVAL_KEYS
+    if unknown:
+        raise ExperimentConfigError(f"eval has unknown keys: {', '.join(sorted(unknown))}")
+    out: dict[str, Any] = {}
+    if raw.get("runner_type") is not None:
+        out["runner_type"] = str(raw["runner_type"])
+    for key in ("sc_params",):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            joined = value.strip()
+        elif isinstance(value, list):
+            parts = [str(part).strip() for part in value if str(part).strip()]
+            for part in parts:
+                if "=" not in part:
+                    raise ExperimentConfigError(f"eval.{key} entries must be key=value, got {part!r}")
+            joined = ",".join(parts)
+        else:
+            raise ExperimentConfigError(f"eval.{key} must be a string or a list of key=value strings")
+        if joined:
+            out[key] = joined
+    return out
+
+
+def eval_harness(config: ExperimentConfig | None) -> EvalHarness:
+    """The ``eval:`` section as an :class:`EvalHarness`; defaults when absent."""
+    if config is None:
+        return EvalHarness()
+    section = config.eval
+    return EvalHarness(
+        runner_type=section.get("runner_type"),
+        sc_params=section.get("sc_params"),
     )
 
 
@@ -137,6 +185,11 @@ def runner_arg_defaults(config: ExperimentConfig) -> dict[str, Any]:
         defaults["eval_run_grace_period_sec"] = int(run["eval_run_grace_period_sec"])
     if run.get("seed_candidate"):
         defaults["seed_candidate"] = Path(str(run["seed_candidate"]))
+    if run.get("customer_eval") is not None:
+        customer_eval = run["customer_eval"]
+        if not isinstance(customer_eval, bool):
+            raise ExperimentConfigError(f"run.customer_eval must be true or false, got {customer_eval!r}")
+        defaults["customer_eval"] = customer_eval
     modules = run.get("editable_modules")
     if modules is None:
         modules = config.reflection.get("editable_modules")
@@ -162,6 +215,8 @@ def runner_arg_defaults(config: ExperimentConfig) -> dict[str, Any]:
         defaults["eval_version_days_back"] = int(data["days_back"])
     if data.get("val_version_count") is not None:
         defaults["val_eval_version_count"] = int(data["val_version_count"])
+    if data.get("val_eval_set_name"):
+        defaults["val_eval_set_name"] = str(data["val_eval_set_name"])
     search = config.search
     if "reflection_samples" in search:
         samples = search["reflection_samples"]
@@ -186,31 +241,77 @@ def evalset_identity(config: ExperimentConfig | None) -> tuple[str, list[str]]:
 
 
 def pointwise_judges(config: ExperimentConfig) -> tuple[PointwiseJudge, ...]:
-    return tuple(
+    judges = tuple(
         PointwiseJudge(str(signal["name"]), str(signal["type"]), judge_run_params_json(signal))
         for signal in _enabled_cortex_judges(config.signals, "pointwise")
     )
+    return _with_required_judges(judges, config, kind="pointwise", build=_pointwise_from_spec)
 
 
 def pairwise_judges(config: ExperimentConfig) -> tuple[PairwiseJudge, ...]:
-    judges = tuple(
-        PairwiseJudge(
-            str(signal["name"]),
-            str(signal["type"]),
-            judge_run_params_json(signal),
-            _pairwise_input_mappings(signal),
-        )
-        for signal in _enabled_cortex_judges(config.signals, "pairwise")
+    judges = tuple(_pairwise_from_signal(signal) for signal in _enabled_cortex_judges(config.signals, "pairwise"))
+    return _with_required_judges(judges, config, kind="pairwise", build=_pairwise_from_spec)
+
+
+def _pairwise_from_signal(signal: Mapping[str, Any]) -> PairwiseJudge:
+    """A YAML ``cortex_judge`` signal whose ``type`` is a JudgeSpec name uses that spec's Cortex wiring.
+
+    ``type: AGENTIC_CORRECTNESS_JUDGE`` is an adapter key, not a Cortex type; the spec
+    supplies the real Cortex type and skill name. Other types pass through as-is.
+    """
+    judge_type = str(signal["type"])
+    spec = next((s for s in JUDGE_SPECS.values() if s.kind == "pairwise" and s.judge_type == judge_type), None)
+    # Only adapter-only types inherit the spec's run_params; Cortex types keep the YAML's.
+    adapter_only = spec is not None and spec.cortex_type_override is not None
+    if signal.get("run_params") or not adapter_only:
+        run_params = judge_run_params_json(signal)
+    else:
+        run_params = spec.run_params if spec else "{}"
+    return PairwiseJudge(
+        str(signal["name"]),
+        judge_type,
+        run_params,
+        _pairwise_input_mappings(signal),
+        cortex_type_override=spec.cortex_type_override if spec else None,
+        judge_skill_name=spec.judge_skill_name if spec else None,
     )
-    if config.primary_objective != CUSTOMER_AGENTIC_PREFERENCE_METRIC:
-        return judges
-    spec = JUDGE_SPECS[CUSTOMER_AGENTIC_PREFERENCE_METRIC]
-    if any(judge.name == spec.name for judge in judges):
-        return judges
-    return (
-        *judges,
-        PairwiseJudge(spec.name, spec.judge_type, spec.run_params, spec.input_mappings),
+
+
+def _pointwise_from_spec(spec: Any) -> PointwiseJudge:
+    return PointwiseJudge(spec.name, spec.judge_type, spec.run_params)
+
+
+def _pairwise_from_spec(spec: Any) -> PairwiseJudge:
+    return PairwiseJudge(
+        spec.name,
+        spec.judge_type,
+        spec.run_params,
+        spec.input_mappings,
+        cortex_type_override=spec.cortex_type_override,
+        judge_skill_name=spec.judge_skill_name,
     )
+
+
+def _required_judge_names(config: ExperimentConfig, *, kind: str) -> set[str]:
+    """Judge specs the run must start even when no signal declared them.
+
+    An ``agentic_preference_rate`` primary does this for ``AGENTIC_JUDGE``. A screening
+    weight does it for whichever judge the gate reads.
+    """
+    names = {name for name in screening_weights(config) if name in JUDGE_SPECS}
+    if kind == "pairwise" and config.primary_objective == CUSTOMER_AGENTIC_PREFERENCE_METRIC:
+        names.add(CUSTOMER_AGENTIC_PREFERENCE_METRIC)
+    return {name for name in names if JUDGE_SPECS[name].kind == kind}
+
+
+def _with_required_judges(
+    judges: tuple[Any, ...], config: ExperimentConfig, *, kind: str, build: Any
+) -> tuple[Any, ...]:
+    present = {judge.name for judge in judges}
+    extra = tuple(
+        build(JUDGE_SPECS[name]) for name in sorted(_required_judge_names(config, kind=kind)) if name not in present
+    )
+    return (*judges, *extra)
 
 
 def composite_weights(config: ExperimentConfig) -> dict[str, float]:
@@ -232,8 +333,14 @@ def screening_threshold(config: ExperimentConfig) -> float | None:
     return float(config.screening["threshold"])
 
 
-def experiment_objective_pack(config: ExperimentConfig) -> dict[str, Any]:
-    """Slice of the merged experiment that ``build_objective`` applies to the metric."""
+def screening_weights(config: ExperimentConfig) -> dict[str, float]:
+    """Child-gate blend. Empty means the gate is ``summary[primary]``."""
+    raw = config.screening.get("weights") or {}
+    return {str(name): float(weight) for name, weight in raw.items()}
+
+
+def experiment_objective_spec(config: ExperimentConfig) -> dict[str, Any]:
+    """Slice of the experiment that ``build_objective`` applies to the metric."""
     return {
         "objective": config.objective,
         "reflection": config.reflection,
@@ -312,42 +419,30 @@ def _require_int(raw: Any, *, field: str, default: int) -> int:
         raise ExperimentConfigError(f"{field} must be an integer, got {raw!r}") from exc
 
 
-def _load_mode_packs(raw_packs: Any, *, mode: JudgingMode, mode_path: Path) -> tuple[tuple[str, ...], dict[str, Any]]:
-    """Load packs whose telemetry sources are registered for ``mode``."""
-    if raw_packs is None:
-        names = (MODE_DEFAULT_PACK[mode],)
-    else:
-        if isinstance(raw_packs, str):
-            raise ExperimentConfigError(f"packs must be a list, got {raw_packs!r}")
-        names = tuple(str(name) for name in raw_packs)
-        if not names:
-            raise ExperimentConfigError(f"mode {mode} requires at least one pack")
-    merged_signals: list[Any] = []
-    merged_objective: dict[str, Any] = {}
-    merged_screening: dict[str, Any] = {}
-    merged_reflection: dict[str, Any] = {}
-    for name in names:
-        pack = _load_pack(name, mode_path=mode_path)
-        for signal in pack.get("signals") or []:
-            if not isinstance(signal, dict):
-                continue
-            source = signal.get("source")
-            if source in {_CONSTANT_SOURCE, "cortex_judge", None}:
-                continue
-            if not is_registered_telemetry_source(mode, str(source)):
-                raise ExperimentConfigError(
-                    f"mode {mode} cannot score pack {name!r} (source {source!r} is not registered for this mode)"
-                )
-        merged_signals.extend(pack.get("signals") or [])
-        merged_objective = _overlay_keeping(merged_objective, pack.get("objective") or {}, ("params",))
-        merged_screening = _overlay(merged_screening, pack.get("screening") or {})
-        merged_reflection = _overlay_keeping(merged_reflection, pack.get("reflection") or {}, ("modules",))
-    return names, {
-        "signals": merged_signals,
-        "objective": merged_objective,
-        "screening": merged_screening,
-        "reflection": merged_reflection,
-    }
+def _parse_signals(raw: Any, *, mode: JudgingMode) -> list[dict[str, Any]]:
+    """Validate ``signals``: unique names, and telemetry sources registered for ``mode``."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ExperimentConfigError(f"signals must be a list, got {raw!r}")
+    signals: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for signal in raw:
+        if not isinstance(signal, dict) or "name" not in signal:
+            raise ExperimentConfigError("each signal must be a mapping with a name")
+        name = str(signal["name"])
+        if name in seen:
+            raise ExperimentConfigError(f"signal {name!r} is declared more than once")
+        seen.add(name)
+        source = signal.get("source")
+        if source not in {_CONSTANT_SOURCE, "cortex_judge", None} and not is_registered_telemetry_source(
+            mode, str(source)
+        ):
+            raise ExperimentConfigError(
+                f"mode {mode} cannot score signal {name!r} (source {source!r} is not registered for this mode)"
+            )
+        signals.append(dict(signal))
+    return signals
 
 
 def _enabled_cortex_judges(signals: Sequence[Mapping[str, Any]], kind: str) -> list[Mapping[str, Any]]:
@@ -427,6 +522,47 @@ def _require_scorable_composite_signals(
         )
 
 
+def _require_screening_weights(
+    screening: Mapping[str, Any], signals: list[dict[str, Any]], *, mode: JudgingMode
+) -> None:
+    """Reject a child-gate blend the adapter cannot score.
+
+    Parent selection stays on ``objective.primary``. ``screening.weights`` is only
+    the gate a focused child must clear. A judge named here is started even when
+    no signal declared it.
+    """
+    raw = screening.get("weights")
+    if raw is None:
+        return
+    if screening.get("kind") == "correctness_floor":
+        raise ExperimentConfigError("screening.weights cannot be combined with screening.kind correctness_floor")
+    if not isinstance(raw, Mapping):
+        raise ExperimentConfigError(f"screening.weights must be a mapping of signal name to weight, got {raw!r}")
+    if not raw:
+        raise ExperimentConfigError("screening.weights must weight at least one signal; omit it to gate on the primary")
+    weights: dict[str, float] = {}
+    for name, raw_weight in raw.items():
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, int | float):
+            raise ExperimentConfigError(f"screening.weights weight for {name} must be a number, got {raw_weight!r}")
+        weights[str(name)] = float(raw_weight)
+    negative = sorted(name for name, weight in weights.items() if weight < 0)
+    if negative:
+        raise ExperimentConfigError(f"screening.weights must be non-negative: {', '.join(negative)}")
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-6:
+        detail = ", ".join(f"{name}={weight:g}" for name, weight in sorted(weights.items()))
+        raise ExperimentConfigError(f"screening.weights must sum to 1, got {total:g} ({detail})")
+    scorable = _scorable_signal_names(signals, mode=mode)
+    judge_names = set(JUDGE_SPECS) if mode in _MODES_WITH_CORTEX_JUDGES else set()
+    allowed = scorable | judge_names
+    unknown = sorted(name for name in weights if name not in allowed)
+    if unknown:
+        raise ExperimentConfigError(
+            f"screening.weights names signals that produce no score: {', '.join(unknown)}; "
+            f"scorable signals are {', '.join(sorted(allowed)) or '(none)'}"
+        )
+
+
 def _require_normalized_composite_weights(composite: Any) -> None:
     """Reject weights that cannot produce a score inside 0..1.
 
@@ -499,70 +635,12 @@ def _require_mode_primary_objective(primary: Any, signals: list[dict[str, Any]],
         )
 
 
-def _load_pack(name: str, *, mode_path: Path) -> dict[str, Any]:
-    candidates = [mode_path.parent / "packs" / f"{name}.yaml", PACKS_DIR / f"{name}.yaml"]
-    for path in candidates:
-        if path.is_file():
-            loaded = _load_yaml(path)
-            if not isinstance(loaded, dict):
-                raise ExperimentConfigError(f"pack {name} must be a mapping")
-            return loaded
-    raise ExperimentConfigError(f"unknown pack {name!r}")
-
-
 def _load_yaml(path: Path) -> Any:
     try:
         import yaml
     except ImportError as exc:
         raise ImportError("PyYAML is required to load glean_gepa experiment configs. Install gepa[glean].") from exc
     return yaml.safe_load(path.read_text())
-
-
-def _merge_signals(*groups: list[Any]) -> list[dict[str, Any]]:
-    """Merge signals by name, field by field.
-
-    A mode that re-declares a pack signal usually means to adjust one field, so
-    replacing the whole entry would drop the rest -- losing ``source`` leaves a
-    signal nothing can score, which fails the load. Nested values such as
-    ``run_params`` are still replaced whole, matching ``_overlay``: a partial
-    judge payload is more likely a mistake than an intended merge.
-    """
-    by_name: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for group in groups:
-        for signal in group:
-            if not isinstance(signal, dict) or "name" not in signal:
-                raise ExperimentConfigError("each signal must be a mapping with a name")
-            name = str(signal["name"])
-            if name not in by_name:
-                order.append(name)
-            by_name[name] = {**by_name.get(name, {}), **signal}
-    return [by_name[name] for name in order]
-
-
-def _overlay(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
-    """Overlay top-level keys, replacing container values instead of merging them.
-
-    ``objective.composite`` must replace the pack's wholesale: merging the two would
-    make a weight the pack declared impossible to remove, and would let the surviving
-    weights sum past 1 without anyone noticing.
-    """
-    return {**base, **overlay}
-
-
-def _overlay_keeping(base: dict[str, Any], overlay: Mapping[str, Any], merged_keys: Sequence[str]) -> dict[str, Any]:
-    """Like ``_overlay``, but field-merge the named nested maps instead of replacing them.
-
-    ``objective.params`` and ``reflection.modules`` are knobs a mode YAML should be
-    able to retune one-at-a-time without restating the rest of the pack.
-    """
-    merged = _overlay(base, overlay)
-    for key in merged_keys:
-        left = base.get(key)
-        right = overlay.get(key)
-        if isinstance(left, Mapping) or isinstance(right, Mapping):
-            merged[key] = {**(left or {}), **(right or {})}
-    return merged
 
 
 def _require_focused_bucket_type(bucket: Any) -> None:

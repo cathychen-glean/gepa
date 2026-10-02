@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ from glean_gepa.adapter_types import (
     ALDataInst,
     ALRolloutOutput,
     ALTrajectory,
+    EvalHarness,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import (
@@ -33,15 +35,21 @@ from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, prepare_high
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
 from glean_gepa.reflection_prompts import (
     EMPTY_DIAGNOSIS_FALLBACK,
+    DiagnosisReply,
     consolidate_prompt,
     diagnosis_prompt,
+    diagnosis_retry_preface,
+    drops_conditional,
     drops_render_slot,
     length_rule_for,
     module_char_budget,
+    new_module_length_rule,
+    parse_diagnosis_reply,
     sanitize_proposed_module,
 )
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
+from glean_gepa.waldo_harness_params import WALDO_HARNESS_SC_PARAMS
 
 
 def _write_json_atomically(path: str, data: Any) -> None:
@@ -84,7 +92,6 @@ CODING_HARNESS_SC_PARAMS = (
     "db.get_doc_metadata=true,"
     "co.lo.enable_agent_recommendation=false,"
     "ro.feso.slso.drop_slack_native=false,"
-    "ro.feso.slso.rts_count=0,"
     "ro.feso.slso.skip_inline_rts=true,"
     "co.disable_full_document_content=true,"
     "wo.plan_only_dry_run_for_write_actions=true,"
@@ -141,7 +148,52 @@ DEFAULT_AGENTIC_LOOP_MODELS = frozenset({"gpt", "fast"})
 AGENTIC_LOOP_MODEL_OVERRIDES = {
     "claude_sonnet": "CLAUDE_4_6_SONNET_20260217",
     "claude_opus": "CLAUDE_5_OPUS",
+    "gpt6_luna": "GPT6_LUNA",
+    "gpt6_sol": "GPT6_SOL",
+    # GPT-6.1 Sol. "high" is the reasoning effort, pinned below, not a separate enum.
+    "gpt6_1_sol_high": "GPT6_1_SOL",
 }
+# Alias -> reasoning effort. Harness evals run as ADVANCED. Auto routing reads the
+# model-router driver effort; otherwise the advanced-mode override wins over the
+# medium default. GPT6_LUNA is already high in the deployment default; GPT6_SOL is not.
+AGENTIC_LOOP_REASONING_EFFORT = {
+    "gpt6_1_sol_high": "high",
+}
+
+# --- Waldo ---
+# Waldo is the lightweight router that runs before the agentic loop. It is off by
+# default in eval runs; scio gates it on `co.lo.icpo.should_run_waldo_qe`
+# (ic_preloop_context.is_waldo_enabled). Its model comes from
+# `co.lo.icpo.waldo_model` as `PROVIDER:MODEL[:effort]` (waldo_agent.resolve_waldo_model),
+# defaulting to BASETEN:WALDO. The model alias `waldo` turns it on with the default
+# model; `waldo:PROVIDER:MODEL[:effort]` turns it on with that model.
+#
+# Waldo evals use their own harness preset (WALDO_HARNESS_SC_PARAMS), not the Coding
+# Harness one: a different inner-loop config (`agentic_loop_sc_params_exp`, stripped
+# prompts, a 4-tool core set) plus the icpo Waldo knobs (max_loops, timeout, service
+# tier, handoff rules). Teacher and student share that preset and differ only in
+# `waldo_model` and the prompt override.
+WALDO_MODEL_ALIAS = "waldo"
+WALDO_DEFAULT_MODEL = "BASETEN:WALDO"
+WALDO_ENABLE_SC_PARAM = "co.lo.icpo.should_run_waldo_qe=true"
+WALDO_MODEL_SC_PARAM = "co.lo.icpo.waldo_model"
+
+
+def parse_waldo_alias(model: str) -> str | None:
+    """Return the Waldo model spec for a ``waldo[:PROVIDER:MODEL[:effort]]`` alias, else ``None``.
+
+    ``waldo`` alone selects :data:`WALDO_DEFAULT_MODEL`. Anything after the first
+    colon is passed through to ``co.lo.icpo.waldo_model`` unchanged.
+    """
+    if model == WALDO_MODEL_ALIAS:
+        return WALDO_DEFAULT_MODEL
+    prefix = WALDO_MODEL_ALIAS + ":"
+    if model.startswith(prefix):
+        spec = model[len(prefix) :]
+        if not spec or ":" not in spec:
+            raise ValueError(f"Waldo model must be PROVIDER:MODEL[:effort], got {spec!r} in {model!r}")
+        return spec
+    return None
 
 
 # ---------------------------
@@ -162,7 +214,7 @@ class ModuleSpec:
 
 @dataclass
 class Candidate:
-    model: str  # "gpt" | "fast" | "claude_sonnet" | "claude_opus"
+    model: str  # "gpt" | "fast" | "claude_sonnet" | "claude_opus" | "gpt6_luna" | "gpt6_sol" | "gpt6_1_sol_high"
     prompt_modules: dict[str, str]  # Editable keys, e.g. {"WRITING_CODE": "..."}
     module_specs: dict[str, ModuleSpec]
     global_token_cap: int  # relative to baseline prompt for that model
@@ -329,9 +381,12 @@ class ALRunner:
         cache_file: str | None = None,
         eval_run_timeout_sec: int | None = None,
         eval_run_grace_period_sec: int | None = None,
+        harness: EvalHarness | None = None,
     ):
         self.evalcli = evalcli
         self.deployment_ids = deployment_ids or ["scio-prod"]
+        # Per-experiment eval-run overrides (the YAML `eval:` section).
+        self.harness = harness or EvalHarness()
         self.cache_file = os.path.expanduser(cache_file) if cache_file else None
         self.eval_run_timeout_sec = eval_run_timeout_sec
         self.eval_run_grace_period_sec = eval_run_grace_period_sec
@@ -553,13 +608,36 @@ class ALRunner:
         """Build scParams based on model type."""
         # Start with the exact Coding Harness preset. It is a single string
         # because nested values intentionally contain encoded commas.
-        base_params = [CODING_HARNESS_SC_PARAMS]
+        waldo_model = parse_waldo_alias(model)
+        if waldo_model is not None:
+            base_params = [
+                self.harness.sc_params or WALDO_HARNESS_SC_PARAMS,
+                WALDO_ENABLE_SC_PARAM,
+                f"{WALDO_MODEL_SC_PARAM}={waldo_model}",
+            ]
+            # Waldo reads llmo.per_prompt_overrides.waldo_system from the compiled prompt.
+            if system_prompt and system_prompt != "<<TEACHER_PROD_PROMPT>>":
+                base_params.append(system_prompt)
+            return ",".join(base_params)
+
+        base_params = [self.harness.sc_params or CODING_HARNESS_SC_PARAMS]
 
         override = AGENTIC_LOOP_MODEL_OVERRIDES.get(model)
         if override:
             base_params.append(f"co.lo.oai_model_for_agentic_loop={override}")
         elif model not in DEFAULT_AGENTIC_LOOP_MODELS:
             raise ValueError(f"Unknown model: {model}")
+
+        effort = AGENTIC_LOOP_REASONING_EFFORT.get(model)
+        if effort:
+            # Non-auto path. The per-model key is the ChatModel enum (model_id).
+            base_params.append(f"co.lo.advanced_mode_reasoning_effort={effort}")
+            if override:
+                base_params.append(f"co.lo.advanced_mode_model_reasoning_overrides={override}:{effort}")
+            # Auto-routing path. The harness sets use_auto_mode, and that path
+            # ignores the advanced-mode fields above.
+            for tier in ("economical", "balanced", "frontier"):
+                base_params.append(f"co.lo.mro.{tier}.driver_reasoning_effort={effort}")
 
         # Add system prompt override if provided (and not the placeholder)
         if system_prompt and system_prompt != "<<TEACHER_PROD_PROMPT>>":
@@ -598,12 +676,16 @@ class ALRunner:
             return resolved
 
         id_token = hashlib.md5("|".join(cache_key).encode()).hexdigest()[:16]
-        eval_id = f"{run_label}_{model}_{id_token}_{int(time.time())}"
+        # `waldo:PROVIDER:MODEL` aliases carry colons; keep eval ids to [A-Za-z0-9_].
+        model_label = re.sub(r"[^A-Za-z0-9_]+", "_", model).strip("_")
+        eval_id = f"{run_label}_{model_label}_{id_token}_{int(time.time())}"
         sc_params = self._build_sc_params(model, system_prompt)
         eval_params = "experimental_queue=eval-experimental-2"
         if model == "fast":
             eval_params += ",gleanchat_agent=FAST"
         else:
+            # Waldo aliases run ADVANCED too: is_waldo_enabled requires the
+            # internal-coding route, which only the advanced agent takes.
             eval_params += ",gleanchat_agent=ADVANCED"
 
         print(f"Creating eval run {eval_id} for {eval_set_name}:{eval_set_version}...")
@@ -615,6 +697,7 @@ class ALRunner:
             description=f"GEPA eval run for {eval_set_name}:{eval_set_version}",
             sc_params=sc_params,
             eval_params=eval_params,
+            **({"runner_type": self.harness.runner_type} if self.harness.runner_type else {}),
         )
         self._remember_in_flight(cache_key, created_id)
         if on_created is not None:
@@ -653,12 +736,19 @@ class ALRunner:
         run_params: str,
         base_eval_run_id: str | None = None,
         input_mappings: str | None = None,
+        cortex_judge_type: str | None = None,
+        judge_skill_name: str | None = None,
     ) -> str:
         """Return a judge run for this eval pair, reusing one if it already exists.
 
         Judge runs are expensive, so this checks the persistent cache first, then Cortex
         itself, and only creates a new run when neither turns one up.
+
+        ``judge_type`` is the cache key; ``cortex_judge_type`` (default: the same) is
+        what Cortex is asked for. ``judge_skill_name`` disambiguates reuse when several
+        judges share one Cortex type.
         """
+        cortex_type = cortex_judge_type or judge_type
         cache_key = (eval_run_id, base_eval_run_id or "", judge_type.upper())
         with self._cache_lock:
             cached = self._judge_run_ids.get(cache_key)
@@ -666,10 +756,9 @@ class ALRunner:
             print(f"[{judge_type}] Reusing cached judge run {cached} for eval {eval_run_id}")
             return cached
 
+        skill_filter = {"judge_skill_name": judge_skill_name} if judge_skill_name else {}
         existing = self.evalcli.find_judge_run_id(
-            eval_run_id,
-            judge_type=judge_type,
-            base_eval_run_id=base_eval_run_id,
+            eval_run_id, judge_type=cortex_type, base_eval_run_id=base_eval_run_id, **skill_filter
         )
         if existing:
             print(f"[{judge_type}] Reusing existing judge run {existing} for eval {eval_run_id}")
@@ -678,7 +767,7 @@ class ALRunner:
 
         judge_run_id = self.evalcli.create_judge_run(
             eval_run_id=eval_run_id,
-            judge_type=judge_type,
+            judge_type=cortex_type,
             run_params=run_params,
             base_eval_run_id=base_eval_run_id,
             input_mappings=input_mappings,
@@ -707,7 +796,7 @@ class ALRunner:
         Trigger an eval run, wait for completion, and return the eval_run_id.
 
         Args:
-            model: "gpt", "fast", "claude_sonnet", or "claude_opus"
+            model: "gpt", "fast", "claude_sonnet", "claude_opus", "gpt6_luna", "gpt6_sol", or "gpt6_1_sol_high"
             system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
             eval_set_name: Name of the eval set
             eval_set_version: Version of the eval set
@@ -1120,6 +1209,8 @@ class Thresholds:
 class GleanAdapterBase:
     supports_high_signal_eval = False
     screening_kind: str | None = None
+    # Child-gate blend. Empty keeps the gate on ``summary[primary]``.
+    screening_weights: dict[str, float]
 
     #: Dimensions the subclass resolves from evaluation telemetry, as opposed to the
     #: constants and judge scores the base already knows about.
@@ -1149,6 +1240,7 @@ class GleanAdapterBase:
         self.thresholds = thresholds
         self.student_model = student_model
         self.primary_objective = primary_objective
+        self.screening_weights = {}
         self.composite_weights = dict(composite_weights)
         self.constant_scores = dict(constant_scores)
         self._extra_scorable_dimensions = frozenset(extra_scorable_dimensions)
@@ -1334,7 +1426,18 @@ class GleanAdapterBase:
         return eval_batch.summary.get(self.primary_objective, float("-inf"))
 
     def child_screen_score(self, parent_eval: GleanEvaluationBatch, child_eval: GleanEvaluationBatch) -> float:
-        """Score a focused child screen. Default is the high-signal fix rate."""
+        """Score a focused child screen.
+
+        ``screening.weights`` blends summary metrics and leaves parent selection
+        on ``get_screening_score`` (the primary). Otherwise the gate is the
+        correctness floor or the primary's high-signal fix rate.
+        """
+        # getattr: tests build bare adapters via __new__ without running __init__.
+        weights = getattr(self, "screening_weights", None) or {}
+        if weights:
+            if child_eval.summary is None:
+                return float("-inf")
+            return sum(weight * float(child_eval.summary.get(name, 0.0)) for name, weight in weights.items())
         if self.screening_kind == "correctness_floor":
             if child_eval.summary is None:
                 return float("-inf")
@@ -1571,19 +1674,36 @@ class GleanAdapterBase:
         )
 
         raw = reflection_llm(prompt).strip()
+        reply = parse_diagnosis_reply(raw, current=current)
+        if reply.is_module_rewrite:
+            print(f"Reflection returned a rewrite of {module_name} instead of a diagnosis; asking again")
+            raw = reflection_llm(diagnosis_retry_preface(module_name) + prompt).strip()
+            reply = parse_diagnosis_reply(raw, current=current)
+        if reply.is_module_rewrite:
+            # Twice a rewrite: consolidate it as an untallied suggestion rather than lose the round,
+            # but say so in the run log instead of passing the module text off as a diagnosis.
+            print(f"Reflection returned a rewrite of {module_name} again; consolidating it without a diagnosis")
+            reply = DiagnosisReply(
+                diagnosis=f"(reflector returned a rewrite of {module_name} instead of a diagnosis)",
+                patches=raw,
+                is_module_rewrite=True,
+            )
         if raw.upper() == "NOT_RELEVANT" or not raw:
-            raw = EMPTY_DIAGNOSIS_FALLBACK
+            reply = DiagnosisReply(diagnosis="", patches=EMPTY_DIAGNOSIS_FALLBACK, is_module_rewrite=False)
 
-        # Simple parser strategy:
-        # In production, parse structured JSON/YAML, or ask LLM to output patches in JSON.
-        # Here we just return one consolidated rewrite request for a second pass:
+        consolidate_length = length_rule
+        budget = module_char_budget(current, token_budget)
+        if not current.strip() and reply.patches and not reply.is_module_rewrite:
+            consolidate_length, budget = new_module_length_rule(reply.patches, budget)
+
         consolidate_text = consolidate_prompt(
             module_name=module_name,
             max_variants=max_variants,
-            consolidate_length=length_rule,
+            consolidate_length=consolidate_length,
             current=current,
             example_blocks="".join(ex_blocks),
-            suggestions=raw,
+            suggestions=reply.patches or reply.suggestions,
+            diagnosis="" if reply.is_module_rewrite else reply.diagnosis,
         )
         consolidated = reflection_llm(consolidate_text).strip()
         variants = []
@@ -1594,8 +1714,11 @@ class GleanAdapterBase:
             if drops_render_slot(variant, current=current):
                 print(f"Discarding {module_name} variant that dropped a render slot")
                 continue
+            if drops_conditional(variant, current=current):
+                print(f"Discarding {module_name} variant that dropped a <<<[[...]]>>> conditional")
+                continue
+            if budget is not None and len(variant) > budget:
+                print(f"Discarding {module_name} variant of {len(variant)} chars (budget {budget})")
+                continue
             variants.append(variant)
-        budget = module_char_budget(current, token_budget)
-        if budget is not None:
-            variants = [variant for variant in variants if len(variant) <= budget]
-        return variants[:max_variants], False, raw
+        return variants[:max_variants], False, reply.suggestions

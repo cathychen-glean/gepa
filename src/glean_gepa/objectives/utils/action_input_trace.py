@@ -261,6 +261,24 @@ def fetch_action_inputs_by_entry(
     return resolved
 
 
+def fetch_named_tool_inputs_by_entry(
+    evalcli: Any,
+    locators: Iterable[TraceActionInputLocator],
+    *,
+    skip_tools: frozenset[str] = frozenset(),
+    limit: int | None = None,
+    max_fetches: int = DEFAULT_MAX_TRACE_FETCHES,
+    role_label: str = "",
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Fetch detailed traces and return ``{entry_id: ((tool_name, payload), ...)}``."""
+    resolved: dict[str, tuple[tuple[str, str], ...]] = {}
+    for entry_id, trace in _iter_entry_traces(evalcli, locators, max_fetches=max_fetches, role_label=role_label):
+        pairs = extract_trace_tool_inputs(trace, skip_tools=skip_tools, limit=limit)
+        if pairs:
+            resolved[entry_id] = pairs
+    return resolved
+
+
 def fetch_first_tool_inputs_by_entry(
     evalcli: Any,
     locators: Iterable[TraceActionInputLocator],
@@ -287,5 +305,6 @@ __all__ = [
     "extract_trace_tool_inputs",
     "fetch_action_inputs_by_entry",
     "fetch_first_tool_inputs_by_entry",
+    "fetch_named_tool_inputs_by_entry",
     "trace_locators_for_rows",
 ]

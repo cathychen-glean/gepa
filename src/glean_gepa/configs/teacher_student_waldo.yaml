@@ -1,0 +1,177 @@
+# Waldo routing experiment (teacher-student).
+#
+# Goal: tune the Waldo "Tool Usage Guidelines" section so the lightweight router
+# picks the same first tool a stronger model would, without regressing
+# agentic-judge correctness. Routing (escalate vs answer) is scored only insofar
+# as it shows up in tool choice; see the note on `discover` under `objective`.
+#
+# Teacher: there is no strong Waldo-class model, so the teacher is a high-reasoning
+# frontier model running the SAME Waldo prompt and harness. Its first tool call is
+# the reference the student is scored against (`tool_alignment`).
+#
+# Run:  uv run python -m glean_gepa.runner --config teacher_student_waldo
+#
+# STATUS: runs on Glean Chat V2 Medium (scio-prod) with train/val pinned below and
+# the external customer eval off (run.customer_eval). Swap in the Waldo team's
+# routing set (gap-2) when it is in EvalCLI. Other TODOs are tuning.
+
+schema_version: 1
+mode: teacher_student
+
+run:
+  dir: run_ts_waldo
+  max_metric_calls: 10
+  # External (customer) eval after the search: seed vs best on the val set, gated by
+  # objective.validation. Off while customer evals are unavailable; flip to true (or
+  # pass --customer_eval) to re-enable. The in-loop search is unaffected.
+  customer_eval: false
+  eval_run_timeout_sec: 21600
+  # Seed is the LIVE production Waldo prompt (from a Waldo eval's
+  # llmo.per_prompt_overrides.waldo_system), split into WALDO_SYSTEM (template with
+  # the {WALDO_TOOL_USAGE} slot) and WALDO_TOOL_USAGE (the "Glean Search Argument
+  # Construction" rules + search-tool conditionals). It is ~4x the stock
+  # waldo_system.prompt in scio master; do not seed from the stock defaults.
+  seed_candidate: data/waldo_seed_candidate.json
+  editable_modules: [WALDO_TOOL_USAGE]
+
+models:
+  # `waldo[:PROVIDER:MODEL[:effort]]` turns on the Waldo router
+  # (co.lo.icpo.should_run_waldo_qe) and sets co.lo.icpo.waldo_model. Bare `waldo`
+  # is scio's default BASETEN:WALDO. The sample Waldo eval ran OPEN_AI:GPT6_LUNA:none.
+  # TODO(gap-1): confirm with the team which deployment they are tuning for.
+  student: waldo:OPEN_AI:GPT6_LUNA:none
+  teacher: waldo:OPEN_AI:GPT6_1_SOL:high
+  reflection: OPEN_AI:GPT5_LATEST
+
+eval:
+  # EvalCLI --runner-type. Waldo evals run on the standard Glean Chat runner.
+  runner_type: GLEAN_CHAT
+  # Base scParams for every eval run in this experiment (teacher and student).
+  # Taken from a production Waldo eval on 2026-10-01. Replaces the alias's built-in
+  # harness preset (WALDO_HARNESS_SC_PARAMS). The runner appends per run:
+  #   co.lo.icpo.should_run_waldo_qe=true, co.lo.icpo.waldo_model=<from models.*>,
+  #   llmo.per_prompt_overrides.waldo_system=<compiled candidate>.
+  # Values are verbatim; nested params keep their %-encoding. Long entries are
+  # single-line on purpose: YAML folding would corrupt the encoding.
+  sc_params:
+    - "co.internal_looping_pyagent_default_route_override=coding_agent_loop"
+    - "co.lo.mo.slwo.disabled=1"
+    - "ro.scholastic_required=true"
+    - "db.disable_usr=true"
+    - "db.filter_query_debug_results=true"
+    - "db.filter_bad_query_jiras=true"
+    - "db.include_final_scores=true"
+    - "ro.ro.fetch_supplemental_results=false"
+    - "db.ranking_only=true"
+    - "db.debug_mode=1"
+    - "co.debug_only_disabled_tools_list=gmail_search;outlook_search;respond;think;curl"
+    - "db.get_doc_metadata=true"
+    - "co.lo.enable_agent_recommendation=false"
+    - "ro.feso.slso.drop_slack_native=false"
+    - "ro.feso.slso.skip_inline_rts=true"
+    - "co.disable_full_document_content=true"
+    - "wo.plan_only_dry_run_for_write_actions=true"
+    - "wo.plan_only_dry_run_for_write_actions_in_actas=true"
+    - "co.lo.cao.agentic_loop_sc_params_exp=co.lo.cao.use_stripped_prompts%3D1%2Cco.lo.fast_mode_core_tools_only%3Dfalse%2Cco.so.ptc_only_tools%3Dglean_search%253Bglean_document_reader%253Bdiscover%253Bask_user_questions%2Cco.lo.cao.core_tools_set%3Dglean_search%253Bglean_document_reader%253Bdiscover%253Bask_user_questions%2Cco.lo.cao.bare_tool_configs%3DCode%2520Search%253Acode_search%2528query%252C%2520exhaustive%253F%252C%2520extension%253F%2529.%2520Search%2520company%2520code%252C%2520configs%252C%2520schemas%252C%2520commits%252C%2520and%2520snippets.%2520Primary%2520tool%2520for%2520any%2520technical%2520question%2520about%2520implementation%2520ground%2520truth%252C%2520system%2520behavior%252C%2520code%2520locations%252C%2520bugs%252C%2520errors%252C%2520config%2520keys%252C%2520APIs%252C%2520data%2520models%252C%2520feature%2520flags%252C%2520or%2520how%252Fwhere%252Fwhy%2520something%2520is%2520implemented.%2520Set%2520exhaustive%2520only%2520when%2520the%2520user%2520asks%2520for%2520all%2520or%2520every%2520match.%253BWeb%2520Search%253Aweb_search%2528query%252C%2520freshness%253F%2529.%2520Public%2520web%2520search.%2520Set%2520freshness%2520to%2520%2522pd%2522%252C%2520%2522pw%2522%252C%2520%2522pm%2522%252C%2520or%2520%2522YYYY-MM-DDtoYYYY-MM-DD%2522%2520only%2520when%2520the%2520query%2520asks%2520for%2520current%2520or%2520time-bounded%2520information.%253BEmployee%2520Search%253Aemployee_search%2528query%252C%2520startafter%253F%252C%2520startbefore%253F%252C%2520roletype%253F%252C%2520reportsto%253F%252C%2520exhaustive%253F%252C%2520sortby%253F%252C%2520peoplenamesoremails%253F%2529.%2520People%2520and%2520org%2520directory.%2520query%2520is%2520required.%2520Pass%2520%2522%252A%2522%2520when%2520you%2520only%2520want%2520filters%252C%2520e.g.%2520employee_search%2528%2522%252A%2522%252C%2520reportsto%253D%2522Jane%2520Doe%2522%2529%2520for%2520a%2520manager%2527s%2520direct%2520reports.%2520peoplenamesoremails%2520takes%2520up%2520to%252025%2520names%2520or%2520emails.%2520Use%2520reportsto%2520only%2520for%2520who%2520reports%2520to%2520X%252C%2520never%2520for%2520who%2520X%2520reports%2520to.%253BUser%2520Activity%2520Retrieve%253ARetrieves%2520the%2520current%2520user%2527s%2520own%2520cross-app%2520work%2520activity%2520%2528docs%252C%2520PRs%252C%2520tickets%252C%2520messages%252C%2520meetings%2529%2520over%2520a%2520date%2520range.%2520Self%2520only%253A%2520for%2520another%2520person%2527s%2520activity%2520use%2520glean_search%2520with%2520the%2520from_%2520filter.%253BMap%253ARuns%2520parallel%2520subtasks%2520across%2520multiple%2520inputs.%2520Use%2520sparingly.%253BCode%2520Repository%2520Agent%253AMakes%2520code%2520changes%2520and%2520creates%2520PRs%253BEmail%2520Search%2520V2%253ASearches%2520over%2520the%2520user%2527s%2520emails%253BSandbox%2520File%2520View%253AView%2520image%2520files%2520%2528.jpg%252F.jpeg%252F.png%2529%2520from%2520the%2520sandbox%2520for%2520visual%2520inspection%253BData%2520Analysis%253Adata_analysis%2528%2529.%2520Use%2520for%2520SQL%252C%2520analytics%252C%2520BI%252C%2520metrics%252C%2520KPIs%252C%2520or%2520CRM%252Fpipeline%2520queries.%2520Returns%2520a%2520routing%2520playbook%2520across%2520the%2520connected%2520data%2520sources.%2520Run%2520it%2520first%2520with%2520no%2520arguments%2520before%2520drilling%2520into%2520a%2520specific%2520data%2520source.%2Cco.lo.cao.bare_tools_redlist%3Dsalesforce_context_selector%253Bjira_schema_reader%253Bknowledge_graph_query%253Bknowledge_graph_schema%2Cco.skip_discovery_warm_start%3D1%2Cco.disable_full_document_content%3Dtrue%2Cco.so.ptc_result_md_preview%3Dtrue%2Cco.so.preserve_all_ptc_tool_output_paths_on_clear%3D1%2Cco.lo.enable_todo%3D0%2Cco.so.ptc_always_included_skills%3Dartifact_email%253Bartifact_email_sandbox%253Bartifact_html%253Bartifact_html_sandbox%253Bartifact_inline_html%253Bartifact_md%253Bartifact_md_sandbox%253Bartifact_message%253Bartifact_message_sandbox%253Bartifact_podcast%253Bartifact_podcast_sandbox%253Bartifact_scribe%253Bartifact_skill_type%253Bartifact_skill_type_sandbox%253Bartifact_slides%253Bartifact_spreadsheet%253Bmemory%253Bhtml_artifact_guide%253Bexhaustive_pagination%2Cco.skill_description_overrides%3Dartifact_email_sandbox%253AQ3JlYXRlIG9yIGVkaXQgLmVtYWlsIGFydGlmYWN0cyB3aGVuIGRyYWZ0aW5nIG9yIHJldmlzaW5nIGVtYWlsLCBpbmNsdWRpbmcgcmVwbGllcyB3aGVuIGVtYWlsIGNvbnRleHQgaXMgY2xlYXIu%253Bartifact_html_sandbox%253AQ3JlYXRlIG9yIGVkaXQgc2VsZi1jb250YWluZWQgLmh0bWwgYXJ0aWZhY3RzIGluIHRoZSBzYW5kYm94IGZvciB2aXN1YWwgb3IgaW50ZXJhY3RpdmUgZGVsaXZlcmFibGVzLiBGb2xsb3cgdGhlIEhUTUwgYXJ0aWZhY3Qgc3RydWN0dXJlLCB2aXN1YWwgZGVzaWduLCBhbmQgc2FuZGJveCBlZGl0aW5nIHJ1bGVzLg%253D%253D%253Bartifact_md_sandbox%253AQ3JlYXRlIG9yIGVkaXQgLm1kIGFydGlmYWN0cyBpbiB0aGUgc2FuZGJveCBmb3IgcmVwb3J0cywgcGxhbnMsIHdyaXRldXBzLCBhbmQgb3RoZXIgZG9jdW1lbnQgZGVsaXZlcmFibGVzIG5vdCBjb3ZlcmVkIGJ5IGFub3RoZXIgYXJ0aWZhY3QgZm9ybWF0Lg%253D%253D%253Bartifact_message_sandbox%253AQ3JlYXRlIG9yIGVkaXQgLm1lc3NhZ2UgYXJ0aWZhY3RzIHdoZW4gZHJhZnRpbmcgb3IgcmV2aXNpbmcgbWVzc2FnZXMsIHBvc3RzLCBvciByZXBsaWVzIGZvciBvdGhlcnMuIFVzZSBmb3IgY29tbXVuaWNhdGlvbiBkcmFmdHMgd2hlbiB0aGUgY2hhbm5lbCBpcyB1bnNwZWNpZmllZC4%253D%253Bartifact_podcast_sandbox%253AQ3JlYXRlIC5hdWRpbyBhcnRpZmFjdHMgaW4gdGhlIHNhbmRib3ggZm9yIHBvZGNhc3RzLCBuYXJyYXRlZCByZWNhcHMsIGFuZCBhdWRpbyBicmllZnMuIFVzZSBhIHNpbmdsZSBuYXJyYXRvciBhbmQgZml4ZWQgdm9pY2Ugc2V0dGluZ3Mu%253Bartifact_skill_type_sandbox%253AQ3JlYXRlIG9yIGVkaXQgLnNraWxsIGFydGlmYWN0cyBpbiB0aGUgc2FuZGJveC4gV3JpdGUgcmV1c2FibGUgYWdlbnQgaW5zdHJ1Y3Rpb25zIHdpdGggWUFNTCBmcm9udG1hdHRlciB1bmRlciBza2lsbHMve25hbWV9LyBhbmQgZm9sbG93IHRoZSBza2lsbC1maWxlIHN0cnVjdHVyZS4%253D%253Bartifact_slides%253AQ3JlYXRlIG9yIGVkaXQgLnNsaWRlcyBhcnRpZmFjdHMgdGhyb3VnaCB0aGUgc2FuZGJveCByZW5kZXIgZmxvdy4gRm9sbG93IHNsaWRlIGRlY2sgc3RydWN0dXJlLCBpbWFnZSwgbWFya2Rvd24sIGFuZCBkZWxpdmVyeSBydWxlcy4%253D%253Bartifact_spreadsheet%253AQ3JlYXRlLCBpbnNwZWN0LCBhbmFseXplLCBlZGl0LCBhbmQgdmVyaWZ5IC54bHN4IHNwcmVhZHNoZWV0IGFydGlmYWN0cyB0aHJvdWdoIHNhbmRib3ggY29kZS4gVXNlIGZvciBzcHJlYWRzaGVldHMsIGZpbmFuY2lhbCBtb2RlbHMsIHRhYnVsYXIgZGVsaXZlcmFibGVzLCBhbmQgd29ya2Jvb2sgYW5hbHlzaXMu%253Bautomation_trigger_configuration%253AVXNlIHdoZW4gdGhlIHVzZXIgYXNrcyB0byBjcmVhdGUgYW4gYXV0b21hdGlvbiB0aGF0IHJ1bnMgaW4gcmVzcG9uc2UgdG8gYSBjb250ZW50IGV2ZW50IChhIGRvY3VtZW50IGJlaW5nIGNyZWF0ZWQsIHVwZGF0ZWQsIG9yIGRlbGV0ZWQpLCBOIG1pbnV0ZXMgYmVmb3JlIGEgY2FsZW5kYXIgZXZlbnQsIG9yIHNjb3BlZCB0byBhIHNwZWNpZmljIGRvY3VtZW50LiBOb3QgbmVlZGVkIGZvciBwdXJlbHkgdGltZS1zY2hlZHVsZWQgYXV0b21hdGlvbnMsIHdoaWNoIHVzZSBhbiBSRkMgNTU0NSBSUlVMRS4K%2Cco.so.enable_dev_message_at_max_turns%3Dfalse%2Cco.so.compact_max_chars%3D20000%2Cco.so.compact_max_chars_per_tool%3Dglean_document_reader%253A50000%253Buser_activity_retrieve%253A50000%2Cco.lo.cmpo.tool_output_compact_max_chars%3D20000%2Cco.lo.cmpo.tool_output_compact_max_chars_per_tool%3Dglean_document_reader%253A50000%253Buser_activity_retrieve%253A50000%253Bshell%253A200000%2Cco.so.omit_file_path_when_no_compaction%3Dfalse%2Cco.lo.cao.hide_shell_tool_output_file_path%3Dfalse%2Cro.qnao.expanded_snippet_size%3D2000"
+    - "co.lo.icpo.max_loops=3"
+    - "co.lo.icpo.enable_ic_preloop_tool_output_compaction=true"
+    - "co.lo.icpo.skip_waldo_after_user_turns=2"
+    - "co.lo.icpo.skip_waldo_escalation_discovery=true"
+    - "co.lo.icpo.waldo_timeout_seconds=5"
+    - "llmo.per_prompt_overrides.stripped_artifact_instructions=IyMgQXJ0aWZhY3RzCkNyZWF0ZSBhbiBhcnRpZmFjdCB3aGVuIHRoZSB1c2VyIGFza3MgZm9yIGNvbnRlbnQgdG8gdXNlIG91dHNpZGUgdGhpcyBjb252ZXJzYXRpb246IGRvY3VtZW50cywgcGxhbnMsIGFnZW5kYXMsIG91dGxpbmVzLCBzY3JpcHRzLCBwcm9tcHRzLCBhbmQgYW55IGVtYWlsLCBtZXNzYWdlLCBwb3N0LCBvciByZXBseSB0byBzZW5kLCBob3dldmVyIHNob3J0LCBpbmNsdWRpbmcgYSByZXdyaXRlIG9mIG9uZS4gRG8gdGhpcyBldmVuIGlmIGFza2VkIHRvIHNlbmQgb3IgcG9zdC4gQXNzdW1lIG1pc3NpbmcgcHJlZmVyZW5jZXMgKGF1ZGllbmNlLCB0b25lLCBsZW5ndGgsIHNjb3BlKSBhbmQgc3RhdGUgdGhlbSByYXRoZXIgdGhhbiBhc2tpbmcuIFJlYWQgYW5kIGZvbGxvdyB0aGUgbWF0Y2hpbmcgYXJ0aWZhY3Qgc2tpbGw7IHVzZSB0aGUgZm9ybWF0IHRoZSB1c2VyIG5hbWVzLCBlbHNlIGluZmVyIGl0LCBkZWZhdWx0aW5nIHRvIGAubWRgLiBFZGl0IGV4aXN0aW5nIGFydGlmYWN0cyBpbiBwbGFjZS4gS2VlcCBpbiBjaGF0OiBjb250ZW50IG9ubHkgZm9yIHRoZSB1c2VyIChhbnN3ZXJzLCByZXNlYXJjaCwgcHJlcCwgc3VtbWFyaWVzKSwgcmV3b3JkaW5nIG9yIHRyYW5zbGF0aW5nIGEgc2luZ2xlIHNlbnRlbmNlLCBhbmQgY29kZSBwcm9qZWN0cy4K"
+    - "co.lo.icpo.waldo_service_tier=fast"
+    - "co.lo.icpo.waldo_handoff_terms="
+    - "co.lo.icpo.waldo_handoff_chinese_japanese_text=false"
+
+data:
+  # TODO(gap-2): replace with the Waldo team's routing / tool query set once it is
+  # registered in EvalCLI with per-entry labels (expected_route, expected_tool).
+  eval_set_name: Glean Chat V2 Medium
+  # Regression check stays on Glean Chat V2 regardless of the training set.
+  val_eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 1
+  # Pinned so validation is scored on data.deployment_ids (scio-prod), not a sampled
+  # customer deployment. Unpinned val goes through the customer path, which is off.
+  # Train and val are disjoint scio-prod versions; 20260909 is the newest outside the
+  # 14-day training window as of 2026-10-01.
+  train_eval_versions: [20261001]
+  val_eval_versions: [20260909]
+
+signals:
+  - name: tool_alignment
+    source: tool_match
+    lookback_days: 7
+  # judge_pairwise_agentic_correctness: pairwise, randomized_single_0_10, correctness
+  # dimension only. Per-entry 0-4 = teacher more correct, 5 = tie, 6-10 = student more
+  # correct; aggregate is the tie-split preference rate, so 0.50 = parity with the
+  # teacher. Cortex type is AGENTIC_JUDGE; the adapter keys it separately so it does
+  # not collide with the multi-dimension agentic judge.
+  - name: agentic_correctness_rate
+    source: cortex_judge
+    type: AGENTIC_CORRECTNESS_JUDGE
+    kind: pairwise
+
+objective:
+  primary: tool_alignment
+  frontier_type: hybrid
+  composite:
+    tool_alignment: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  # Waldo's tool set is glean_search, glean_document_reader, employee_search,
+  # web_search, and discover. Spans for the first four are `Execute Action: <Tool>`
+  # and compare directly.
+  #
+  # `discover` is different. The harness runs skip_waldo_escalation_discovery=true,
+  # so a discover call does NOT invoke the tool: Waldo terminates
+  # (SAW_INSUFFICIENT_TOOLS) and hands off to the full agent with no Execute Action
+  # span of its own. The first scored span on an escalated run is therefore the full
+  # agent's first tool, not Waldo's. Teacher-escalates vs student-searches still
+  # mismatches most of the time (full agent rarely leads with the same search), but
+  # that is a side effect, not a direct escalation measure. Treat tool_alignment as
+  # "same first tool" only.
+  params:
+    skipped_tools:
+      - Personal Knowledge Vault Retrieve
+      - Shell
+      - Shell Tool
+      - find_skills_assistant
+    failure_score_below: 0.7
+  validation:
+    # Correctness floor: 4.8 on the judge's 0-10 pairwise scale (5 = parity with the
+    # teacher), i.e. 0.48 as the normalized tie-split rate the gate reads.
+    - metric: agentic_correctness_rate
+      min: 0.48
+
+screening:
+  # Focused (high-signal) screen: child must fix >= 25% of the parent's first-tool
+  # mismatches. No judge runs on the slice; correctness is gated at validation only.
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: tool_alignment
+
+reflection:
+  editable_modules: [WALDO_TOOL_USAGE]
+  failure_label: "HIGH-SIGNAL FAILURES (teacher vs student first tool)"
+  report_title: "REFLECTION: Waldo tool choice — which attached tool, and when to hand off"
+  modules:
+    WALDO_TOOL_USAGE: >-
+      This module is the "Tool Usage Guidelines" section of the Waldo router prompt.
+      It decides when Waldo calls the discover tool (escalate to a stronger agent)
+      versus using the attached search tools and answering directly. It has two
+      conditional branches, <<<[[has_search_tools]] ... >>> and
+      <<<[[no_search_tools]] ... >>>; scio renders exactly one per request. Keep
+      both branches and every [[...]] placeholder. The failures below are cases
+      where the teacher's first tool differed from the student's. State tool-choice
+      rules in terms of request type (which attached tool fits which kind of
+      lookup; when nothing fits, discover), never in terms of specific documents or
+      customers from the examples.
+
+search:
+  offspring_count: 5
+  reflection_samples: 25
+  reflection_hamming_distance_k: null
+  # Live Waldo prompt is ~6.3k tokens; runner raises this to the module budgets anyway.
+  global_token_cap: 8192

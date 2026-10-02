@@ -6,25 +6,26 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.objectives.tool_match import FirstToolMatchObjective
-from glean_gepa.objectives.utils.action_input_trace import extract_trace_tool_inputs
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
-from glean_gepa.objectives.utils.tool_match_util import (
-    SKIPPED_TOOL_NAMES,
-    NoComparedEvalEntriesError,
+from glean_gepa.objectives.tool_match import (
+    FirstToolMatchObjective,
     ToolMatchEntryMetrics,
     aggregate_tool_match_metrics,
     build_tool_match_per_entry_query,
-    build_tool_match_time_bounds_query,
     empty_tool_match_analysis,
     fetch_eval_run_tool_match_analysis,
+    parse_tool_match_entry_metrics,
+)
+from glean_gepa.objectives.utils.action_input_trace import extract_trace_tool_inputs
+from glean_gepa.objectives.utils.agentspan import bounds_query
+from glean_gepa.objectives.utils.agentspan_query import EXECUTE_ACTION_FILTER
+from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.objectives.utils.tool_names import (
+    SKIPPED_TOOL_NAMES,
     first_tool_mismatch_pair,
     first_tool_name,
-    parse_tool_match_entry_metrics,
-    require_compared_eval_entries,
     scored_tool_sequence,
 )
-from glean_gepa.prompt_constants import RULES_EXT_KEY
 
 
 def test_first_tool_scoring_strips_shell_and_ignores_later_tools():
@@ -109,7 +110,7 @@ def test_extract_trace_tool_inputs_reads_both_call_envelopes():
 
 
 def test_tool_match_queries_and_fetch():
-    bounds_sql = build_tool_match_time_bounds_query()
+    bounds_sql = bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", span_filter=EXECUTE_ACTION_FILTER)
     sql = build_tool_match_per_entry_query()
     assert "PARSE_DATE" not in bounds_sql
     assert "PARSE_DATE" not in sql
@@ -196,18 +197,18 @@ def test_tool_match_queries_and_fetch():
     assert entry_params["teacher_eval_id"] == "teacher"
     assert analysis.per_entry["entry-1"].tools_match is False
     assert analysis.per_entry["entry-2"].student_tools == ()
-    # Payloads come from the detailed trace (the scrubbed table serves none), and only
-    # the first scored call is kept, tagged with the tool that issued it.
-    assert analysis.per_entry["entry-1"].teacher_first_tool_input == (
-        "Glean Search",
-        '{"glean_search_tool_args": {"query": "case 007"}}',
+    # Payloads come from the detailed trace (the scrubbed table serves none). Each
+    # role keeps its scored calls, shell excluded, tagged with the tool that issued them.
+    assert analysis.per_entry["entry-1"].teacher_tool_inputs == (
+        ("Glean Search", '{"glean_search_tool_args": {"query": "case 007"}}'),
+        ("Glean Document Reader", '{"code_search": {"urls": ["a"]}}'),
     )
-    assert analysis.per_entry["entry-1"].student_first_tool_input == ("Write", '{"path":"a.txt"}')
+    assert analysis.per_entry["entry-1"].student_tool_inputs == (("Write", '{"path":"a.txt"}'),)
     # entry-2 exposes no trace locator, so it is never fetched and stays empty.
-    assert analysis.per_entry["entry-2"].teacher_first_tool_input is None
+    assert analysis.per_entry["entry-2"].teacher_tool_inputs == ()
     # Customer deployments 403 on analyze-trace; skip them and still score the mismatch.
     assert analysis.per_entry["entry-3"].tools_match is False
-    assert analysis.per_entry["entry-3"].teacher_first_tool_input is None
+    assert analysis.per_entry["entry-3"].teacher_tool_inputs == ()
     assert {call.kwargs["trace_id"] for call in evalcli.get_analysis_trace.call_args_list} == {
         "t-trace-1",
         "s-trace-1",
@@ -239,10 +240,11 @@ def test_tool_match_queries_and_fetch():
         },
         {},
     )
-    # The payload is attributed, so the reflector cannot read the teacher's call as the
-    # student's, and it is the teacher's first tool rather than a later one.
+    # Each call is attributed to a role, and later scored calls are kept with the first.
     assert example["Action Inputs"] == [
-        'teacher first tool (Glean Search): {"glean_search_tool_args": {"query": "case 007"}}'
+        'teacher Glean Search: {"glean_search_tool_args": {"query": "case 007"}}',
+        'teacher Glean Document Reader: {"code_search": {"urls": ["a"]}}',
+        'student Write: {"path":"a.txt"}',
     ]
 
 
@@ -303,8 +305,8 @@ def test_failed_runs_are_excluded_rather_than_scored_as_mismatches():
     )
     assert all_failed.aggregate.compared_entries == 0
     assert all_failed.aggregate.excluded_failed_runs == 2
-    with pytest.raises(NoComparedEvalEntriesError, match="all 2 candidate entries were dropped"):
-        require_compared_eval_entries(all_failed)
+    with pytest.raises(NoComparedEntriesError, match="all 2 candidate entries were dropped"):
+        FirstToolMatchObjective().require_compared_entries(all_failed)
 
 
 def _reflective_example(objective, objective_scores: dict, **output_extras) -> dict:
@@ -323,53 +325,57 @@ def _reflective_example(objective, objective_scores: dict, **output_extras) -> d
     )
 
 
-def test_first_tool_payload_falls_back_to_the_student_call():
-    """When the teacher called nothing, the student's call is the only intent evidence.
-
-    It must still say whose call it is: an unlabelled payload would read as the
-    teacher's target behaviour and invite reflection to entrench the student's error.
-    """
+def test_reflective_example_includes_both_roles_tool_inputs():
+    """Both sequences are labeled, so a student payload cannot be read as the teacher's."""
     objective = FirstToolMatchObjective()
     scores = {"tool_alignment": 0.0}
 
     student_only = _reflective_example(
-        objective, scores, student_first_tool_input=["Glean Search", '{"query": "pto policy"}']
+        objective, scores, student_tool_inputs=[["Glean Search", '{"query": "pto policy"}']]
     )
-    assert student_only["Action Inputs"] == ['student first tool (Glean Search): {"query": "pto policy"}']
+    assert student_only["Action Inputs"] == ['student Glean Search: {"query": "pto policy"}']
 
-    # A teacher call outranks the student's, and a missing payload surfaces nothing
-    # rather than an empty ACTION_INPUT line.
     both = _reflective_example(
         objective,
         scores,
-        student_first_tool_input=["Glean Search", '{"query": "pto policy"}'],
-        teacher_first_tool_input=["Glean Document Reader", '{"urls": ["x"]}'],
+        student_tool_inputs=[["Glean Search", '{"query": "pto policy"}'], ["Write", '{"path":"a.txt"}']],
+        teacher_tool_inputs=[["Glean Document Reader", '{"urls": ["x"]}']],
     )
-    assert both["Action Inputs"] == ['teacher first tool (Glean Document Reader): {"urls": ["x"]}']
+    assert both["Action Inputs"] == [
+        'teacher Glean Document Reader: {"urls": ["x"]}',
+        'student Glean Search: {"query": "pto policy"}',
+        'student Write: {"path":"a.txt"}',
+    ]
     assert _reflective_example(objective, scores)["Action Inputs"] == []
-    assert _reflective_example(objective, scores, teacher_first_tool_input=["Glean Search", ""])["Action Inputs"] == []
+    assert _reflective_example(objective, scores, teacher_tool_inputs=[["Glean Search", ""]])["Action Inputs"] == []
 
     payload = '{"file_path":"SKILL.md","old_string":"' + "x" * 900 + '"}'
-    long = _reflective_example(objective, scores, teacher_first_tool_input=["Edit", payload])
+    long = _reflective_example(objective, scores, teacher_tool_inputs=[["Edit", payload]])
     assert long["Action Inputs"][0].endswith("... (truncated)")
     assert len(long["Action Inputs"][0]) < len(payload)
 
+    extra = [[f"Tool{i}", f'{{"q": "{i}"}}'] for i in range(4)]
+    capped = _reflective_example(objective, scores, teacher_tool_inputs=extra, student_tool_inputs=extra)
+    assert capped["Generated Outputs"]["teacher_tools"] == ["Glean Document Reader"]
+    assert capped["Generated Outputs"]["student_tools"] == ["Glean Search"]
+    assert capped["Action Inputs"] == [
+        'teacher Tool0: {"q": "0"}',
+        'teacher Tool1: {"q": "1"}',
+        'teacher Tool2: {"q": "2"}',
+        'student Tool0: {"q": "0"}',
+        'student Tool1: {"q": "1"}',
+        'student Tool2: {"q": "2"}',
+    ]
 
-def test_rules_ext_reflects_on_its_own_ranking_of_non_core_mismatches():
+
+def test_reflection_selects_mismatches_in_order_without_grouping():
     objective = FirstToolMatchObjective()
-    trajectories = [{"entry_id": f"core-{i}"} for i in range(5)] + [{"entry_id": f"write-{i}"} for i in range(5)]
-    mismatch_keys = [("Glean Search", "")] * 5 + [("Write", "")] * 5
-    selected, selected_keys = trajectories[:6], mismatch_keys[:6]
-
-    chosen = objective._component_trajectories(
-        RULES_EXT_KEY, selected, selected_keys, trajectories=trajectories, mismatch_keys=mismatch_keys
-    )
-    assert [entry["entry_id"] for entry in chosen] == [f"write-{i}" for i in range(5)]
-
-    core = objective._component_trajectories(
-        "glean_search", selected, selected_keys, trajectories=trajectories, mismatch_keys=mismatch_keys
-    )
-    assert [entry["entry_id"] for entry in core] == [f"core-{i}" for i in range(5)]
+    keys = [("Write", "")] * 2 + [("Glean Search", "Discover")] * 10 + [None]
+    selected, groups = objective._select_mismatch_groups(keys, max_entries=4)
+    assert selected == [0, 1, 2, 3]
+    assert groups == []
+    all_mismatches, _ = objective._select_mismatch_groups(keys, max_entries=None)
+    assert all_mismatches == list(range(12))
 
 
 def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
@@ -400,21 +406,37 @@ def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
     assert "Correctness" not in hidden["Feedback"]
 
 
+def test_reflective_example_includes_the_agentic_judge_verdict_and_tool_inputs():
+    objective = FirstToolMatchObjective()
+    example = _reflective_example(
+        objective,
+        {"tool_alignment": 0.0},
+        teacher_tool_inputs=[["Glean Search", '{"query": "pto"}']],
+        student_tool_inputs=[["Discover", '{"query": "policy"}']],
+        agentic_preference_rate_feedback="task_completion: the student stopped after a search.",
+    )
+    assert example["Action Inputs"] == [
+        'teacher Glean Search: {"query": "pto"}',
+        'student Discover: {"query": "policy"}',
+    ]
+    assert "Agentic judge verdict:\ntask_completion: the student stopped after a search." in example["Feedback"]
+
+
 def test_aggregate_and_empty_analysis():
     per_entry = {
         "a": ToolMatchEntryMetrics("a", ("search",), ("search",), True),
         "b": ToolMatchEntryMetrics("b", ("read",), ("search",), False),
     }
-    aggregate = aggregate_tool_match_metrics("teacher", "student", per_entry)
+    aggregate = aggregate_tool_match_metrics(per_entry)
     assert aggregate.compared_entries == 2
     assert aggregate.matching_entries == 1
     assert aggregate.tool_match_rate == 0.5
-    empty = aggregate_tool_match_metrics("teacher", "student", {})
+    empty = aggregate_tool_match_metrics({})
     assert empty.compared_entries == 0
     assert empty.tool_match_rate == 0.0
     analysis = empty_tool_match_analysis("teacher-1", "student-1", end_date=date(2026, 8, 11))
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
-        require_compared_eval_entries(analysis)
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
+        FirstToolMatchObjective().require_compared_entries(analysis)
 
 
 def test_select_mismatch_groups():

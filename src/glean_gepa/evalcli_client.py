@@ -60,6 +60,22 @@ AGENTIC_RUN_PARAMS = json.dumps(
         "use_flex_tier": "false",
     }
 )
+# Single-dimension agentic correctness: the same Cortex judge type and scoring mode as
+# the multi-dimension judge above, but only the correctness scorer. It shares Cortex
+# type AGENTIC_JUDGE, so callers distinguish the two by ``judge_skill_name`` when
+# looking up existing runs.
+AGENTIC_CORRECTNESS_JUDGE_NAME = "judge_pairwise_agentic_correctness"
+AGENTIC_CORRECTNESS_RUN_PARAMS = json.dumps(
+    {
+        "judge_name": AGENTIC_CORRECTNESS_JUDGE_NAME,
+        "judge_skill_name": AGENTIC_CORRECTNESS_JUDGE_NAME,
+        "scoring_mode": "randomized_single_0_10",
+        "tool_allowlist": "Shell,Glean Search,Glean Document Reader",
+        "max_turns": "30",
+        "eval_run_source_filter": "require_successful_trace",
+        "use_flex_tier": "false",
+    }
+)
 # The judge reads both responses from the eval runs; only the query comes from the eval set.
 AGENTIC_INPUT_MAPPINGS = json.dumps(
     [
@@ -95,6 +111,13 @@ TRANSIENT_EVALCLI_PATTERNS = (
     "API request failed: 504",
     "Connection refused",
     "Connection reset",
+    # Local network / DNS blips on the machine running the loop (e.g. VPN reconnect).
+    "nodename nor servname provided",
+    "Name or service not known",
+    "Temporary failure in name resolution",
+    "Network is unreachable",
+    "Connection timed out",
+    "Max retries exceeded",
     "__Host-GCP_IAP_AUTH_TOKEN_",
     "Lost connection to MySQL server",
     "MySQL server has gone away",
@@ -110,6 +133,7 @@ DUPLICATE_EVAL_RUN_PATTERNS = ("duplicate entry", "(1062,")
 JUDGE_CREATE_ATTEMPTS = 4
 JUDGE_CREATE_RETRY_SEC = 30
 EVALCLI_TIMEOUT_SEC = 900
+ANALYSIS_DETAILS_PAGE_SIZE = 10
 
 MIN_INGESTED_ENTRY_FRACTION = 0.5
 
@@ -209,12 +233,19 @@ def classify_eval_run_status(status: Any) -> str:
     A run is usable when every counted task is terminal, or when succeeded+failed
     is more than 9x the unfinished remainder. The last 10% of entries can sit in
     queue or grind through execution for a long time without moving the score.
+
+    A run whose tasks are mostly ``TASK_CANCELLED`` (someone killed it) is
+    ``missing``: it is terminal but has too few scored entries to stand in for the
+    eval, so the caller creates a fresh run instead of reusing it from the cache.
     """
     active_counts = _active_task_counts(status)
     if not active_counts:
         return "missing"
     finished = sum(count for task_status, count in active_counts if task_status in FINISHED_TASK_STATUSES)
+    cancelled = sum(count for task_status, count in active_counts if task_status == "TASK_CANCELLED")
     unfinished = sum(count for task_status, count in active_counts if task_status not in TERMINAL_TASK_STATUSES)
+    if cancelled and cancelled >= finished:
+        return "missing"
     if unfinished == 0:
         return "usable"
     return "usable" if finished > MIN_FINISHED_TO_UNFINISHED_RATIO * unfinished else "ongoing"
@@ -230,6 +261,29 @@ def judge_run_base_eval_id(row: dict[str, Any]) -> str | None:
         value = row.get(key)
         if isinstance(value, str) and value:
             return value
+    return None
+
+
+def judge_run_skill_name(row: dict[str, Any]) -> str | None:
+    """Read ``judge_skill_name`` from a judge run's run parameters.
+
+    Cortex returns run parameters under ``config.runParameters`` (or top-level
+    ``runParameters`` / ``run_params``), either as a dict or a JSON string.
+    """
+    raw_config = row.get("config")
+    config: dict[str, Any] = raw_config if isinstance(raw_config, dict) else {}
+    for source in (config, row):
+        for key in ("runParameters", "run_parameters", "runParams", "run_params"):
+            raw = source.get(key)
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(raw, dict):
+                value = raw.get("judge_skill_name") or raw.get("judge_name")
+                if isinstance(value, str) and value:
+                    return value
     return None
 
 
@@ -668,12 +722,16 @@ class EvalCliClient:
         *,
         judge_type: str,
         base_eval_run_id: str | None = None,
+        judge_skill_name: str | None = None,
     ) -> str | None:
         """Find a judge run via GET /judgeruns?evalRunIds= (evalcli judge list).
 
         ``base_eval_run_id`` restricts the match to comparative judges scored against that
         baseline. The list filter matches either the test or the base eval run, so without
         it a pairwise judge for an unrelated baseline could be returned.
+
+        ``judge_skill_name`` restricts the match to runs whose run parameters name that
+        skill. Several judges share Cortex type AGENTIC_JUDGE and differ only here.
         """
         wanted_type = judge_type.upper()
         for row in self.list_judge_runs(eval_run_id, judge_type=wanted_type):
@@ -684,6 +742,8 @@ class EvalCliClient:
             if str(row.get("evalRunId") or row.get("eval_run_id") or eval_run_id) != eval_run_id:
                 continue
             if base_eval_run_id is not None and judge_run_base_eval_id(row) != base_eval_run_id:
+                continue
+            if judge_skill_name is not None and judge_run_skill_name(row) != judge_skill_name:
                 continue
             judge_run_id = row.get("id")
             if judge_run_id:
@@ -776,19 +836,27 @@ class EvalCliClient:
     ) -> list[dict[str, Any]]:
         if not entry_ids:
             return []
-        result = self._invoke_json(
-            "analyze",
-            "details",
-            "--entry-ids",
-            *entry_ids,
-            "--eval-run-ids",
-            *eval_run_ids,
-            "--deployment-id",
-            deployment_id,
-        )
-        if not isinstance(result, list):
-            raise EvalCliError(f"Unexpected analysis details response: {result!r}")
-        return result
+        # One `analyze details` call fans out to a trace + judge lookup per entry on the
+        # server; asking for 40 at once has hung for over an hour before failing opaquely,
+        # so page the request and retry each page on transient Cortex errors.
+        details: list[dict[str, Any]] = []
+        for start in range(0, len(entry_ids), ANALYSIS_DETAILS_PAGE_SIZE):
+            page = entry_ids[start : start + ANALYSIS_DETAILS_PAGE_SIZE]
+            result = self._invoke_json_retrying(
+                "analyze",
+                "details",
+                "--entry-ids",
+                *page,
+                "--eval-run-ids",
+                *eval_run_ids,
+                "--deployment-id",
+                deployment_id,
+                label=f"analyze details ({len(page)} entries)",
+            )
+            if not isinstance(result, list):
+                raise EvalCliError(f"Unexpected analysis details response: {result!r}")
+            details.extend(result)
+        return details
 
     def get_analysis_trace(
         self,

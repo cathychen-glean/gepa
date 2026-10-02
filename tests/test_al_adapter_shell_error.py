@@ -13,7 +13,7 @@ from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
 from glean_gepa.objectives import AnalysisRequest
 from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION, ShellSuccessObjective
-from glean_gepa.objectives.utils.shell_tool_error_util import (
+from glean_gepa.objectives.shell import (
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
     ShellToolErrorEntryMetrics,
@@ -25,7 +25,6 @@ from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPending
 
 def _shell_analysis(*, executions: int, per_entry: bool) -> EvalRunShellToolErrorAnalysis:
     aggregate = ShellToolErrorMetrics(
-        eval_id="run",
         shell_executions=executions,
         shell_errors=0,
         shell_error_rate=0.0,
@@ -41,7 +40,7 @@ def _shell_analysis(*, executions: int, per_entry: bool) -> EvalRunShellToolErro
         recent_error_examples=(),
     )
     return EvalRunShellToolErrorAnalysis(
-        eval_id="run",
+        eval_ids=("run",),
         start_date=date(2026, 8, 1),
         end_date=date(2026, 8, 2),
         aggregate=aggregate,
@@ -102,11 +101,10 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         }
     ]
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=8,
             shell_errors=2,
             shell_error_rate=0.25,
@@ -274,6 +272,88 @@ def test_proposals_that_drop_a_render_slot_are_rejected():
 
     assert variants == [kept.strip()]
     assert "{RULES_EXT}" in prompts[0]
+
+
+def test_empty_module_variants_are_bounded_by_the_patches_not_the_token_budget():
+    """Two patches for an empty RULES_EXT must not come back as a seven-topic rulebook."""
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"RULES_EXT": ""},
+        module_specs={"RULES_EXT": ModuleSpec("RULES_EXT", "free_text", 512)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    patch_a = "- After writing or editing a file, re-open it and quote only the changed region."
+    patch_b = "- Update the existing artifact instead of creating a new file."
+    diagnosis = (
+        "DIAGNOSIS:\n- unverified edit claims: 6 of 25 LOSS examples\n- new-file drift: 4 of 25\n"
+        f"PATCHES:\nBEFORE:\n[empty]\nAFTER:\n{patch_a}\nWHY: a\n\nBEFORE:\n[empty]\nAFTER:\n{patch_b}\nWHY: b"
+    )
+    tight = f"{patch_a}\n{patch_b}"
+    sprawl = "\n".join(f"- {topic}: " + "x" * 150 for topic in ("Artifact", "Claims", "Calibration", "Data", "Access"))
+    assert len(sprawl) < 512 * 4  # would have passed the old token-budget filter
+    prompts: list[str] = []
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return diagnosis if len(prompts) == 1 else f"{sprawl}\n===VARIANT===\n{tight}"
+
+    variants, _, _ = adapter.propose_new_texts(reflection_lm, candidate, ["RULES_EXT"], [])
+
+    assert variants == [tight]
+    assert "write 2 rules, one per AFTER snippet" in prompts[1]
+    assert "each variant applies those patches and nothing else" in prompts[1]
+
+
+def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
+    """A rewrite in place of a diagnosis is re-requested once, and the tally reaches the consolidation pass."""
+    current = (
+        "- Resolve the request in as few tool loops as possible while ensuring accuracy. "
+        "Do not follow up for minor doubts; ask only when a missing detail would change the deliverable. "
+        "Deliver a best-effort answer and state assumptions when the request is answerable. "
+        "Do not offer optional next steps unless the user asked for options. "
+        "Keep the final message focused on the result rather than the process you followed."
+    )
+    rewrite = current.replace("Do not follow up for minor doubts", "Never ask a follow-up question")
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"EXECUTION_DISCIPLINE": current},
+        module_specs={"EXECUTION_DISCIPLINE": ModuleSpec("EXECUTION_DISCIPLINE", "free_text", 1024)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    prompts: list[str] = []
+    replies = [
+        rewrite,
+        "DIAGNOSIS:\n- asks in prose: 4 of 6 LOSS examples\nPATCHES:\nBEFORE: Do not follow up\nAFTER: Deliver\nWHY: w",
+        rewrite,
+    ]
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    variants, _, diagnosis = adapter.propose_new_texts(reflection_lm, candidate, ["EXECUTION_DISCIPLINE"], [])
+
+    assert len(prompts) == 3
+    assert prompts[1].startswith("IMPORTANT: a previous attempt")
+    assert prompts[1].endswith(prompts[0])
+    assert "DIAGNOSIS (failure-mode tally from the first pass):\n- asks in prose: 4 of 6 LOSS examples" in prompts[2]
+    assert "SUGGESTIONS:\nBEFORE: Do not follow up" in prompts[2]
+    assert diagnosis.startswith("- asks in prose: 4 of 6 LOSS examples")
+    assert variants == [rewrite]
 
 
 def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
@@ -564,11 +644,10 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
         error_str="command exited with status 1",
     )
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=4,
             shell_errors=1,
             shell_error_rate=0.25,
@@ -636,11 +715,10 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         trace_ids=("trace-1",),
     )
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_123",
+        eval_ids=("run_123",),
         start_date=date(2026, 8, 11),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_123",
             shell_executions=1,
             shell_errors=1,
             shell_error_rate=1.0,
@@ -720,11 +798,10 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
 def test_shell_error_analysis_cache_round_trip(tmp_path):
     cache_file = tmp_path / "eval-cache.json"
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="run_cached",
+        eval_ids=("run_cached",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_cached",
             shell_executions=10,
             shell_errors=3,
             shell_error_rate=0.3,
@@ -780,11 +857,10 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
 def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path):
     cache_file = tmp_path / "eval-cache.json"
     provisional = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -814,11 +890,10 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
 
 def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
     provisional = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -853,21 +928,20 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
 
 def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
     analysis = EvalRunShellToolErrorAnalysis(
-        eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
+        eval_ids=("gepa_gpt_5a0754e0543e49fc_1788306729",),
         start_date=date(2026, 9, 2),
         end_date=date(2026, 9, 2),
         aggregate=ShellToolErrorMetrics(
-            eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
             shell_executions=560,
             shell_errors=38,
             shell_error_rate=0.0679,
             shell_error_pct=6.79,
             recent_error_examples=(
                 ShellToolErrorExample(
+                    eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
                     started_at="2026-09-02T05:27:00Z",
                     project_id="scio-prod",
                     entry_id="entry-1",
-                    eval_id="gepa_gpt_5a0754e0543e49fc_1788306729",
                     run_id="execution-1",
                     trace_id="trace-1",
                     span_id="span-1",
@@ -950,11 +1024,10 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         )
     )
     refreshed = EvalRunShellToolErrorAnalysis(
-        eval_id="run_pending_telemetry",
+        eval_ids=("run_pending_telemetry",),
         start_date=date(2026, 8, 31),
         end_date=date(2026, 9, 1),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_pending_telemetry",
             shell_executions=1,
             shell_errors=0,
             shell_error_rate=0.0,
@@ -1004,11 +1077,10 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         )
     )
     refreshed = EvalRunShellToolErrorAnalysis(
-        eval_id="run_legacy",
+        eval_ids=("run_legacy",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ShellToolErrorMetrics(
-            eval_id="run_legacy",
             shell_executions=0,
             shell_errors=0,
             shell_error_rate=0.0,

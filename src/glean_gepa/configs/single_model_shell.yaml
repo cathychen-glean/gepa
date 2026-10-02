@@ -1,0 +1,72 @@
+# Single-model experiment: shell-tool success from Agentspan telemetry.
+# Run with `--config single_model_shell`.
+#
+# This file is self-contained. `signals`, `objective`, `screening`, and
+# `reflection` below are the full experiment; nothing is merged in from elsewhere.
+# `signals[].source` must be a telemetry source registered for this mode in
+# glean_gepa/objectives/registry.py (single_model: shell_telemetry, loop_telemetry).
+#
+# To optimize agent loop count instead, swap in the `loop_efficiency` variant
+# shown in comments at each section.
+
+schema_version: 1
+mode: single_model
+
+run:
+  dir: run_sm
+  max_metric_calls: 10
+  eval_run_timeout_sec: 21600
+  seed_candidate: data/seed_candidate.json
+
+models:
+  student: gpt
+  reflection: OPEN_AI:GPT5_LATEST
+
+data:
+  eval_set_name: Glean Chat V2 Medium
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 2
+
+signals:
+  - name: shell_success_rate
+    source: shell_telemetry
+    lookback_days: 1
+  # loops variant (score per entry is 1 / (1 + loop_count); zero loops is 1.0):
+  # - name: loop_efficiency
+  #   source: loop_telemetry
+  #   lookback_days: 1
+
+objective:
+  primary: shell_success_rate # or loop_efficiency
+  frontier_type: objective
+  composite:
+    shell_success_rate: 1.0 # or loop_efficiency: 1.0
+  focused_bucket_type: SESSION # loops variant: QUERY_CANONICAL
+  params:
+    failure_score_below: 0.9 # loops variant: omit
+  validation:
+    - metric: correctness
+      min: 0.80
+    - metric: agentic_preference_rate
+      min: 0.50
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.5 # loops variant: 0.25 (mean of 1/(1+loops); about three loops)
+  high_signal: shell_success_rate # or loop_efficiency
+
+reflection:
+  editable_modules: [WRITING_CODE, CORE_TOOLS] # loops variant: [WRITING_CODE]
+  failure_label: HIGH-SIGNAL FAILURES # loops variant: "HIGH-SIGNAL FAILURES (too many loops)"
+  # Override module reflection prompts with modules.<KEY>.
+
+search:
+  offspring_count: 5
+  # Set to `all` to reflect on every available example.
+  reflection_samples: 8
+  reflection_hamming_distance_k: null
+  # Total prompt-token ceiling a mutated candidate may reach. Raised at startup to
+  # fit the per-module budgets, so a value below those cannot starve a module.
+  global_token_cap: 4096

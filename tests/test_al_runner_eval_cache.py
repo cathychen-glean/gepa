@@ -39,18 +39,6 @@ def test_start_writes_in_flight_and_wait_promotes_cancelled(tmp_path):
     [
         ([{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 1}]}], True, False),
         ([{"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 10}]}], False, True),
-        (
-            [
-                {
-                    "taskCountsByStatus": [
-                        {"status": "TASK_SUCCEEDED", "count": 77},
-                        {"status": "TASK_CANCELLED", "count": 123},
-                    ]
-                }
-            ],
-            False,
-            True,
-        ),
     ],
 )
 def test_resumed_runner_reuses_cached_eval(tmp_path, status, wait_required, expect_completed):
@@ -73,6 +61,40 @@ def test_resumed_runner_reuses_cached_eval(tmp_path, status, wait_required, expe
     else:
         assert saved["completed"] == {}
         assert "run_abc" in saved["in_flight"]
+
+
+def test_resumed_runner_recreates_a_cancelled_cached_eval(tmp_path):
+    """A cached run that was killed (mostly TASK_CANCELLED) is dropped and relaunched.
+
+    Reusing it would score the handful of entries that finished before the cancel
+    as if they were the whole eval.
+    """
+    cache_file = tmp_path / "eval-runs.json"
+    first = ALRunner(evalcli=MagicMock(create_eval_run=MagicMock(return_value="run_abc")), cache_file=str(cache_file))
+    _start(first)
+    first.wait("run_abc")
+    assert "run_abc" in json.loads(cache_file.read_text())["completed"].values()
+
+    second_client = MagicMock(create_eval_run=MagicMock(return_value="run_new"))
+    second_client.get_eval_run_status.return_value = [
+        {
+            "taskCountsByStatus": [
+                {"status": "TASK_CANCELLED", "count": 178},
+                {"status": "TASK_SUCCEEDED", "count": 14},
+                {"status": "TASK_EXECUTING", "count": 1},
+            ]
+        }
+    ]
+    second = ALRunner(evalcli=second_client, cache_file=str(cache_file))
+    eval_id, wait_required = _start(second)
+
+    second_client.create_eval_run.assert_called_once()
+    assert eval_id == "run_new"
+    assert wait_required is True
+    saved = json.loads(cache_file.read_text())
+    assert "run_abc" not in saved["completed"].values()
+    assert "run_abc" not in saved["in_flight"]
+    assert "run_new" in saved["in_flight"]
 
 
 def test_wait_polls_when_completed_id_is_probed_ongoing(tmp_path):

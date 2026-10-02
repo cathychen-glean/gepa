@@ -6,10 +6,7 @@ import keyword
 import re
 from base64 import urlsafe_b64encode
 from collections.abc import Mapping, Sequence
-from typing import Any
 
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
-from glean_gepa.objectives.utils.tool_match_util import first_tool_mismatch_pair
 from glean_gepa.prompt_constants import (
     CORE_TOOL_DESCRIPTIONS,
     CORE_TOOL_KEYS,
@@ -23,6 +20,12 @@ from glean_gepa.prompt_constants import (
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     WRITING_CODE_KEY,
+)
+from glean_gepa.waldo_prompt_constants import (
+    WALDO_SYSTEM_KEY,
+    WALDO_SYSTEM_OVERRIDE_PARAM,
+    WALDO_TOOL_USAGE_KEY,
+    compile_waldo_system_prompt,
 )
 
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -67,7 +70,8 @@ def compile_encoded_prompt(candidate: dict[str, str]) -> str:
     """Compile candidate modules into encoded scParams fragments.
 
     Always includes the coding-agent system prompt. Core-tool description
-    overrides are appended when the candidate has those modules.
+    overrides are appended when the candidate has those modules. The Waldo
+    system prompt override is appended when the candidate edits a Waldo module.
 
     The system prompt must be URL-safe base64. QE parses ``sc=`` with
     ``url.QueryUnescape``, which turns ``+`` into space; standard base64 then
@@ -78,7 +82,24 @@ def compile_encoded_prompt(candidate: dict[str, str]) -> str:
     tool_overrides = compile_tool_description_overrides(candidate)
     if tool_overrides:
         parts.append(tool_overrides)
+    waldo_override = compile_waldo_system_override(candidate)
+    if waldo_override:
+        parts.append(waldo_override)
     return ",".join(parts)
+
+
+def compile_waldo_system_override(candidate: Mapping[str, str]) -> str:
+    """Encode the compiled Waldo prompt as ``llmo.per_prompt_overrides.waldo_system=<b64>``.
+
+    Empty string when the candidate edits neither ``WALDO_SYSTEM`` nor
+    ``WALDO_TOOL_USAGE``, so evals keep the stock template. Scio renders the
+    ``[[...]]`` and ``<<<[[...]]>>>`` markers in the override at request time.
+    """
+    if not (candidate.get(WALDO_SYSTEM_KEY) or candidate.get(WALDO_TOOL_USAGE_KEY)):
+        return ""
+    text = compile_waldo_system_prompt(candidate)
+    encoded = urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+    return WALDO_SYSTEM_OVERRIDE_PARAM + "=" + encoded
 
 
 def candidate_module_names(editable_modules: Sequence[str]) -> list[str]:
@@ -112,27 +133,6 @@ def with_core_tool_defaults(prompt_modules: Mapping[str, str]) -> dict[str, str]
     for key, text in CORE_TOOL_DESCRIPTIONS.items():
         merged.setdefault(key, text)
     return merged
-
-
-def high_signal_core_tool_keys(trajectories: Sequence[Any] | None) -> list[str]:
-    """Core-tool keys that appear in the reflection high-signal first-tool mismatch groups."""
-    mismatch_keys: list[tuple[str, str] | None] = []
-    for trajectory in trajectories or []:
-        output = trajectory.get("output") if isinstance(trajectory, Mapping) else None
-        if not isinstance(output, Mapping):
-            mismatch_keys.append(None)
-            continue
-        mismatch_keys.append(
-            first_tool_mismatch_pair(output.get("teacher_tool_events"), output.get("student_tool_events"))
-        )
-    _indices, groups = select_mismatch_groups(mismatch_keys)
-    found: list[str] = []
-    for teacher_tool, student_tool, _count in groups:
-        for name in (teacher_tool, student_tool):
-            key = tool_description_override_key(name)
-            if key in CORE_TOOL_KEYS and key not in found:
-                found.append(key)
-    return found
 
 
 def compile_tool_description_overrides(candidate: Mapping[str, str]) -> str:

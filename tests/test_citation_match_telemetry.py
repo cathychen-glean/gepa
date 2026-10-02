@@ -6,20 +6,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.experiment_config import experiment_objective_pack, load_experiment_config
+from glean_gepa.experiment_config import experiment_objective_spec, load_experiment_config
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.citation_match import CitationMatchObjective
-from glean_gepa.objectives.utils.citation_match_util import (
+from glean_gepa.objectives.utils.agentspan import bounds_query
+from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.objectives.citation_match import (
     CitationMatchEntryMetrics,
-    NoComparedCitationEntriesError,
     aggregate_citation_match_metrics,
     build_citation_match_per_entry_query,
-    build_citation_match_time_bounds_query,
     citation_mismatch_pair,
     empty_citation_match_analysis,
     fetch_eval_run_citation_match_analysis,
     parse_citation_match_entry_metrics,
-    require_compared_citation_entries,
     scored_citation_ids,
 )
 
@@ -81,7 +80,7 @@ def _trace_with_glean_search(*queries: str) -> dict:
 
 
 def test_citation_match_queries_and_fetch():
-    bounds_sql = build_citation_match_time_bounds_query()
+    bounds_sql = bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)")
     sql = build_citation_match_per_entry_query()
     assert "PARSE_DATE" not in bounds_sql
     assert "PARSE_DATE" not in sql
@@ -142,22 +141,28 @@ def test_aggregate_and_empty_analysis():
         "a": CitationMatchEntryMetrics("a", ("doc-1",), ("doc-1",), True),
         "b": CitationMatchEntryMetrics("b", (), ("doc-1",), False),
     }
-    aggregate = aggregate_citation_match_metrics("teacher", "student", per_entry)
+    aggregate = aggregate_citation_match_metrics(per_entry)
     assert aggregate.compared_entries == 2
     assert aggregate.matching_entries == 1
     assert aggregate.citation_match_rate == 0.5
 
     empty = empty_citation_match_analysis("teacher", "student")
-    with pytest.raises(NoComparedCitationEntriesError):
-        require_compared_citation_entries(empty)
+    with pytest.raises(NoComparedEntriesError):
+        CitationMatchObjective().require_compared_entries(empty)
 
 
-def test_citations_pack_constructs_the_citation_match_objective(tmp_path):
+def test_citation_match_signal_constructs_the_citation_match_objective(tmp_path):
     mode = tmp_path / "mode.yaml"
-    mode.write_text("schema_version: 1\nmode: teacher_student\npacks: [citations]\n")
+    mode.write_text(
+        "schema_version: 1\n"
+        "mode: teacher_student\n"
+        "signals:\n  - name: citation_match\n    source: citation_match\n"
+        "objective:\n  primary: citation_match\n  composite:\n    citation_match: 1.0\n"
+        "  focused_bucket_type: QUERY_CANONICAL\n"
+    )
     config = load_experiment_config(mode)
     objective = build_objective(
-        "teacher_student", config.signals, bigquery_client=MagicMock(), pack=experiment_objective_pack(config)
+        "teacher_student", config.signals, bigquery_client=MagicMock(), experiment=experiment_objective_spec(config)
     )
     assert config.primary_objective == "citation_match"
     assert isinstance(objective, CitationMatchObjective)

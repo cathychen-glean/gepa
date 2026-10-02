@@ -5,7 +5,7 @@ This is a short handoff guide for the `glean_gepa` integration.
 ## Target architecture
 
 ```text
-CLI / experiment setup (`runner.py`)
+CLI / experiment setup (`runner.py`, `--config configs/<experiment>.yaml`)
         |
         v
 GEPA engine wiring (`api.py`)
@@ -69,16 +69,33 @@ Keep evaluation behavior stable while changing the surrounding code. Do not simu
 ## Customer eval after optimization
 
 When a real (non-`--fake_flow`) run finishes, `runner.py` runs the seed baseline
-and best candidate on the same **Glean Chat V2 Medium** customer entries. The
-eval-set **version is not configured**: EvalCLI is queried at runtime, and the
-newest `YYYYMMDD` version available to every configured customer is used.
+and best candidate on the validation set and enforces the `objective.validation`
+gates from the experiment YAML (judge metrics with a `min`). A failed gate exits
+the run unsuccessfully. These evals do not feed the search.
 
-The best run is judged for pairwise correctness against the baseline. The
-held-out check passes only when correctness is above 80% and the EvalCLI paired
-comparison finds no statistically significant change (Benjamini-Hochberg
-adjusted `p >= 0.05`) in average cost, average loops, or any tool invocation
-rate. A failed gate exits the run unsuccessfully. These evals do not feed the
-search.
+**Toggle.** `run.customer_eval: false` in the YAML, or `--no_customer_eval` on
+the CLI, skips this step. The search still runs and the best candidate is still
+written; the log records that the gates were not enforced. The CLI flag wins over
+the YAML (`--customer_eval` re-enables it). Default is on. Use this while external
+(customer) deployments are unavailable.
+
+**Where validation runs.** Two paths, chosen by whether `data.val_eval_versions`
+is set:
+
+- *Unpinned* (no `val_eval_versions`): the runner samples customer deployments
+  from the pool, persists the sample in `<run_dir>/cache/glean_customer_deployments.json`,
+  and picks the `val_version_count` newest **Glean Chat V2 Medium** versions fully
+  published to that sample. In-loop validation evals then run on those customer
+  deployments. This path needs external evals.
+- *Pinned* (`val_eval_versions: [YYYYMMDD]`): validation is scored on
+  `data.deployment_ids` (normally `scio-prod`) with `data.val_eval_set_name`
+  (defaults to the training set). Set `train_eval_versions` too so train and val
+  are disjoint; otherwise training is every `scio-prod` version in the
+  `lookback_days` window. One or two val versions are allowed. Use this path when
+  customer deployments are off.
+
+`customer_eval: false` only skips the post-search gate. It does not change which
+path the in-loop validation set uses; pin `val_eval_versions` for that.
 
 ## Reflection sampling CLI
 
@@ -98,6 +115,57 @@ uv run python -m glean_gepa.runner \
   --reflection_hamming_distance_k 10
 ```
 
+## Experiment YAML (`configs/*.yaml`)
+
+Each file under `src/glean_gepa/configs/` is one complete experiment. There is
+no inheritance or pack merging: the `signals`, `objective`, `screening`, and
+`reflection` sections in the file are the whole experiment. A `packs:` key fails
+the load. Run one with `--config <stem>` (or a path); CLI flags override YAML.
+
+```bash
+uv run python -m glean_gepa.runner --config teacher_student_waldo
+uv run python -m glean_gepa.runner --config single_model_shell --max_metric_calls 4
+```
+
+Shipped experiments:
+
+| File | Mode | Primary | Notes |
+|---|---|---|---|
+| `single_model_shell.yaml` | single_model | `shell_success_rate` | Loops variant (`loop_efficiency`) shown in comments. |
+| `teacher_student.yaml` | teacher_student | `agentic_preference_rate` | Pairwise AGENTIC_JUDGE vs the teacher; screens on the same judge. |
+| `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match; citations variant (`citation_match`) in comments. Weighted screen. |
+| `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
+| `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
+
+Sections:
+
+- `signals` -- every metric the run scores or reports. `source` is a telemetry
+  source registered for the mode in `objectives/registry.py` (`tool_match`,
+  `citation_match`, `agentic_preference`; `shell_telemetry`, `loop_telemetry`),
+  `cortex_judge` (with `type` and `kind`), or `constant`. Names must be unique.
+  A telemetry source not registered for the file's `mode` fails the load.
+- `objective` -- `primary` (parent selection; must be scorable), `composite`
+  (weights summing to 1; every name must be scorable), `frontier_type`,
+  `focused_bucket_type`, `params` (objective knobs such as `skipped_tools`,
+  `failure_score_below`), and `validation` (judge-metric floors for the
+  post-search customer eval).
+- `screening` -- the focused child gate. `kind: high_signal_fix_rate` with
+  `threshold` and `high_signal`; `kind: correctness_floor`; `kind: none`; or
+  `weights` for a blend of summary metrics. A judge named only in `weights`
+  is still started.
+- `reflection` -- `editable_modules`, `failure_label`, `report_title`, and
+  per-module prompt overrides under `modules.<KEY>`.
+- `run`, `models`, `data`, `search` -- runner defaults (`run.customer_eval`,
+  `data.train_eval_versions`, `data.val_eval_versions`, ...) that CLI flags override.
+- `eval` -- eval-run creation overrides: `runner_type` and `sc_params`
+  (string or list of `key=value`; the Waldo config uses `GLEAN_CHAT` and the
+  production Waldo harness params).
+
+In teacher_student mode, pairwise judges run on full-train and validation evals.
+On a focused screen slice only the judges the screen reads are started: the
+pairwise primary, or anything named in `screening.weights`. A telemetry primary
+with a plain fix-rate screen starts no judge on the slice.
+
 ## Implementation rules
 
 1. Select the concrete adapter explicitly in `runner.py`; keep each adapter free of branches for the other evaluation path.
@@ -107,6 +175,7 @@ uv run python -m glean_gepa.runner \
 5. Preserve the distinction between a selection score and reflection diagnostics. Scores choose candidates; traces, error strings, and per-entry data explain what to edit.
 6. Cache keys must include every result-changing input: eval-set identity/version, model, prompt hash, and run label. Keep fresh eval-set cache behavior explicit.
 7. Every extraction step gets characterization tests before cleanup. Remote EvalCLI/BigQuery runs are smoke tests, not unit tests.
+8. A cached eval run is reused only when Cortex reports it `usable`: every task terminal, or succeeded+failed more than 9x the unfinished remainder. A run whose cancelled tasks are at least its finished tasks (someone killed it) is `missing` and is dropped from `glean_eval_run_cache.json` and relaunched. Cancelling an eval therefore needs no manual cache edit; restarting the runner recreates it.
 
 ## Adding an objective
 
@@ -114,23 +183,66 @@ An objective turns one eval run (or a teacher/student pair) into per-entry
 scores and reflection evidence. Adapters, the proposer, caching, and the
 reflection frame are shared; you write the parts that know your signal.
 
+### Start from a template
+
+Two complete, importable objectives live beside the real ones. Copy the one
+that matches where your signal comes from, rename, and fill the `TODO`s:
+
+Start from the template that matches where the signal lives. The question is:
+does the eval run's analysis view already have your number?
+
+| Answer | Template | Lines | Examples |
+|---|---|---|---|
+| Yes: a judge score, a count, or a yes/no the run already recorded per entry | `objectives/_template_evalcli.py` | ~210 | agentic_preference; a downvote rate; any judge dimension |
+| No: the signal is in span telemetry | `objectives/_template_agentspan.py` | ~300 | tool_match, citation_match, loop_efficiency, shell |
+
+Not sure? Call `evalcli.get_analysis_view(eval_id)` on a recent run. If the field
+you would score is in an entry's `metadata` or a judge's `outputs`, it is evalcli.
+Both templates open with this same question.
+
+Both pass `check_objective_contract` and pyright as-is. Each is one file in
+the same layout as the five shipped objectives, top to bottom:
+
+1. **Types.** One `EntryMetrics` dataclass with `entry_id`, `passed`, `score`;
+   one aggregate dataclass; the `Analysis` frame alias.
+2. **Parse and reduce.** `parse_row(row) -> EntryMetrics | None` and
+   `aggregate(per_entry) -> Aggregate`; `pass_rate` and `mean_score` in `utils.core`
+   cover the two common reductions.
+3. **Source.** Agentspan: one SQL query returning one row per entry, passed to
+   `fetch_agentspan_analysis`. EvalCLI: one call, then `build_analysis`.
+4. **Feedback.** The sentence the reflector reads for a failing entry, built
+   inline in `build_reflective_example`.
+5. **Objective class.** `SingleModelObjective[Analysis]` or
+   `TeacherStudentObjective[Analysis]`, with the hooks below.
+
+### The four decisions
+
+Everything specific to your objective is an answer to one of these. The
+template marks where each goes.
+
+| Decision | Where it lands |
+|---|---|
+| What is one entry, and when has it passed? | `EntryMetrics.passed` / `.score` |
+| What does the run score, and which field is `0` while telemetry is still landing? | the aggregate dataclass; `pending_count` on the class |
+| Where do the rows come from? | `build_*_per_entry_query` + `fetch_agentspan_analysis`, or one EvalCLI call + `build_analysis` |
+| What should the prompt do differently for a failing entry? | the `feedback` string built inline in `build_reflective_example` |
+
 ### Files you touch
 
 | File | What goes there |
 |---|---|
-| `objectives/utils/<signal>_util.py` | Fetch and parse: the BigQuery/EvalCLI query, an `EntryMetrics` dataclass, an `Analysis` dataclass, `empty_*_analysis`, `log_*_analysis`. Nothing here imports from `objectives/*.py`. |
-| `objectives/<signal>.py` | The objective class. Subclass `TeacherStudentObjective` or `SingleModelObjective` and fill in the hooks below. |
-| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string a pack YAML uses to select you. |
-| `configs/packs/<pack>.yaml` | A pack that names your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `loops.yaml`. |
-| `tests/test_<signal>_objective.py` | At least the contract test (see below), a scoring test, and a reflective-example test. |
+| `objectives/<signal>.py` | The copied template. One file: types, parsing, source, feedback, class. |
+| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string an experiment YAML's `signals[].source` uses to select you. |
+| `configs/<experiment>.yaml` | A self-contained experiment that declares a signal with your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `single_model_shell.yaml` or `teacher_student.yaml`. |
+| `tests/test_<signal>_objective.py` | At least the contract test (below), a scoring test, and a reflective-example test. |
 
-Do not touch the adapters, `base.py`, or `protocol.py` unless every existing
-objective needs the change.
+Do not touch the adapters, `base.py`, `protocol.py`, or anything under
+`objectives/utils/` unless every existing objective needs the change.
 
 ### Class attributes
 
 ```python
-name = "loop_efficiency"                 # objective score key; also the pack signal name
+name = "loop_efficiency"                 # objective score key; also the signal name in the experiment YAML
 telemetry_dimensions = ("loop_efficiency",)
 focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
 failure_label = "HIGH-SIGNAL FAILURES (extra loops)"
@@ -138,9 +250,14 @@ module_responsibilities = {WRITING_CODE_KEY: "..."}   # optional; seeds the refl
 ```
 
 `SingleModelObjective` also needs `pending_telemetry_label` and `pending_count`,
-which name the aggregate field that is `0` while BigQuery is still ingesting.
+which name the aggregate field that is `0` while telemetry is still ingesting.
 
-### Hooks (all abstract)
+### Hooks
+
+The base classes are generic in the frame your `analyze()` returns:
+`class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis])`.
+Every hook then receives that type, and pyright flags a hook typed against the
+wrong frame.
 
 | Hook | Returns | Notes |
 |---|---|---|
@@ -149,9 +266,10 @@ which name the aggregate field that is `0` while BigQuery is still ingesting.
 | `entry_row(entry_id, metrics, analysis, ctx)` | `ScoredRow` | One entry. `ctx` carries `eval_set_name`, `deployment_id`, and `ctx.entry_query(entry_id)`. Put every field `build_reflective_example` will read into `output`. |
 | `aggregate_row(analysis, ctx)` | `ScoredRow` | The whole-run row used for validation batches. |
 | `failure_pattern(component_name, trajectory)` | `tuple` | Grouping key for near-duplicate failures; return `()` to disable. |
-| `build_reflective_example(component_name, candidate, trajectory)` | `ReflectiveExample` | Compute `feedback` (and `generated` for teacher/student), then `return self.reflective_example(trajectory, feedback=..., action_inputs=..., execution_errors=...)`. The helper owns `Inputs`, `Metrics`, and the evidence caps. |
-| `log_analysis(analysis)` | `None` | Single model only. Usually delegates to `log_*_analysis` in your util. |
-| `validate_full_eval(analysis)` | `None` | Teacher/student only. Raise when a full eval has nothing to compare. |
+| `build_reflective_example(component_name, trajectory, candidate)` | `ReflectiveExample` | Compute `feedback` (and `generated` for teacher/student), then `return self.reflective_example(trajectory, feedback=..., action_inputs=..., execution_errors=...)`. The helper owns `Inputs`, `Metrics`, and the evidence caps. |
+| `log_analysis(analysis)` | `None` | Single model only. Call `core.log_analysis(analysis, label=, headline=, entry_line=)`. |
+| `validate_full_eval(analysis)` | `None` | Teacher/student only. Log the comparison; raise when a full eval has nothing to compare. |
+| `require_compared_entries(analysis)` | `None` | Teacher/student only, optional. Raise `core.NoComparedEntriesError` with a hint when `compared_entries == 0`; default does nothing. |
 
 Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 `cache_hit_is_sufficient`, `analysis_is_cacheable`, `cache_payload` /
@@ -162,7 +280,7 @@ Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 - Every score is higher-is-better in `[0.0, 1.0]`. `scored_rows_are_normalized`
   in `protocol.py` rejects anything else.
 - `objective_scores` in each row must contain `self.name`. Extra keys are fine;
-  the pack decides which ones enter the composite.
+  the experiment YAML's `objective.composite` decides which ones enter the composite.
 - Provisional results (telemetry not yet ingested) return an analysis whose
   aggregate reports `0` entries. `is_pending` sees that and the adapter retries.
 
@@ -193,14 +311,32 @@ def test_satisfies_contract_and_is_registered() -> None:
 `BUILTIN_OBJECTIVES` loads and satisfies the protocol, so a missing hook fails
 CI before you write a scoring test.
 
+### What `objectives/utils/` gives you
+
+You call these; you do not add to them for one objective.
+
+| Module | What it is |
+|---|---|
+| `core` | The frame: `RunAnalysis[A, E]` / `PairedRunAnalysis`, `EntryMetricsLike`, `build_analysis`, `empty_analysis`, `select_high_signal`, `require_compared_entries`, `log_analysis`, `EVIDENCE_LIMIT`. |
+| `agentspan` | BigQuery: `bounds_query` (`"= @eval_id"` or `"IN UNNEST(@eval_ids)"`), `paired_role_query` (the teacher/student FULL OUTER JOIN scaffold), `fetch_agentspan_analysis` (window → query → `filter_rows` → `parse_row` → `post_parse` → high-signal → `enrich` → `aggregate`). |
+| `traces` | `enrich_action_inputs`: tool payloads from detailed EvalCLI traces for high-signal entries. You supply one `apply(metrics, fetched, entry_id)`. |
+| `agentspan_query` | Shard-window and table constants, `default_date_range`, `wildcard_shard_filter`, `EVAL_ENTRY_ID_EXPR`. |
+| `evalset_entries` | `fact.*` lookups the adapters use to build focused replay sets. |
+| `tool_names` | `SKIPPED_TOOL_NAMES`, `scored_tool_sequence`, `first_tool_name`, `first_tool_mismatch_pair`. Shared with `prompt` and `run_log`. |
+| `mismatch` | Grouping near-duplicate failures for reflection. |
+
+Two shipped objectives depart from the template and say why in their module
+docstrings: `shell.py` (own aggregate query; `action_run_id`-keyed enrichment)
+and `agentic_preference.py` (no SQL, no aggregate on the frame).
+
 ### Checklist
 
-- [ ] Util module fetches, parses, logs. No adapter or objective imports.
-- [ ] Objective class sets the class attributes and implements every hook in the table.
+- [ ] One file under `objectives/`, in the template layout. Imports from `utils/`, never from another objective.
+- [ ] Class binds its frame: `SingleModelObjective[YourAnalysis]`.
 - [ ] `analyze` goes through the shared cache helper.
 - [ ] `build_reflective_example` goes through `self.reflective_example`.
 - [ ] `ObjectiveSpec` added; `uv run pytest tests/test_objectives_catalog.py` passes.
-- [ ] Pack YAML added; `uv run pytest tests/test_experiment_config.py` passes.
+- [ ] Experiment YAML added or extended; `uv run pytest tests/test_experiment_config.py` passes.
 - [ ] `uv run ruff check src/ && uv run pyright src/` clean.
 
 ## Children cache (`glean_children_cache.json`)

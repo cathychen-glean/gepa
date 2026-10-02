@@ -5,15 +5,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from glean_gepa.objectives.utils.tool_names import SKIPPED_TOOL_NAMES
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
 from glean_gepa.judge_metrics_util import JudgeAnalysis
-from glean_gepa.objectives.utils.tool_match_util import (
-    SKIPPED_TOOL_NAMES,
+from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.objectives.tool_match import (
     TOOL_ALIGNMENT_OBJECTIVE,
     EvalRunToolMatchAnalysis,
-    NoComparedEvalEntriesError,
     ToolMatchEntryMetrics,
     ToolMatchMetrics,
 )
@@ -103,13 +103,10 @@ def _tool_match_analysis(
         )
     matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
     return EvalRunToolMatchAnalysis(
-        teacher_eval_id=teacher_eval_id,
-        student_eval_id=student_eval_id,
+        eval_ids=(teacher_eval_id, student_eval_id),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id=teacher_eval_id,
-            student_eval_id=student_eval_id,
             compared_entries=len(per_entry),
             matching_entries=matching,
             tool_match_rate=(matching / len(per_entry)) if per_entry else 0.0,
@@ -276,13 +273,10 @@ def test_get_or_fetch_analysis_caches_fetch():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
     fetched = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
             tool_match_rate=0.0,
@@ -450,13 +444,10 @@ def test_validation_only_skips_action_input_hydration():
 def test_finish_batch_evals_uses_tool_match_and_correctness():
     adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     analysis = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=1,
             matching_entries=0,
             tool_match_rate=0.5,
@@ -604,13 +595,10 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
     """
     adapter = _teacher_student_adapter(MagicMock(), judge_correctness=True)
     adapter._analysis_cache[("teacher-1", "student-1")] = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=4,
             matching_entries=3,
             tool_match_rate=0.75,
@@ -677,13 +665,10 @@ def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
 def test_finish_focused_eval_uses_requested_entry_denominator():
     adapter = _teacher_student_adapter(MagicMock())
     analysis = EvalRunToolMatchAnalysis(
-        teacher_eval_id="teacher-1",
-        student_eval_id="student-1",
+        eval_ids=("teacher-1", "student-1"),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
         aggregate=ToolMatchMetrics(
-            teacher_eval_id="teacher-1",
-            student_eval_id="student-1",
             compared_entries=2,
             matching_entries=1,
             tool_match_rate=0.5,
@@ -726,7 +711,7 @@ def test_finish_focused_eval_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
 
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
             [
                 _StartedPair(
@@ -743,7 +728,7 @@ def test_finish_batch_evals_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
     adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
 
-    with pytest.raises(NoComparedEvalEntriesError, match="No eval entries were compared"):
+    with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
             [
                 _StartedPair(
@@ -973,7 +958,7 @@ def _mismatch_trajectory(entry_id: str, teacher_tools: list[str], student_tools:
     }
 
 
-def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups():
+def test_make_reflective_dataset_takes_mismatches_in_order_up_to_the_cap():
     adapter = _teacher_student_adapter(MagicMock())
     trajectories = (
         [_mismatch_trajectory(f"xy-{i}", ["x"], ["y"]) for i in range(12)]
@@ -1002,7 +987,7 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
         ["WRITING_CODE"],
         k=8,
     )["WRITING_CODE"]
-    assert [example["Inputs"]["entry_id"] for example in capped] == [f"xy-{i}" for i in range(12)]
+    assert [example["Inputs"]["entry_id"] for example in capped] == [f"xy-{i}" for i in range(8)]
 
     oversized = adapter.make_reflective_dataset(
         {"WRITING_CODE": "prompt"},
@@ -1015,10 +1000,10 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
         ["WRITING_CODE"],
         k=8,
     )["WRITING_CODE"]
-    assert [example["Inputs"]["entry_id"] for example in oversized] == [f"xy-{i}" for i in range(35)]
+    assert [example["Inputs"]["entry_id"] for example in oversized] == [f"xy-{i}" for i in range(8)]
 
 
-def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches():
+def test_make_reflective_dataset_shares_examples_across_tool_modules():
     adapter = _teacher_student_adapter(MagicMock())
     trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
         _mismatch_trajectory(f"read-{i}", ["Glean Document Reader"], ["todo_write"]) for i in range(8)
@@ -1032,22 +1017,18 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
         k=20,
     )
 
-    assert len(examples["WRITING_CODE"]) == 20
-    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
-    discover_ids = [example["Inputs"]["entry_id"] for example in examples["discover"]]
-    reader_ids = [example["Inputs"]["entry_id"] for example in examples["glean_document_reader"]]
-    assert search_ids == [f"search-{i}" for i in range(12)]
-    assert discover_ids == search_ids
-    assert reader_ids == [f"read-{i}" for i in range(8)]
+    shared = [f"search-{i}" for i in range(12)] + [f"read-{i}" for i in range(8)]
+    for module in ("WRITING_CODE", "glean_search", "discover", "glean_document_reader"):
+        assert [example["Inputs"]["entry_id"] for example in examples[module]] == shared
     assert examples["glean_search"][0]["Feedback"].startswith(
         "First-tool mismatch: teacher used Glean Search and student used Discover."
     )
 
 
-def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
+def test_make_reflective_dataset_shares_non_core_mismatches_with_tool_modules():
     adapter = _teacher_student_adapter(MagicMock())
-    trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
-        _mismatch_trajectory(f"write-{i}", ["Write"], []) for i in range(8)
+    trajectories = [_mismatch_trajectory("write-0", ["Write"], [])] + [
+        _mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)
     ]
     examples = adapter.make_reflective_dataset(
         {"FULL_PROMPT": "prompt", RULES_EXT_KEY: ""},
@@ -1055,10 +1036,9 @@ def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
         [RULES_EXT_KEY, "glean_search"],
         k=8,
     )
-    write_ids = [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]]
-    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
-    assert write_ids == [f"write-{i}" for i in range(8)]
-    assert search_ids == [f"search-{i}" for i in range(12)]
+    expected = ["write-0"] + [f"search-{i}" for i in range(7)]
+    assert [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]] == expected
+    assert [example["Inputs"]["entry_id"] for example in examples["glean_search"]] == expected
     # An empty student sequence means every span was a skipped one, so say so rather
     # than printing "(none)", which reflection read as a hole in the trace.
     assert examples[RULES_EXT_KEY][0]["Feedback"].startswith(
