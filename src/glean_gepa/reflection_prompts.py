@@ -425,6 +425,29 @@ def diagnosis_retry_preface(module_name: str) -> str:
     )
 
 
+def shrink_prompt(*, module_name: str, variant: str, budget: int, current: str) -> str:
+    """Ask the reflector to cut an over-budget variant down to ``budget`` characters.
+
+    Used once per over-length variant before it is discarded. The variant already
+    passed the slot and conditional checks, so the only allowed change is removing
+    or tightening text; the rules it added are kept, the module is not re-planned.
+    """
+    over = len(variant) - budget
+    return (
+        f"The following rewrite of the module {module_name} is {len(variant)} characters, which is "
+        f"{over} characters over the hard limit of {budget}. Shorten it to at most {budget} characters.\n"
+        "Rules:\n"
+        "- Do not add any rule, heading, section or topic. Only remove or tighten text.\n"
+        "- Prefer deleting redundant restatements, examples that repeat a rule already stated, and "
+        "hedging or transitional sentences. Merge overlapping bullets.\n"
+        "- Keep every rule that is new relative to the ORIGINAL module; those are the point of the rewrite.\n"
+        f"- {markup_rule_for(current)}\n"
+        "- Output only the shortened module text, with no preamble, no fences and no variant label.\n\n"
+        f"ORIGINAL module (for reference, {len(current)} characters):\n{current}\n\n"
+        f"REWRITE to shorten:\n{variant}\n"
+    )
+
+
 def consolidate_prompt(
     *,
     module_name: str,
