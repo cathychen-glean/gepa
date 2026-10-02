@@ -555,12 +555,15 @@ class ALRunner:
             if isinstance(exc, EvalCliError) and is_missing_eval_job(exc):
                 return "missing"
             return self._fallback_eval_state(eval_run_id)
-        if isinstance(statuses, list) and statuses:
-            return classify_eval_run_status(statuses[0])
-        if isinstance(statuses, dict):
-            return classify_eval_run_status(statuses)
         if statuses is None:
-            return "missing"
+            return "missing"  # evalcli surfaced a not-found error
+        row = statuses[0] if isinstance(statuses, list) and statuses else statuses
+        state = classify_eval_run_status(row) if isinstance(row, dict) else "unknown"
+        if state != "unknown":
+            return state
+        # Cortex answered but without task counts (and without a not-found error).
+        # Do not drop a cached run on that; trust what the cache already knows.
+        print(f"[Eval run cache] {eval_run_id}: status payload had no task counts; keeping cached state")
         return self._fallback_eval_state(eval_run_id)
 
     def _resolve_cached_eval(self, cache_key: EvalCacheKey) -> tuple[str, bool] | None:

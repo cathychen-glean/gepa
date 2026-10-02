@@ -23,6 +23,7 @@ from glean_gepa.evalcli_client import (
     EvalCliError,
     _subprocess_env,
     classify_eval_run_status,
+    is_missing_run_status,
     min_ingested_eval_set_entries,
 )
 from glean_gepa.judge_metrics_util import (
@@ -1118,8 +1119,16 @@ def test_invoke_raises_on_nonzero_exit():
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        (None, "missing"),
-        ({"taskCountsByStatus": []}, "missing"),
+        # No task counts and no not-found error: Cortex answered but did not say.
+        # Callers keep the cached state rather than relaunching the run.
+        (None, "unknown"),
+        ({"taskCountsByStatus": []}, "unknown"),
+        ({"crossDeploymentUuid": "x"}, "unknown"),
+        # Explicit "no such run" payload (HTTP 200 with errors, no counts) is missing.
+        ({"crossDeploymentUuid": "x", "errors": ["No EvalRun or JudgeRun found with this ID"]}, "missing"),
+        ({"crossDeploymentUuid": "x", "errors": ["no job found"]}, "missing"),
+        # An unrelated error string without counts is still unknown, not missing.
+        ({"crossDeploymentUuid": "x", "errors": ["backend timeout"]}, "unknown"),
         ({"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}, "ongoing"),
         (
             {
@@ -1234,3 +1243,20 @@ def test_invoke_raises_on_nonzero_exit():
 )
 def test_classify_eval_run_status(status, expected):
     assert classify_eval_run_status(status) == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ({"errors": ["No EvalRun or JudgeRun found with this ID"]}, True),
+        ({"errors": ["No job found for id"]}, True),
+        ({"errors": ["backend timeout"]}, False),
+        ({"errors": "No EvalRun found"}, False),  # must be a list
+        ({"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 1}]}, False),
+        ({}, False),
+        (None, False),
+        ("No EvalRun found", False),
+    ],
+)
+def test_is_missing_run_status(status, expected):
+    assert is_missing_run_status(status) is expected
