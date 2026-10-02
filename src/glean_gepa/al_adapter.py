@@ -46,7 +46,6 @@ from glean_gepa.reflection_prompts import (
     new_module_length_rule,
     parse_diagnosis_reply,
     sanitize_proposed_module,
-    shrink_prompt,
 )
 from glean_gepa.reflection_sampling import deduplicate_reflective_examples
 from glean_gepa.run_log import format_eval_entry_report, log_section, selected_entry_ids_from_examples
@@ -1718,11 +1717,8 @@ class GleanAdapterBase:
             if not self._keeps_structure(variant, current=current, module_name=module_name):
                 continue
             if budget is not None and len(variant) > budget:
-                variant = self._shrink_to_budget(
-                    reflection_llm, variant, current=current, module_name=module_name, budget=budget
-                )
-                if variant is None:
-                    continue
+                print(f"Discarding {module_name} variant of {len(variant)} chars (budget {budget})")
+                continue
             variants.append(variant)
         return variants[:max_variants], False, reply.suggestions
 
@@ -1735,33 +1731,3 @@ class GleanAdapterBase:
             print(f"Discarding {module_name} variant that dropped a <<<[[...]]>>> conditional")
             return False
         return True
-
-    def _shrink_to_budget(
-        self,
-        reflection_llm: Callable[[str], str],
-        variant: str,
-        *,
-        current: str,
-        module_name: str,
-        budget: int,
-    ) -> str | None:
-        """One shrink pass for an over-budget variant; None if it still does not fit.
-
-        The consolidate step is told the limit but routinely overshoots on dense
-        modules (a 10% growth cap on an 8k-char module leaves little slack). One
-        targeted cut-only call rescues the generation instead of losing it to a
-        length rule, at the cost of a single extra LLM call per oversize variant.
-        """
-        print(f"Shrinking {module_name} variant of {len(variant)} chars to budget {budget}")
-        shrunk = sanitize_proposed_module(
-            reflection_llm(shrink_prompt(module_name=module_name, variant=variant, budget=budget, current=current)),
-            current=current,
-            module_name=module_name,
-        )
-        if not shrunk or not self._keeps_structure(shrunk, current=current, module_name=module_name):
-            return None
-        if len(shrunk) > budget:
-            print(f"Discarding {module_name} variant of {len(shrunk)} chars after shrink (budget {budget})")
-            return None
-        print(f"Kept {module_name} variant at {len(shrunk)} chars after shrink")
-        return shrunk

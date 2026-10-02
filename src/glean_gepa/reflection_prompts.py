@@ -193,12 +193,18 @@ def compose_responsibility(frame: str, body: str, *, guide: str = "", closing: s
 FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the failed examples."
 
 
+# Per-generation growth allowed for a non-empty module. 1.1 was too tight for dense
+# rule modules: on the ~8k-char Waldo tool module every consolidated variant across
+# two generations landed 3-19% over and was discarded, so no child was ever produced.
+MODULE_GROWTH = 1.2
+
+
 def module_char_budget(current: str, token_budget: int | None = None) -> int | None:
     """Largest rewrite size in characters, or None if unbounded. ~4 chars/token."""
     hard_cap = token_budget * 4 if token_budget else None
     if not current.strip():
         return hard_cap
-    growth = max(int(len(current) * 1.1), 200)
+    growth = max(int(len(current) * MODULE_GROWTH), 200)
     return min(growth, hard_cap) if hard_cap else growth
 
 
@@ -422,29 +428,6 @@ def diagnosis_retry_preface(module_name: str) -> str:
         "instead of the requested sections. Do not return module text. Your reply must start with "
         "the line 'DIAGNOSIS:' followed by the failure-mode tally, then a line 'PATCHES:' followed "
         "by BEFORE / AFTER / WHY blocks. Nothing else.\n\n"
-    )
-
-
-def shrink_prompt(*, module_name: str, variant: str, budget: int, current: str) -> str:
-    """Ask the reflector to cut an over-budget variant down to ``budget`` characters.
-
-    Used once per over-length variant before it is discarded. The variant already
-    passed the slot and conditional checks, so the only allowed change is removing
-    or tightening text; the rules it added are kept, the module is not re-planned.
-    """
-    over = len(variant) - budget
-    return (
-        f"The following rewrite of the module {module_name} is {len(variant)} characters, which is "
-        f"{over} characters over the hard limit of {budget}. Shorten it to at most {budget} characters.\n"
-        "Rules:\n"
-        "- Do not add any rule, heading, section or topic. Only remove or tighten text.\n"
-        "- Prefer deleting redundant restatements, examples that repeat a rule already stated, and "
-        "hedging or transitional sentences. Merge overlapping bullets.\n"
-        "- Keep every rule that is new relative to the ORIGINAL module; those are the point of the rewrite.\n"
-        f"- {markup_rule_for(current)}\n"
-        "- Output only the shortened module text, with no preamble, no fences and no variant label.\n\n"
-        f"ORIGINAL module (for reference, {len(current)} characters):\n{current}\n\n"
-        f"REWRITE to shorten:\n{variant}\n"
     )
 
 
