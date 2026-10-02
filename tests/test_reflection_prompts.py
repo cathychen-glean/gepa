@@ -281,13 +281,13 @@ def test_length_rule_states_a_character_count():
     rule = length_rule_for(tool_text)
     assert str(budget) in rule
     assert str(len(tool_text)) in rule
-    assert "1.2" not in rule
+    assert "1.3" not in rule
 
 
-def test_module_char_budget_allows_twenty_percent_growth():
-    """Waldo's 8102-char module needs room for a ~10-15% consolidated overshoot."""
+def test_module_char_budget_allows_thirty_percent_growth():
+    """Waldo's 8102-char module: consolidated variants landed 9091-10594 chars."""
     current = "x" * 8102
-    assert module_char_budget(current) == int(8102 * 1.2) == 9722
+    assert module_char_budget(current) == int(8102 * 1.3) == 10532
     # Token cap still wins when it is lower.
     assert module_char_budget(current, token_budget=2000) == 8000
     # Small modules keep the 200-char floor.

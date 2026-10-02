@@ -195,8 +195,9 @@ FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the faile
 
 # Per-generation growth allowed for a non-empty module. 1.1 was too tight for dense
 # rule modules: on the ~8k-char Waldo tool module every consolidated variant across
-# two generations landed 3-19% over and was discarded, so no child was ever produced.
-MODULE_GROWTH = 1.2
+# three generations landed 3-25% over and was discarded, so no child was ever produced.
+# The per-module token budget still hard-caps the result.
+MODULE_GROWTH = 1.3
 
 
 def module_char_budget(current: str, token_budget: int | None = None) -> int | None:
