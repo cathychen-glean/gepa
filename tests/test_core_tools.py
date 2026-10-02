@@ -257,3 +257,25 @@ def test_total_prompt_tokens_excludes_core_tool_descriptions():
         baseline_prompt_hash="h",
     )
     assert total_prompt_tokens(candidate) == approx_token_len("abcd" * 10)
+
+
+def test_total_prompt_tokens_skips_full_prompt_for_waldo_candidates():
+    """Waldo renders through WALDO_SYSTEM; the attached FULL_PROMPT template is not budgeted."""
+    specs = {"WALDO_TOOL_USAGE": ModuleSpec("WALDO_TOOL_USAGE", "free_text", 2560)}
+    waldo = Candidate(
+        model="waldo",
+        prompt_modules={"FULL_PROMPT": "f" * 4000, "WALDO_SYSTEM": "s" * 800, "WALDO_TOOL_USAGE": "t" * 400},
+        module_specs=specs,
+        global_token_cap=400,
+        baseline_prompt_hash="h",
+    )
+    assert total_prompt_tokens(waldo) == 200 + 100
+    # Without WALDO_SYSTEM the template is the rendered prompt and does count.
+    generic = Candidate(
+        model="gpt",
+        prompt_modules={"FULL_PROMPT": "f" * 4000, "RULES_EXT": "r" * 400},
+        module_specs={"RULES_EXT": ModuleSpec("RULES_EXT", "free_text", 512)},
+        global_token_cap=4096,
+        baseline_prompt_hash="h",
+    )
+    assert total_prompt_tokens(generic) == 1000 + 100

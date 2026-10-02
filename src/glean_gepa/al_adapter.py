@@ -32,7 +32,7 @@ from glean_gepa.evalcli_client import (
     is_missing_eval_job,
 )
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, prepare_high_signal_eval_batch
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS, FULL_PROMPT_KEY
 from glean_gepa.reflection_prompts import (
     EMPTY_DIAGNOSIS_FALLBACK,
     DiagnosisReply,
@@ -230,9 +230,28 @@ def approx_token_len(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# Candidates that edit a Waldo module render through WALDO_SYSTEM. The generic
+# FULL_PROMPT render template is still attached (it keys the coding_agent_loop_system
+# override, so dropping it would change the eval cache hash) but it is not the prompt
+# under optimization, so it must not count against the global cap.
+WALDO_RENDER_KEY = "WALDO_SYSTEM"
+
+
+def budgeted_module_keys(candidate: Candidate) -> list[str]:
+    """Module keys whose length counts toward ``global_token_cap``."""
+    keys = [key for key in candidate.prompt_modules if key not in CORE_TOOL_KEYS]
+    if WALDO_RENDER_KEY in candidate.prompt_modules:
+        keys = [key for key in keys if key != FULL_PROMPT_KEY]
+    return keys
+
+
 def total_prompt_tokens(candidate: Candidate) -> int:
-    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions."""
-    return sum(approx_token_len(text) for key, text in candidate.prompt_modules.items() if key not in CORE_TOOL_KEYS)
+    """Sum token estimates for the rendered system prompt.
+
+    Excludes core-tool descriptions, and excludes the generic ``FULL_PROMPT`` template
+    when the candidate renders through ``WALDO_SYSTEM`` (see ``budgeted_module_keys``).
+    """
+    return sum(approx_token_len(candidate.prompt_modules[key]) for key in budgeted_module_keys(candidate))
 
 
 def within_prompt_budget(candidate: Candidate) -> bool:

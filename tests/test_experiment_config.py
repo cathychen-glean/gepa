@@ -417,24 +417,30 @@ def test_waldo_config_runs_post_search_eval_on_pinned_internal_val():
 
 
 def test_waldo_global_token_cap_leaves_room_for_the_tool_module_budget():
-    """The global cap must not bind before the per-module budget does."""
+    """The seed candidate, as the runner builds it, must fit the cap with the tool budget to spare."""
     import json
 
-    from glean_gepa.al_adapter import approx_token_len
+    from glean_gepa.al_adapter import Candidate, ModuleSpec, approx_token_len, total_prompt_tokens, within_prompt_budget
+    from glean_gepa.runner import _seed_for_editable_modules
     from glean_gepa.waldo_prompt_constants import WALDO_TOOL_USAGE_TOKEN_BUDGET
 
     config = load_experiment_config("teacher_student_waldo")
-    seed = json.loads(Path(config.run["seed_candidate"]).read_text())
-
-    def find(obj, key):
-        if isinstance(obj, dict):
-            if isinstance(obj.get(key), str):
-                return obj[key]
-            for value in obj.values():
-                found = find(value, key)
-                if found:
-                    return found
-        return None
-
-    system_tokens = approx_token_len(find(seed, "WALDO_SYSTEM"))
-    assert config.search["global_token_cap"] >= system_tokens + WALDO_TOOL_USAGE_TOKEN_BUDGET
+    raw = json.loads(Path(config.run["seed_candidate"]).read_text())
+    modules = _seed_for_editable_modules(raw, config.run["editable_modules"])
+    assert "FULL_PROMPT" in modules  # attached for the coding_agent_loop_system override
+    cap = config.search["global_token_cap"]
+    candidate = Candidate(
+        model="waldo",
+        prompt_modules=modules,
+        module_specs={"WALDO_TOOL_USAGE": ModuleSpec("WALDO_TOOL_USAGE", "free_text", WALDO_TOOL_USAGE_TOKEN_BUDGET)},
+        global_token_cap=cap,
+        baseline_prompt_hash="seed",
+    )
+    # FULL_PROMPT is not the rendered prompt and must not count.
+    assert total_prompt_tokens(candidate) == approx_token_len(modules["WALDO_SYSTEM"]) + approx_token_len(
+        modules["WALDO_TOOL_USAGE"]
+    )
+    assert within_prompt_budget(candidate)
+    # A child that uses the whole tool-module budget still fits the cap.
+    maxed = {**modules, "WALDO_TOOL_USAGE": "x" * (WALDO_TOOL_USAGE_TOKEN_BUDGET * 4)}
+    assert within_prompt_budget(Candidate(**{**candidate.__dict__, "prompt_modules": maxed}))
