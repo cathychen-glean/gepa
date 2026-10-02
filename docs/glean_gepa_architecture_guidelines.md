@@ -97,6 +97,12 @@ is set:
 `customer_eval: false` only skips the post-search gate. It does not change which
 path the in-loop validation set uses; pin `val_eval_versions` for that.
 
+The post-search gate runs on the same valset the search used. So with
+`val_eval_versions` pinned and `customer_eval: true`, the seed-vs-best pair runs on
+the internal `scio-prod` set and the `objective.validation` gates are enforced
+there, with no customer deployment involved. "Customer" in the name refers to the
+unpinned default, not a requirement. `teacher_student_waldo` uses this combination.
+
 ## Reflection sampling CLI
 
 Use all available reflective examples when each iteration's example set is

@@ -404,6 +404,13 @@ def test_customer_eval_toggle_yaml_default_and_cli_override(tmp_path):
         runner_arg_defaults(load_experiment_config(bad))
 
 
-def test_waldo_config_turns_customer_eval_off():
-    assert runner_arg_defaults(load_experiment_config("teacher_student_waldo"))["customer_eval"] is False
-    assert _parse_args(["--config", "teacher_student_waldo"]).customer_eval is False
+def test_waldo_config_runs_post_search_eval_on_pinned_internal_val():
+    """customer_eval is on, and with val pinned it runs on scio-prod, not a customer deployment."""
+    config = load_experiment_config("teacher_student_waldo")
+    assert runner_arg_defaults(config)["customer_eval"] is True
+    assert _parse_args(["--config", "teacher_student_waldo"]).customer_eval is True
+    assert config.data["val_eval_versions"] == [20260909]
+    assert config.data["deployment_ids"] == ["scio-prod"]
+    # Two pinned train versions so a childless generation does not exhaust the schedule.
+    assert config.data["train_eval_versions"] == [20261001, 20260908]
+    assert not set(config.data["train_eval_versions"]) & set(config.data["val_eval_versions"])
