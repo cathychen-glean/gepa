@@ -11,9 +11,8 @@
 #
 # Run:  uv run python -m glean_gepa.runner --config teacher_student_waldo
 #
-# STATUS: runs on Glean Chat V2 Medium (scio-prod) with train/val pinned below and
-# the external customer eval off (run.customer_eval). Swap in the Waldo team's
-# routing set (gap-2) when it is in EvalCLI. Other TODOs are tuning.
+# STATUS: runs on Glean Chat V2 Medium (scio-prod) with train/val pinned below. Swap in
+# the Waldo team's routing set (gap-2) when it is in EvalCLI. Other TODOs are tuning.
 
 schema_version: 1
 mode: teacher_student
@@ -21,10 +20,9 @@ mode: teacher_student
 run:
   dir: run_ts_waldo
   max_metric_calls: 10
-  # External (customer) eval after the search: seed vs best on the val set, gated by
-  # objective.validation. Off while customer evals are unavailable; flip to true (or
-  # pass --customer_eval) to re-enable. The in-loop search is unaffected.
-  customer_eval: false
+  # Post-search seed-vs-best eval on the val set, gated by objective.validation. With
+  # val pinned below it runs on scio-prod, not a sampled customer deployment.
+  customer_eval: true
   eval_run_timeout_sec: 21600
   # Seed is the LIVE production Waldo prompt (from a Waldo eval's
   # llmo.per_prompt_overrides.waldo_system), split into WALDO_SYSTEM (template with
@@ -41,7 +39,7 @@ models:
   # TODO(gap-1): confirm with the team which deployment they are tuning for.
   student: waldo:OPEN_AI:GPT6_LUNA:none
   teacher: waldo:OPEN_AI:GPT6_1_SOL:high
-  reflection: OPEN_AI:GPT5_LATEST
+  reflection: CUSTOM:GPT5_6_LUNA
 
 eval:
   # EvalCLI --runner-type. Waldo evals run on the standard Glean Chat runner.
@@ -93,11 +91,10 @@ data:
   lookback_days: 14
   days_back: 0
   val_version_count: 1
-  # Pinned so validation is scored on data.deployment_ids (scio-prod), not a sampled
-  # customer deployment. Unpinned val goes through the customer path, which is off.
-  # Train and val are disjoint scio-prod versions; 20260909 is the newest outside the
-  # 14-day training window as of 2026-10-01.
-  train_eval_versions: [20261001]
+  # Pinned so validation is scored on scio-prod, not a sampled customer deployment.
+  # Train and val are disjoint; two train versions so a childless generation does not
+  # exhaust the schedule.
+  train_eval_versions: [20261001, 20260908]
   val_eval_versions: [20260909]
 
 signals:
@@ -173,5 +170,6 @@ search:
   offspring_count: 5
   reflection_samples: 25
   reflection_hamming_distance_k: null
-  # Live Waldo prompt is ~6.3k tokens; runner raises this to the module budgets anyway.
-  global_token_cap: 8192
+  # WALDO_SYSTEM (~5.9k tok) + WALDO_TOOL_USAGE budget (2560). Must exceed their sum so
+  # the per-module budget binds, not this cap.
+  global_token_cap: 9216

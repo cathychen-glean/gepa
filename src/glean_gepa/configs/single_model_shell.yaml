@@ -20,7 +20,7 @@ run:
 
 models:
   student: gpt
-  reflection: OPEN_AI:GPT5_LATEST
+  reflection: CUSTOM:GPT5_6_LUNA
 
 data:
   eval_set_name: Glean Chat V2 Medium

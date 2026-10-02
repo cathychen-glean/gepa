@@ -281,7 +281,9 @@ def test_length_rule_states_a_character_count():
     rule = length_rule_for(tool_text)
     assert str(budget) in rule
     assert str(len(tool_text)) in rule
-    assert "1.1" not in rule
+    assert "1.3" not in rule
+    assert module_char_budget("x" * 8000) == 10400  # MODULE_GROWTH
+    assert module_char_budget("x" * 8000, token_budget=2000) == 8000  # token cap wins
 
 
 def test_empty_rules_ext_char_budget_fits_consolidated_bullets():

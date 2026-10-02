@@ -97,6 +97,12 @@ is set:
 `customer_eval: false` only skips the post-search gate. It does not change which
 path the in-loop validation set uses; pin `val_eval_versions` for that.
 
+The post-search gate runs on the same valset the search used. So with
+`val_eval_versions` pinned and `customer_eval: true`, the seed-vs-best pair runs on
+the internal `scio-prod` set and the `objective.validation` gates are enforced
+there, with no customer deployment involved. "Customer" in the name refers to the
+unpinned default, not a requirement. `teacher_student_waldo` uses this combination.
+
 ## Reflection sampling CLI
 
 Use all available reflective examples when each iteration's example set is
@@ -161,10 +167,11 @@ Sections:
   (string or list of `key=value`; the Waldo config uses `GLEAN_CHAT` and the
   production Waldo harness params).
 
-In teacher_student mode, pairwise judges run on full-train and validation evals.
-On a focused screen slice only the judges the screen reads are started: the
-pairwise primary, or anything named in `screening.weights`. A telemetry primary
-with a plain fix-rate screen starts no judge on the slice.
+In teacher_student mode, validation evals start every configured pairwise judge.
+Full-train evals and focused screen slices start only the judges the search
+reads: the primary, anything in `objective.composite`, and anything in
+`screening.weights`. A judge listed only under `objective.validation` (the Waldo
+correctness judge) therefore runs once per candidate, on the val eval.
 
 ## Implementation rules
 

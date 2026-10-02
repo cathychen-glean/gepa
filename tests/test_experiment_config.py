@@ -402,8 +402,3 @@ def test_customer_eval_toggle_yaml_default_and_cli_override(tmp_path):
     bad.write_text(_mode_yaml() + "run:\n  customer_eval: nope\n")
     with pytest.raises(ExperimentConfigError, match="run.customer_eval must be true or false"):
         runner_arg_defaults(load_experiment_config(bad))
-
-
-def test_waldo_config_turns_customer_eval_off():
-    assert runner_arg_defaults(load_experiment_config("teacher_student_waldo"))["customer_eval"] is False
-    assert _parse_args(["--config", "teacher_student_waldo"]).customer_eval is False

@@ -32,7 +32,7 @@ from glean_gepa.evalcli_client import (
     is_missing_eval_job,
 )
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE, prepare_high_signal_eval_batch
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS, FULL_PROMPT_KEY
 from glean_gepa.reflection_prompts import (
     EMPTY_DIAGNOSIS_FALLBACK,
     DiagnosisReply,
@@ -230,9 +230,22 @@ def approx_token_len(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# Waldo candidates render through WALDO_SYSTEM; the attached FULL_PROMPT template is
+# not the prompt under optimization and does not count against the global cap.
+WALDO_RENDER_KEY = "WALDO_SYSTEM"
+
+
+def budgeted_module_keys(candidate: Candidate) -> list[str]:
+    """Module keys whose length counts toward ``global_token_cap``."""
+    keys = [key for key in candidate.prompt_modules if key not in CORE_TOOL_KEYS]
+    if WALDO_RENDER_KEY in candidate.prompt_modules:
+        keys = [key for key in keys if key != FULL_PROMPT_KEY]
+    return keys
+
+
 def total_prompt_tokens(candidate: Candidate) -> int:
-    """Sum token estimates for the system-prompt modules, excluding core-tool descriptions."""
-    return sum(approx_token_len(text) for key, text in candidate.prompt_modules.items() if key not in CORE_TOOL_KEYS)
+    """Sum token estimates for the rendered system prompt (see ``budgeted_module_keys``)."""
+    return sum(approx_token_len(candidate.prompt_modules[key]) for key in budgeted_module_keys(candidate))
 
 
 def within_prompt_budget(candidate: Candidate) -> bool:
@@ -554,12 +567,14 @@ class ALRunner:
             if isinstance(exc, EvalCliError) and is_missing_eval_job(exc):
                 return "missing"
             return self._fallback_eval_state(eval_run_id)
-        if isinstance(statuses, list) and statuses:
-            return classify_eval_run_status(statuses[0])
-        if isinstance(statuses, dict):
-            return classify_eval_run_status(statuses)
         if statuses is None:
-            return "missing"
+            return "missing"  # evalcli surfaced a not-found error
+        row = statuses[0] if isinstance(statuses, list) and statuses else statuses
+        state = classify_eval_run_status(row) if isinstance(row, dict) else "unknown"
+        if state != "unknown":
+            return state
+        # No task counts and no not-found error: keep the cached state.
+        print(f"[Eval run cache] {eval_run_id}: status payload had no task counts; keeping cached state")
         return self._fallback_eval_state(eval_run_id)
 
     def _resolve_cached_eval(self, cache_key: EvalCacheKey) -> tuple[str, bool] | None:
@@ -1711,14 +1726,20 @@ class GleanAdapterBase:
             variant = sanitize_proposed_module(chunk, current=current, module_name=module_name)
             if not variant or variant.upper() == "NOT_RELEVANT":
                 continue
-            if drops_render_slot(variant, current=current):
-                print(f"Discarding {module_name} variant that dropped a render slot")
-                continue
-            if drops_conditional(variant, current=current):
-                print(f"Discarding {module_name} variant that dropped a <<<[[...]]>>> conditional")
+            if not self._keeps_structure(variant, current=current, module_name=module_name):
                 continue
             if budget is not None and len(variant) > budget:
                 print(f"Discarding {module_name} variant of {len(variant)} chars (budget {budget})")
                 continue
             variants.append(variant)
         return variants[:max_variants], False, reply.suggestions
+
+    @staticmethod
+    def _keeps_structure(variant: str, *, current: str, module_name: str) -> bool:
+        if drops_render_slot(variant, current=current):
+            print(f"Discarding {module_name} variant that dropped a render slot")
+            return False
+        if drops_conditional(variant, current=current):
+            print(f"Discarding {module_name} variant that dropped a <<<[[...]]>>> conditional")
+            return False
+        return True

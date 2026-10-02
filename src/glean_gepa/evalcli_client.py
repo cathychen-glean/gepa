@@ -227,8 +227,21 @@ def _unfinished_task_count(status: Any) -> int:
     return sum(count for task_status, count in _active_task_counts(status) if task_status not in TERMINAL_TASK_STATUSES)
 
 
+MISSING_RUN_ERROR_MARKERS = ("no evalrun", "no job found", "not found with this id", "not found")
+
+
+def is_missing_run_status(status: Any) -> bool:
+    """True when ``run status`` answered HTTP 200 with a "No EvalRun ... found" error and no counts."""
+    if not isinstance(status, dict):
+        return False
+    errors = status.get("errors")
+    if not isinstance(errors, list):
+        return False
+    return any(isinstance(e, str) and any(m in e.lower() for m in MISSING_RUN_ERROR_MARKERS) for e in errors)
+
+
 def classify_eval_run_status(status: Any) -> str:
-    """Classify a Cortex run-status payload as ongoing, usable, or missing.
+    """Classify a Cortex run-status payload as ongoing, usable, missing, or unknown.
 
     A run is usable when every counted task is terminal, or when succeeded+failed
     is more than 9x the unfinished remainder. The last 10% of entries can sit in
@@ -237,10 +250,14 @@ def classify_eval_run_status(status: Any) -> str:
     A run whose tasks are mostly ``TASK_CANCELLED`` (someone killed it) is
     ``missing``: it is terminal but has too few scored entries to stand in for the
     eval, so the caller creates a fresh run instead of reusing it from the cache.
+    So is an explicit "no such run" payload. A payload with no task counts and no
+    such error is ``unknown``; callers keep the cached state rather than relaunch.
     """
+    if is_missing_run_status(status):
+        return "missing"
     active_counts = _active_task_counts(status)
     if not active_counts:
-        return "missing"
+        return "unknown"
     finished = sum(count for task_status, count in active_counts if task_status in FINISHED_TASK_STATUSES)
     cancelled = sum(count for task_status, count in active_counts if task_status == "TASK_CANCELLED")
     unfinished = sum(count for task_status, count in active_counts if task_status not in TERMINAL_TASK_STATUSES)

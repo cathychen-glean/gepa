@@ -15,7 +15,10 @@ entries, and extracts each span's tool payload from whichever envelope it used.
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +29,10 @@ _CALL_METADATA_KEYS = frozenset({"id", "action", "tool_id", "tool_name"})
 TRACE_WINDOW_LEAD_MS = 3_600_000
 TRACE_WINDOW_TRAIL_MS = 60_000
 DEFAULT_MAX_TRACE_FETCHES = 60
+# Concurrent ``evalcli analyze trace`` subprocesses per role (each is a fresh process
+# plus an IAP round trip). GLEAN_GEPA_TRACE_FETCH_WORKERS overrides; 1 = serial.
+DEFAULT_TRACE_FETCH_WORKERS = 6
+_PROGRESS_EVERY_SEC = 30.0
 # Customer deployments 403 on ``analyze trace``. Reflection only reads Action Inputs from scio-prod
 INTERNAL_TRACE_DEPLOYMENT_ID = "scio-prod"
 
@@ -207,24 +214,35 @@ def _iter_entry_traces(
     max_fetches: int,
     role_label: str,
 ) -> Iterator[tuple[str, Any]]:
-    """Yield ``(entry_id, detailed_trace)`` for fetchable locators.
+    """Yield ``(entry_id, detailed_trace)`` for fetchable locators, in locator order.
 
     Skips locators that are not on ``scio-prod``: customer deployments reject
     ``analyze trace`` with 403, and validation scoring does not need payloads.
+    Fetches run on a thread pool (``trace_fetch_workers()``) with periodic progress
+    lines; results are yielded in input order.
     """
     get_trace = getattr(evalcli, "get_analysis_trace", None)
     if not callable(get_trace):
         return
-    fetched = 0
-    skipped_external = 0
     label = f"{role_label} " if role_label else ""
+    selected: list[TraceActionInputLocator] = []
+    skipped_external = 0
     for locator in locators:
         if locator.deployment_id != INTERNAL_TRACE_DEPLOYMENT_ID:
             skipped_external += 1
             continue
-        if fetched >= max_fetches:
+        if len(selected) >= max_fetches:
             break
-        fetched += 1
+        selected.append(locator)
+    if skipped_external:
+        print(
+            f"[Action Inputs] Skipping {skipped_external} {label}traces on non-"
+            f"{INTERNAL_TRACE_DEPLOYMENT_ID} deployments"
+        )
+    if not selected:
+        return
+
+    def fetch_one(locator: TraceActionInputLocator) -> tuple[str, Any | None]:
         try:
             trace = get_trace(
                 deployment_id=locator.deployment_id,
@@ -234,13 +252,38 @@ def _iter_entry_traces(
             )
         except Exception as exc:
             print(f"[Action Inputs] Failed to fetch {label}trace for entry {locator.entry_id}: {exc}")
-            continue
-        yield locator.entry_id, trace
-    if skipped_external:
-        print(
-            f"[Action Inputs] Skipping {skipped_external} {label}traces on non-"
-            f"{INTERNAL_TRACE_DEPLOYMENT_ID} deployments"
-        )
+            return locator.entry_id, None
+        return locator.entry_id, trace
+
+    total = len(selected)
+    workers = max(1, min(trace_fetch_workers(), total))
+    started = time.monotonic()
+    print(f"[Action Inputs] Fetching {total} {label}traces with {workers} worker(s)")
+    done = 0
+    last_report = started
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trace-fetch") as pool:
+        for entry_id, trace in pool.map(fetch_one, selected):
+            done += 1
+            now = time.monotonic()
+            if now - last_report >= _PROGRESS_EVERY_SEC or done == total:
+                elapsed = now - started
+                print(f"[Action Inputs] {label}traces {done}/{total} fetched ({elapsed:.0f}s)")
+                last_report = now
+            if trace is None:
+                continue
+            yield entry_id, trace
+
+
+def trace_fetch_workers() -> int:
+    """Thread-pool size for ``analyze trace`` calls; ``GLEAN_GEPA_TRACE_FETCH_WORKERS`` overrides."""
+    raw = os.environ.get("GLEAN_GEPA_TRACE_FETCH_WORKERS")
+    if raw is None or not raw.strip():
+        return DEFAULT_TRACE_FETCH_WORKERS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        print(f"[Action Inputs] Ignoring GLEAN_GEPA_TRACE_FETCH_WORKERS={raw!r}; using {DEFAULT_TRACE_FETCH_WORKERS}")
+        return DEFAULT_TRACE_FETCH_WORKERS
 
 
 def fetch_action_inputs_by_entry(
@@ -298,6 +341,7 @@ def fetch_first_tool_inputs_by_entry(
 
 __all__ = [
     "DEFAULT_MAX_TRACE_FETCHES",
+    "DEFAULT_TRACE_FETCH_WORKERS",
     "INTERNAL_TRACE_DEPLOYMENT_ID",
     "TraceActionInputLocator",
     "build_trace_locator",
@@ -305,6 +349,7 @@ __all__ = [
     "extract_trace_tool_inputs",
     "fetch_action_inputs_by_entry",
     "fetch_first_tool_inputs_by_entry",
+    "trace_fetch_workers",
     "fetch_named_tool_inputs_by_entry",
     "trace_locators_for_rows",
 ]

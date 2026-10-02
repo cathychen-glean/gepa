@@ -193,12 +193,17 @@ def compose_responsibility(frame: str, body: str, *, guide: str = "", closing: s
 FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the failed examples."
 
 
+# Per-generation growth allowed for a non-empty module; the per-module token budget
+# still hard-caps the result. Dense rule modules routinely overshoot 1.1-1.2.
+MODULE_GROWTH = 1.3
+
+
 def module_char_budget(current: str, token_budget: int | None = None) -> int | None:
     """Largest rewrite size in characters, or None if unbounded. ~4 chars/token."""
     hard_cap = token_budget * 4 if token_budget else None
     if not current.strip():
         return hard_cap
-    growth = max(int(len(current) * 1.1), 200)
+    growth = max(int(len(current) * MODULE_GROWTH), 200)
     return min(growth, hard_cap) if hard_cap else growth
 
 

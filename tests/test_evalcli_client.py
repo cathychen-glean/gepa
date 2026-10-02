@@ -1118,8 +1118,11 @@ def test_invoke_raises_on_nonzero_exit():
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        (None, "missing"),
-        ({"taskCountsByStatus": []}, "missing"),
+        # No counts: unknown unless the payload explicitly says no such run.
+        (None, "unknown"),
+        ({"taskCountsByStatus": []}, "unknown"),
+        ({"errors": ["backend timeout"]}, "unknown"),
+        ({"errors": ["No EvalRun or JudgeRun found with this ID"]}, "missing"),
         ({"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}, "ongoing"),
         (
             {
