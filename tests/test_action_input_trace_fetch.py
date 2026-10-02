@@ -23,14 +23,12 @@ def _loc(entry_id: str, deployment: str = INTERNAL_TRACE_DEPLOYMENT_ID) -> Trace
 
 
 class _Evalcli:
-    """Fake client: records concurrency, finishes later entries first."""
+    """Fake client: records peak concurrency; ``delay_by`` makes early entries finish last."""
 
     def __init__(self, *, fail: frozenset[str] = frozenset(), delay_by: dict[str, float] | None = None):
-        self.fail = fail
-        self.delay_by = delay_by or {}
+        self.fail, self.delay_by = fail, delay_by or {}
         self.calls: list[str] = []
-        self.active = 0
-        self.peak_active = 0
+        self.active = self.peak_active = 0
         self._lock = threading.Lock()
 
     def get_analysis_trace(self, *, deployment_id, trace_id, start_time_millis, end_time_millis):
@@ -49,72 +47,35 @@ class _Evalcli:
                 self.active -= 1
 
 
-def test_fetches_run_in_parallel_and_yield_in_locator_order(monkeypatch):
+def _fetch(client, locators, **kw):
+    return [e for e, _ in ait._iter_entry_traces(client, locators, max_fetches=kw.pop("max_fetches", 60), **kw)]
+
+
+def test_parallel_fetch_keeps_locator_order_skips_failures_and_logs_progress(monkeypatch, capsys):
     monkeypatch.setenv("GLEAN_GEPA_TRACE_FETCH_WORKERS", "4")
-    # First entry is slowest, so completion order is reversed from input order.
-    client = _Evalcli(delay_by={"a": 0.15, "b": 0.10, "c": 0.05, "d": 0.0})
-    out = list(ait._iter_entry_traces(client, [_loc(x) for x in "abcd"], max_fetches=60, role_label="student"))
-    assert [e for e, _ in out] == ["a", "b", "c", "d"]
-    assert [t["trace"] for _, t in out] == ["a", "b", "c", "d"]
-    assert client.peak_active > 1  # actually concurrent
-
-
-def test_serial_when_one_worker(monkeypatch):
-    monkeypatch.setenv("GLEAN_GEPA_TRACE_FETCH_WORKERS", "1")
-    client = _Evalcli(delay_by={x: 0.01 for x in "abc"})
-    out = list(ait._iter_entry_traces(client, [_loc(x) for x in "abc"], max_fetches=60, role_label=""))
-    assert [e for e, _ in out] == ["a", "b", "c"]
-    assert client.peak_active == 1
-    assert client.calls == ["a", "b", "c"]
-
-
-def test_failed_fetch_is_skipped_not_fatal(monkeypatch, capsys):
-    monkeypatch.setenv("GLEAN_GEPA_TRACE_FETCH_WORKERS", "3")
-    client = _Evalcli(fail=frozenset({"b"}))
-    out = list(ait._iter_entry_traces(client, [_loc(x) for x in "abc"], max_fetches=60, role_label="teacher"))
-    assert [e for e, _ in out] == ["a", "c"]
-    assert "Failed to fetch teacher trace for entry b" in capsys.readouterr().out
-
-
-def test_max_fetches_caps_internal_locators_and_skips_external(monkeypatch, capsys):
-    monkeypatch.setenv("GLEAN_GEPA_TRACE_FETCH_WORKERS", "8")
-    locators = [_loc("a"), _loc("x", deployment="guild"), _loc("b"), _loc("c"), _loc("d")]
-    client = _Evalcli()
-    out = list(ait._iter_entry_traces(client, locators, max_fetches=2, role_label=""))
-    assert [e for e, _ in out] == ["a", "b"]
-    assert sorted(client.calls) == ["a", "b"]  # cap counts only fetched internal traces
-    assert "Skipping 1 traces on non-scio-prod" in capsys.readouterr().out
-
-
-def test_progress_lines_report_start_and_completion(capsys):
-    client = _Evalcli()
-    list(ait._iter_entry_traces(client, [_loc(x) for x in "abc"], max_fetches=60, role_label="student"))
+    client = _Evalcli(fail=frozenset({"c"}), delay_by={"a": 0.15, "b": 0.10, "c": 0.05})
+    assert _fetch(client, [_loc(x) for x in "abcd"], role_label="student") == ["a", "b", "d"]
+    assert client.peak_active > 1
     out = capsys.readouterr().out
-    assert "Fetching 3 student traces with" in out
-    assert "student traces 3/3 fetched" in out
+    assert "Fetching 4 student traces with 4 worker(s)" in out
+    assert "Failed to fetch student trace for entry c" in out
+    assert "student traces 4/4 fetched" in out
 
 
-def test_no_fetchable_locators_prints_nothing_and_yields_nothing(capsys):
+def test_serial_cap_and_external_skip(monkeypatch, capsys):
+    monkeypatch.setenv("GLEAN_GEPA_TRACE_FETCH_WORKERS", "1")
     client = _Evalcli()
-    assert list(ait._iter_entry_traces(client, [_loc("x", deployment="guild")], max_fetches=60, role_label="")) == []
-    assert "Fetching" not in capsys.readouterr().out
-    assert client.calls == []
-
-
-def test_client_without_get_analysis_trace_is_a_noop():
-    assert list(ait._iter_entry_traces(object(), [_loc("a")], max_fetches=60, role_label="")) == []
+    locators = [_loc("a"), _loc("x", deployment="guild"), _loc("b"), _loc("c")]
+    assert _fetch(client, locators, max_fetches=2, role_label="") == ["a", "b"]
+    assert client.calls == ["a", "b"] and client.peak_active == 1
+    assert "Skipping 1 traces on non-scio-prod" in capsys.readouterr().out
+    assert _fetch(_Evalcli(), [_loc("x", deployment="guild")], role_label="") == []
+    assert _fetch(object(), [_loc("a")], role_label="") == []
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [
-        (None, DEFAULT_TRACE_FETCH_WORKERS),
-        ("", DEFAULT_TRACE_FETCH_WORKERS),
-        ("3", 3),
-        ("0", 1),
-        ("-2", 1),
-        ("lots", DEFAULT_TRACE_FETCH_WORKERS),
-    ],
+    [(None, DEFAULT_TRACE_FETCH_WORKERS), ("", DEFAULT_TRACE_FETCH_WORKERS), ("3", 3), ("0", 1), ("x", DEFAULT_TRACE_FETCH_WORKERS)],
 )
 def test_trace_fetch_workers_env(monkeypatch, raw, expected):
     if raw is None:

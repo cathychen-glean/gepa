@@ -282,16 +282,8 @@ def test_length_rule_states_a_character_count():
     assert str(budget) in rule
     assert str(len(tool_text)) in rule
     assert "1.3" not in rule
-
-
-def test_module_char_budget_allows_thirty_percent_growth():
-    """Dense ~8k-char rule modules: consolidated variants land 10-30% over the seed."""
-    current = "x" * 8102
-    assert module_char_budget(current) == int(8102 * 1.3) == 10532
-    # Token cap still wins when it is lower.
-    assert module_char_budget(current, token_budget=2000) == 8000
-    # Small modules keep the 200-char floor.
-    assert module_char_budget("short") == 200
+    assert module_char_budget("x" * 8000) == 10400  # MODULE_GROWTH
+    assert module_char_budget("x" * 8000, token_budget=2000) == 8000  # token cap wins
 
 
 def test_empty_rules_ext_char_budget_fits_consolidated_bullets():

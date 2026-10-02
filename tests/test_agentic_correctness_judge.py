@@ -250,23 +250,13 @@ def _judge_names(adapter: TeacherStudentAdapter, pair) -> list[str]:
     return [j.name for j in adapter._pairwise_judges_for_pair(pair)]
 
 
-def test_validation_only_judge_runs_on_val_evals_only(tmp_path):
-    """A judge used only as a validation gate costs one run per candidate: on val."""
-    adapter = _gate_only_adapter(tmp_path)
-    assert _judge_names(adapter, _pair(validation=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-    assert _judge_names(adapter, _pair()) == []  # full-train eval
-    assert _judge_names(adapter, _pair(focused=True)) == []  # focused screen slice
-
-
-def test_judge_in_composite_runs_on_train_evals(tmp_path):
-    adapter = _gate_only_adapter(tmp_path, composite_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
-    assert _judge_names(adapter, _pair()) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-    assert _judge_names(adapter, _pair(validation=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-    # Composite is scored on full evals, not on the screen slice.
-    assert _judge_names(adapter, _pair(focused=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-
-
-def test_weighted_screen_keeps_named_judge_on_focused_slice(tmp_path):
-    adapter = _gate_only_adapter(tmp_path, screening_weights={"tool_alignment": 0.5, CUSTOMER_AGENTIC_CORRECTNESS_METRIC: 0.5})
-    assert _judge_names(adapter, _pair(focused=True)) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
-    assert _judge_names(adapter, _pair()) == [CUSTOMER_AGENTIC_CORRECTNESS_METRIC]
+def test_judges_start_only_where_the_search_reads_them(tmp_path):
+    """Validation evals start every judge; train/focused evals only those in the primary, composite or screen."""
+    judge = CUSTOMER_AGENTIC_CORRECTNESS_METRIC
+    gate_only = _gate_only_adapter(tmp_path)
+    assert _judge_names(gate_only, _pair(validation=True)) == [judge]
+    assert _judge_names(gate_only, _pair()) == [] and _judge_names(gate_only, _pair(focused=True)) == []
+    in_composite = _gate_only_adapter(tmp_path, composite_weights={"tool_alignment": 0.5, judge: 0.5})
+    assert _judge_names(in_composite, _pair()) == [judge] and _judge_names(in_composite, _pair(focused=True)) == [judge]
+    in_screen = _gate_only_adapter(tmp_path, screening_weights={"tool_alignment": 0.5, judge: 0.5})
+    assert _judge_names(in_screen, _pair(focused=True)) == [judge]

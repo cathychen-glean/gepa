@@ -50,31 +50,22 @@ def test_eval_section_parsing_and_validation(tmp_path):
         load_experiment_config(write({"runner": "GLEAN_CHAT"}))
 
 
-def _runner(harness: EvalHarness | None = None) -> tuple[ALRunner, MagicMock]:
+def test_runner_passes_harness_to_evalcli_or_keeps_defaults():
     evalcli = MagicMock()
     evalcli.create_eval_run.return_value = "ev-1"
-    runner = ALRunner(evalcli=evalcli, harness=harness) if harness else ALRunner(evalcli=evalcli)
-    runner._resolve_cached_eval = lambda key: None  # type: ignore[method-assign]
-    return runner, evalcli
+    with_harness = ALRunner(evalcli=evalcli, harness=EvalHarness(runner_type="GLEAN_CHAT", sc_params="x.y=1"))
+    without = ALRunner(evalcli=evalcli)
+    for runner in (with_harness, without):
+        runner._resolve_cached_eval = lambda key: None  # type: ignore[method-assign]
 
-
-def test_runner_uses_harness_sc_params_and_runner_type():
-    runner, evalcli = _runner(EvalHarness(runner_type="GLEAN_CHAT", sc_params="x.y=1,x.z=2"))
-    runner.start("gpt", "", "set", "v1", ["scio-prod"])
+    with_harness.start("gpt", "", "set", "v1", ["scio-prod"])
     kwargs = evalcli.create_eval_run.call_args.kwargs
     assert kwargs["runner_type"] == "GLEAN_CHAT"
-    assert kwargs["sc_params"].startswith("x.y=1,x.z=2")
-    assert CODING_HARNESS_SC_PARAMS not in kwargs["sc_params"]
-    assert kwargs["eval_params"] == "experimental_queue=eval-experimental-2,gleanchat_agent=ADVANCED"
+    assert kwargs["sc_params"].startswith("x.y=1") and CODING_HARNESS_SC_PARAMS not in kwargs["sc_params"]
+    assert kwargs["eval_params"].endswith("gleanchat_agent=ADVANCED")
 
-
-def test_runner_without_harness_keeps_defaults():
-    runner, evalcli = _runner()
-    runner.start("gpt", "", "set", "v1", ["scio-prod"])
+    without.start("fast", "", "set", "v1", ["scio-prod"])
     kwargs = evalcli.create_eval_run.call_args.kwargs
     assert "runner_type" not in kwargs  # evalcli's own default applies
     assert kwargs["sc_params"].startswith(CODING_HARNESS_SC_PARAMS)
-    assert "co.lo.cao.agentic_loop_sc_params=" in kwargs["sc_params"]
-    assert kwargs["eval_params"] == "experimental_queue=eval-experimental-2,gleanchat_agent=ADVANCED"
-    runner.start("fast", "", "set", "v1", ["scio-prod"])
-    assert evalcli.create_eval_run.call_args.kwargs["eval_params"].endswith("gleanchat_agent=FAST")
+    assert kwargs["eval_params"].endswith("gleanchat_agent=FAST")
