@@ -231,12 +231,7 @@ MISSING_RUN_ERROR_MARKERS = ("no evalrun", "no job found", "not found with this 
 
 
 def is_missing_run_status(status: Any) -> bool:
-    """True when ``run status`` returned an explicit "no such run" payload.
-
-    Cortex answers an unknown ID with HTTP 200 and
-    ``{"crossDeploymentUuid": ..., "errors": ["No EvalRun or JudgeRun found with this ID"]}``
-    and no task counts. That is the only payload shape that proves the run is gone.
-    """
+    """True when ``run status`` answered HTTP 200 with a "No EvalRun ... found" error and no counts."""
     if not isinstance(status, dict):
         return False
     errors = status.get("errors")
@@ -255,12 +250,8 @@ def classify_eval_run_status(status: Any) -> str:
     A run whose tasks are mostly ``TASK_CANCELLED`` (someone killed it) is
     ``missing``: it is terminal but has too few scored entries to stand in for the
     eval, so the caller creates a fresh run instead of reusing it from the cache.
-    So is a payload that explicitly says no run exists for the ID.
-
-    A payload with no task counts and no such error is ``unknown``: Cortex
-    returned something, but not the counts. Treating that as missing used to
-    drop a 99%-complete cached run and relaunch it, so callers fall back to
-    what the cache already believes instead.
+    So is an explicit "no such run" payload. A payload with no task counts and no
+    such error is ``unknown``; callers keep the cached state rather than relaunch.
     """
     if is_missing_run_status(status):
         return "missing"

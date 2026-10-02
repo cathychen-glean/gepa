@@ -11,10 +11,8 @@
 #
 # Run:  uv run python -m glean_gepa.runner --config teacher_student_waldo
 #
-# STATUS: runs on Glean Chat V2 Medium (scio-prod) with train/val pinned below. The
-# post-search seed-vs-best eval (run.customer_eval) is on and, because val is pinned,
-# runs on scio-prod:20260909 rather than a sampled customer deployment. Swap in the
-# Waldo team's routing set (gap-2) when it is in EvalCLI. Other TODOs are tuning.
+# STATUS: runs on Glean Chat V2 Medium (scio-prod) with train/val pinned below. Swap in
+# the Waldo team's routing set (gap-2) when it is in EvalCLI. Other TODOs are tuning.
 
 schema_version: 1
 mode: teacher_student
@@ -22,10 +20,8 @@ mode: teacher_student
 run:
   dir: run_ts_waldo
   max_metric_calls: 10
-  # Post-search eval: seed vs best student on the val set, gated by objective.validation.
-  # Despite the name it runs on whatever data.val_eval_versions resolves to; with val
-  # pinned below that is the internal scio-prod:20260909 set, not a customer deployment.
-  # --no_customer_eval skips it.
+  # Post-search seed-vs-best eval on the val set, gated by objective.validation. With
+  # val pinned below it runs on scio-prod, not a sampled customer deployment.
   customer_eval: true
   eval_run_timeout_sec: 21600
   # Seed is the LIVE production Waldo prompt (from a Waldo eval's
@@ -43,9 +39,6 @@ models:
   # TODO(gap-1): confirm with the team which deployment they are tuning for.
   student: waldo:OPEN_AI:GPT6_LUNA:none
   teacher: waldo:OPEN_AI:GPT6_1_SOL:high
-  # glean-dev QE is on customer key + LiteLLM custom provider since 2026-09-30; OPEN_AI:*
-  # is not enabled there ("GPT5_LATEST not enabled in any provider"). GPT5_6_LUNA is
-  # aliased to gpt-5.1 on that proxy. Use OPEN_AI:GPT5_LATEST only on a Glean-key instance.
   reflection: CUSTOM:GPT5_6_LUNA
 
 eval:
@@ -98,12 +91,9 @@ data:
   lookback_days: 14
   days_back: 0
   val_version_count: 1
-  # Pinned so validation (in-loop and post-search) is scored on data.deployment_ids
-  # (scio-prod), not a sampled customer deployment. Train and val are disjoint
-  # scio-prod versions. Two train versions give the schedule a second unseen set, so one
-  # generation that yields no children does not end the run; 20260908 is the newest
-  # scio-prod-only dated version that is not the val set. 20260909 is the newest outside
-  # the 14-day training window as of 2026-10-01.
+  # Pinned so validation is scored on scio-prod, not a sampled customer deployment.
+  # Train and val are disjoint; two train versions so a childless generation does not
+  # exhaust the schedule.
   train_eval_versions: [20261001, 20260908]
   val_eval_versions: [20260909]
 
@@ -180,9 +170,6 @@ search:
   offspring_count: 5
   reflection_samples: 25
   reflection_hamming_distance_k: null
-  # Cap over the rendered Waldo prompt: WALDO_SYSTEM (5919 tok, not editable) +
-  # WALDO_TOOL_USAGE (2025 tok seed, 2560 budget). The generic FULL_PROMPT template the
-  # runner also attaches is not counted (total_prompt_tokens skips it when WALDO_SYSTEM
-  # is present). 9216 > 5919 + 2560, so the per-module budget and the growth rule bind,
-  # not this cap. The runner only raises this to max(module budgets).
+  # WALDO_SYSTEM (~5.9k tok) + WALDO_TOOL_USAGE budget (2560). Must exceed their sum so
+  # the per-module budget binds, not this cap.
   global_token_cap: 9216

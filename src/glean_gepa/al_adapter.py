@@ -230,10 +230,8 @@ def approx_token_len(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-# Candidates that edit a Waldo module render through WALDO_SYSTEM. The generic
-# FULL_PROMPT render template is still attached (it keys the coding_agent_loop_system
-# override, so dropping it would change the eval cache hash) but it is not the prompt
-# under optimization, so it must not count against the global cap.
+# Waldo candidates render through WALDO_SYSTEM; the attached FULL_PROMPT template is
+# not the prompt under optimization and does not count against the global cap.
 WALDO_RENDER_KEY = "WALDO_SYSTEM"
 
 
@@ -246,11 +244,7 @@ def budgeted_module_keys(candidate: Candidate) -> list[str]:
 
 
 def total_prompt_tokens(candidate: Candidate) -> int:
-    """Sum token estimates for the rendered system prompt.
-
-    Excludes core-tool descriptions, and excludes the generic ``FULL_PROMPT`` template
-    when the candidate renders through ``WALDO_SYSTEM`` (see ``budgeted_module_keys``).
-    """
+    """Sum token estimates for the rendered system prompt (see ``budgeted_module_keys``)."""
     return sum(approx_token_len(candidate.prompt_modules[key]) for key in budgeted_module_keys(candidate))
 
 
@@ -579,8 +573,7 @@ class ALRunner:
         state = classify_eval_run_status(row) if isinstance(row, dict) else "unknown"
         if state != "unknown":
             return state
-        # Cortex answered but without task counts (and without a not-found error).
-        # Do not drop a cached run on that; trust what the cache already knows.
+        # No task counts and no not-found error: keep the cached state.
         print(f"[Eval run cache] {eval_run_id}: status payload had no task counts; keeping cached state")
         return self._fallback_eval_state(eval_run_id)
 

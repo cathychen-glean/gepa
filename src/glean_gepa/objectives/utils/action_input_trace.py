@@ -29,12 +29,9 @@ _CALL_METADATA_KEYS = frozenset({"id", "action", "tool_id", "tool_name"})
 TRACE_WINDOW_LEAD_MS = 3_600_000
 TRACE_WINDOW_TRAIL_MS = 60_000
 DEFAULT_MAX_TRACE_FETCHES = 60
-# Concurrent ``evalcli analyze trace`` subprocesses per role. Each call is a fresh
-# process plus an IAP round trip (5-10 s), and the fetches are independent, so a
-# small pool turns a 10-20 minute serial stretch into a few minutes. Override with
-# GLEAN_GEPA_TRACE_FETCH_WORKERS; 1 restores serial fetching.
+# Concurrent ``evalcli analyze trace`` subprocesses per role (each is a fresh process
+# plus an IAP round trip). GLEAN_GEPA_TRACE_FETCH_WORKERS overrides; 1 = serial.
 DEFAULT_TRACE_FETCH_WORKERS = 6
-# Log a progress line at least this often while fetching.
 _PROGRESS_EVERY_SEC = 30.0
 # Customer deployments 403 on ``analyze trace``. Reflection only reads Action Inputs from scio-prod
 INTERNAL_TRACE_DEPLOYMENT_ID = "scio-prod"
@@ -221,11 +218,8 @@ def _iter_entry_traces(
 
     Skips locators that are not on ``scio-prod``: customer deployments reject
     ``analyze trace`` with 403, and validation scoring does not need payloads.
-
-    Fetches run on a small thread pool (``trace_fetch_workers()``) and a progress
-    line is printed every ~30 s so a long hydration is visible in the run log.
-    Results are yielded in input order regardless of completion order, so callers
-    and the ``max_fetches`` cap behave exactly as in the serial version.
+    Fetches run on a thread pool (``trace_fetch_workers()``) with periodic progress
+    lines; results are yielded in input order.
     """
     get_trace = getattr(evalcli, "get_analysis_trace", None)
     if not callable(get_trace):
@@ -268,7 +262,6 @@ def _iter_entry_traces(
     done = 0
     last_report = started
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trace-fetch") as pool:
-        # ``map`` preserves input order; completion order does not matter here.
         for entry_id, trace in pool.map(fetch_one, selected):
             done += 1
             now = time.monotonic()

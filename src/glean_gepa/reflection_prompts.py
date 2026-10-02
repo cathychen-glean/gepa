@@ -193,10 +193,8 @@ def compose_responsibility(frame: str, body: str, *, guide: str = "", closing: s
 FAKE_FLOW_RESPONSIBILITY = "Improve the fake coding instructions using the failed examples."
 
 
-# Per-generation growth allowed for a non-empty module. 1.1 was too tight for dense
-# rule modules: on the ~8k-char Waldo tool module every consolidated variant across
-# three generations landed 3-25% over and was discarded, so no child was ever produced.
-# The per-module token budget still hard-caps the result.
+# Per-generation growth allowed for a non-empty module; the per-module token budget
+# still hard-caps the result. Dense rule modules routinely overshoot 1.1-1.2.
 MODULE_GROWTH = 1.3
 
 

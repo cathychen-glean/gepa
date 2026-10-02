@@ -498,15 +498,11 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _pairwise_judges_for_pair(self, pair: _StartedPair) -> tuple[PairwiseJudge, ...]:
         """Pairwise judges to start for this eval pair.
 
-        Validation evals (``validation_only``) start every configured judge: the
-        post-search gate and the frontier read them there. Full-train evals and
-        focused screen slices start only the judges the search itself reads --
-        the primary, anything in ``objective.composite``, and anything in
-        ``screening.weights``. A judge configured only as a validation gate
-        (the Waldo correctness judge) therefore runs once per candidate, on val.
-
-        ``screening.kind=correctness_floor`` keeps its split: CORRECTNESS on
-        focused slices, AGENTIC on full evals.
+        Validation evals start every configured judge. Full-train evals and focused
+        screen slices start only the judges the search reads: the primary, anything in
+        ``objective.composite``, and anything in ``screening.weights``.
+        ``screening.kind=correctness_floor`` keeps its split: CORRECTNESS on focused
+        slices, AGENTIC on full evals.
         """
         is_focused = bool(pair.al_data_inst.get("eval_entry_ids"))
         if self.screening_kind == "correctness_floor":
