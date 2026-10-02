@@ -152,6 +152,132 @@ def test_reuses_children_cached_for_root_without_rereflecting() -> None:
     assert children_by_root[root.candidate_id] == first
 
 
+class _MultiModuleAdapter(_ReflectionAdapter):
+    """Reflects several modules, three variants each, recording the order asked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.editable_modules = ["EXECUTION_DISCIPLINE", "RULES_EXT", "glean_search", "glean_document_reader"]
+        self.modules_reflected: list[str] = []
+
+    def make_reflective_dataset(self, **kwargs: object) -> dict[str, list[dict[str, str]]]:
+        modules = kwargs["components_to_update"]
+        assert isinstance(modules, list)
+        return {module: [{"feedback": "fix it"}] for module in modules}
+
+    def propose_new_texts(self, **kwargs: object) -> tuple[list[str], object, str]:
+        self.reflection_calls += 1
+        module = kwargs["components_to_update"][0]  # type: ignore[index]
+        self.modules_reflected.append(module)
+        return [f"{module} v1", f"{module} v2", f"{module} v3"], None, f"diagnosis for {module}"
+
+
+def test_offspring_slots_are_shared_round_robin_across_modules(monkeypatch) -> None:
+    """One variant per module before a second variant of any module.
+
+    Generation 1 of the agentic run spent all five offspring on three rewordings of
+    glean_document_reader and two of glean_search; Execution Discipline, which
+    governs the final message the judge scores, was never edited.
+    """
+    from glean_gepa import evolutionary_proposer
+
+    monkeypatch.setattr(
+        evolutionary_proposer,
+        "modules_after_tool_choice",
+        lambda _llm, _parent, modules, _hs: [m for m in modules if not m.startswith("glean")]
+        + [m for m in modules if m.startswith("glean")],
+    )
+    adapter = _MultiModuleAdapter()
+    root = Candidate(
+        model="test",
+        prompt_modules=dict.fromkeys(adapter.editable_modules, "original"),
+        module_specs={module: ModuleSpec(module, "free_text", 100) for module in adapter.editable_modules},
+        global_token_cap=1000,
+        baseline_prompt_hash="baseline",
+        candidate_id="root",
+    )
+
+    children = make_children_for_generation(
+        adapter, [root], {root.candidate_id: _Evaluation()}, reflection_llm=object(), offspring_count=5
+    )
+
+    edited = [next(module for module, text in child.prompt_modules.items() if text != "original") for child in children]
+    assert edited == [
+        "EXECUTION_DISCIPLINE",
+        "RULES_EXT",
+        "glean_search",
+        "glean_document_reader",
+        "EXECUTION_DISCIPLINE",
+    ]
+    assert children[0].prompt_modules["EXECUTION_DISCIPLINE"] == "EXECUTION_DISCIPLINE v1"
+    assert children[4].prompt_modules["EXECUTION_DISCIPLINE"] == "EXECUTION_DISCIPLINE v2"
+    assert adapter.modules_reflected == ["EXECUTION_DISCIPLINE", "RULES_EXT", "glean_search", "glean_document_reader"]
+
+
+class _ScoredEvaluation(_Evaluation):
+    def __init__(self, score: float) -> None:
+        super().__init__()
+        self.score = score
+
+
+class _ScoredReflectionAdapter(_ReflectionAdapter):
+    def __init__(self) -> None:
+        super().__init__(variants=["v1", "v2", "v3", "v4", "v5"])
+        self.reflected_parents: list[str] = []
+
+    def get_screening_score(self, evaluation: _ScoredEvaluation) -> float:
+        return evaluation.score
+
+    def propose_new_texts(self, **kwargs: object) -> tuple[list[str], object, str]:
+        self.reflection_calls += 1
+        candidate = kwargs["candidate"]
+        parent_id = candidate.candidate_id  # type: ignore[attr-defined]
+        self.reflected_parents.append(parent_id)
+        return [f"{parent_id}-{index}" for index in range(5)], None, ""
+
+
+def test_offspring_slots_split_evenly_and_extra_goes_to_higher_score() -> None:
+    """Two frontier parents share one generation. 5 slots is 3 for the leader and 2 for the other."""
+    adapter = _ScoredReflectionAdapter()
+    high = _candidate("high")
+    low = _candidate("low")
+
+    children = make_children_for_generation(
+        adapter,
+        [low, high],
+        {"high": _ScoredEvaluation(0.9), "low": _ScoredEvaluation(0.4)},
+        reflection_llm=object(),
+        offspring_count=5,
+    )
+
+    texts = [child.prompt_modules["WRITING_CODE"] for child in children]
+    assert sum(text.startswith("high-") for text in texts) == 3
+    assert sum(text.startswith("low-") for text in texts) == 2
+    assert adapter.reflection_calls == 2
+
+
+def test_cached_parent_cannot_take_the_other_parents_slots() -> None:
+    adapter = _ScoredReflectionAdapter()
+    high = _candidate("high")
+    low = _candidate("low")
+    cached = [_candidate(f"cached-{index}", f"cached-{index}") for index in range(5)]
+    children_by_root = {"high": cached}
+
+    children = make_children_for_generation(
+        adapter,
+        [high, low],
+        {"high": _ScoredEvaluation(0.9), "low": _ScoredEvaluation(0.4)},
+        reflection_llm=object(),
+        offspring_count=5,
+        children_by_root=children_by_root,
+    )
+
+    texts = [child.prompt_modules["WRITING_CODE"] for child in children]
+    assert sum(text.startswith("cached-") for text in texts) == 3
+    assert sum(text.startswith("low-") for text in texts) == 2
+    assert adapter.reflected_parents == ["low"]
+
+
 def test_prints_child_prompt_delta_against_parent(capsys) -> None:
     adapter = _ReflectionAdapter(variants=["first line\nupdated line\n"])
     root = _candidate("root", "first line\noriginal line\n")
@@ -401,6 +527,42 @@ def test_screening_kind_none_sends_every_child_to_validation(tmp_path) -> None:
     assert all(proposal.metadata["screening_kind"] == "none" for proposal in proposals)
     assert all(proposal.subsample_scores_before == [0.0] for proposal in proposals)
     assert all(proposal.subsample_scores_after == [1.0] for proposal in proposals)
+
+
+def test_each_proposal_names_the_frontier_parent_it_was_reflected_from(tmp_path) -> None:
+    """Children of the second frontier parent must not be recorded as children of the best one.
+
+    A run wrote every child of a two-parent generation as ``parents [2]`` even though two
+    of them were candidate 4's, which corrupts the lineage in the state and the run log.
+    """
+    alpha = _candidate("alpha", "alpha text")
+    beta = _candidate("beta", "beta text")
+
+    class _PerParentAdapter(_ProposerAdapter):
+        screening_kind = "none"
+
+        def propose_new_texts(self, **kwargs: object) -> tuple[list[str], object, str]:
+            self.reflection_calls += 1
+            parent = kwargs["candidate"]
+            return [f"{parent.prompt_modules['WRITING_CODE']} rewrite"], None, ""
+
+    class _State:
+        i = -1
+        program_candidates: ClassVar[list[dict[str, str]]] = [alpha.prompt_modules, beta.prompt_modules]
+        total_num_evals = 0
+        num_full_ds_evals = 2
+        program_full_scores_val_set: ClassVar[list[float]] = [1.0, 0.9]
+
+        @staticmethod
+        def get_pareto_front_mapping():
+            return {0: {0, 1}}
+
+    proposer = _proposer(_PerParentAdapter(), str(tmp_path / "children.json"))
+    proposer.trainset = _OneSliceLoader()
+    proposals = proposer.propose(_State())
+
+    by_text = {proposal.candidate["WRITING_CODE"]: proposal.parent_program_ids for proposal in proposals}
+    assert by_text == {"alpha text rewrite": [0], "beta text rewrite": [1]}
 
 
 def test_resume_skips_slices_whose_passing_children_are_already_in_the_pool(tmp_path) -> None:

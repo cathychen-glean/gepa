@@ -199,7 +199,7 @@ def build_analysis(
     """Assemble the frame from parsed entries.
 
     ``aggregate`` is the objective's own reducer so its aggregate dataclass
-    keeps the field names its pack YAML and adapters already read.
+    keeps the field names its experiment YAML and adapters already read.
     """
     ids = tuple(eval_ids)
     entries = dict(per_entry)

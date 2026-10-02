@@ -958,7 +958,7 @@ def _mismatch_trajectory(entry_id: str, teacher_tools: list[str], student_tools:
     }
 
 
-def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups():
+def test_make_reflective_dataset_takes_mismatches_in_order_up_to_the_cap():
     adapter = _teacher_student_adapter(MagicMock())
     trajectories = (
         [_mismatch_trajectory(f"xy-{i}", ["x"], ["y"]) for i in range(12)]
@@ -987,7 +987,7 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
         ["WRITING_CODE"],
         k=8,
     )["WRITING_CODE"]
-    assert [example["Inputs"]["entry_id"] for example in capped] == [f"xy-{i}" for i in range(12)]
+    assert [example["Inputs"]["entry_id"] for example in capped] == [f"xy-{i}" for i in range(8)]
 
     oversized = adapter.make_reflective_dataset(
         {"WRITING_CODE": "prompt"},
@@ -1000,10 +1000,10 @@ def test_make_reflective_dataset_uses_most_frequent_first_tool_mismatch_groups()
         ["WRITING_CODE"],
         k=8,
     )["WRITING_CODE"]
-    assert [example["Inputs"]["entry_id"] for example in oversized] == [f"xy-{i}" for i in range(35)]
+    assert [example["Inputs"]["entry_id"] for example in oversized] == [f"xy-{i}" for i in range(8)]
 
 
-def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches():
+def test_make_reflective_dataset_shares_examples_across_tool_modules():
     adapter = _teacher_student_adapter(MagicMock())
     trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
         _mismatch_trajectory(f"read-{i}", ["Glean Document Reader"], ["todo_write"]) for i in range(8)
@@ -1017,22 +1017,18 @@ def test_make_reflective_dataset_filters_core_tool_module_to_matching_mismatches
         k=20,
     )
 
-    assert len(examples["WRITING_CODE"]) == 20
-    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
-    discover_ids = [example["Inputs"]["entry_id"] for example in examples["discover"]]
-    reader_ids = [example["Inputs"]["entry_id"] for example in examples["glean_document_reader"]]
-    assert search_ids == [f"search-{i}" for i in range(12)]
-    assert discover_ids == search_ids
-    assert reader_ids == [f"read-{i}" for i in range(8)]
+    shared = [f"search-{i}" for i in range(12)] + [f"read-{i}" for i in range(8)]
+    for module in ("WRITING_CODE", "glean_search", "discover", "glean_document_reader"):
+        assert [example["Inputs"]["entry_id"] for example in examples[module]] == shared
     assert examples["glean_search"][0]["Feedback"].startswith(
         "First-tool mismatch: teacher used Glean Search and student used Discover."
     )
 
 
-def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
+def test_make_reflective_dataset_shares_non_core_mismatches_with_tool_modules():
     adapter = _teacher_student_adapter(MagicMock())
-    trajectories = [_mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)] + [
-        _mismatch_trajectory(f"write-{i}", ["Write"], []) for i in range(8)
+    trajectories = [_mismatch_trajectory("write-0", ["Write"], [])] + [
+        _mismatch_trajectory(f"search-{i}", ["Glean Search"], ["Discover"]) for i in range(12)
     ]
     examples = adapter.make_reflective_dataset(
         {"FULL_PROMPT": "prompt", RULES_EXT_KEY: ""},
@@ -1040,10 +1036,9 @@ def test_make_reflective_dataset_filters_rules_ext_to_non_core_mismatches():
         [RULES_EXT_KEY, "glean_search"],
         k=8,
     )
-    write_ids = [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]]
-    search_ids = [example["Inputs"]["entry_id"] for example in examples["glean_search"]]
-    assert write_ids == [f"write-{i}" for i in range(8)]
-    assert search_ids == [f"search-{i}" for i in range(12)]
+    expected = ["write-0"] + [f"search-{i}" for i in range(7)]
+    assert [example["Inputs"]["entry_id"] for example in examples[RULES_EXT_KEY]] == expected
+    assert [example["Inputs"]["entry_id"] for example in examples["glean_search"]] == expected
     # An empty student sequence means every span was a skipped one, so say so rather
     # than printing "(none)", which reflection read as a hole in the trace.
     assert examples[RULES_EXT_KEY][0]["Feedback"].startswith(

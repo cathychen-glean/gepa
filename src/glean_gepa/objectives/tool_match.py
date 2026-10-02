@@ -18,6 +18,7 @@ from typing import Any, ClassVar
 from glean_gepa.adapter_types import TeacherStudentALTrajectory, paired_rollout_output
 from glean_gepa.al_adapter import ReflectiveExample
 from glean_gepa.focused_evalset import QUERY_CANONICAL_BUCKET_TYPE
+from glean_gepa.judge_metrics_util import CUSTOMER_AGENTIC_PREFERENCE_METRIC
 from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContext, TeacherStudentObjective
 from glean_gepa.objectives.utils.agentspan import (
     Rows,
@@ -42,16 +43,21 @@ from glean_gepa.objectives.utils.core import (
     log_analysis,
     pass_rate,
 )
-from glean_gepa.objectives.utils.mismatch import select_mismatch_groups
+from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
 from glean_gepa.objectives.utils.tool_names import (
     SKIPPED_TOOL_NAMES,
     first_tool_mismatch_pair,
     scored_tool_sequence,
 )
 from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
-from glean_gepa.prompt import high_signal_core_tool_keys, is_core_tool_span, tool_description_override_key
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS, EXECUTION_DISCIPLINE_KEY, RULES_EXT_KEY
-from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+from glean_gepa.prompt_constants import CORE_TOOLS, EXECUTION_DISCIPLINE_KEY, RULES_EXT_KEY
+from glean_gepa.reflection_prompts import (
+    EXECUTION_DISCIPLINE_FRAME,
+    GENERALITY_RULES,
+    RULES_EXT_FRAME,
+    compose_responsibility,
+    core_tool_frame,
+)
 
 TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
 
@@ -65,17 +71,24 @@ TOOL_ALIGNMENT_OBJECTIVE = "tool_alignment"
 class ToolMatchEntryMetrics:
     """One entry's first-tool comparison.
 
-    This objective scores only the first tool each role picked, so the payloads are
-    likewise the first call's -- surfacing later calls would invite reflection to
-    rewrite a prompt over a decision that was never scored.
+    Scoring uses only the first tool each role picked. Reflection evidence keeps a
+    short prefix of each role's scored calls, including the arguments.
     """
 
     entry_id: str
     student_tools: tuple[str, ...]
     teacher_tools: tuple[str, ...]
     tools_match: bool
-    student_first_tool_input: tuple[str, str] | None = None
-    teacher_first_tool_input: tuple[str, str] | None = None
+    student_tool_inputs: tuple[tuple[str, str], ...] = ()
+    teacher_tool_inputs: tuple[tuple[str, str], ...] = ()
+    student_trace_id: str = ""
+    teacher_trace_id: str = ""
+    student_deployment_id: str = ""
+    teacher_deployment_id: str = ""
+    student_min_start_ms: int = 0
+    student_max_start_ms: int = 0
+    teacher_min_start_ms: int = 0
+    teacher_max_start_ms: int = 0
 
     @property
     def passed(self) -> bool:
@@ -121,7 +134,54 @@ def parse_tool_match_entry_metrics(
         student_tools=student_tools,
         teacher_tools=teacher_tools,
         tools_match=(student_tools[:1] == teacher_tools[:1]),
+        student_trace_id=str(row.get("student_trace_id") or ""),
+        teacher_trace_id=str(row.get("teacher_trace_id") or ""),
+        student_deployment_id=str(row.get("student_deployment_id") or ""),
+        teacher_deployment_id=str(row.get("teacher_deployment_id") or ""),
+        student_min_start_ms=_millis(row.get("student_min_start_ms")),
+        student_max_start_ms=_millis(row.get("student_max_start_ms")),
+        teacher_min_start_ms=_millis(row.get("teacher_min_start_ms")),
+        teacher_max_start_ms=_millis(row.get("teacher_max_start_ms")),
     )
+
+
+def _millis(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+_TOOL_INPUT_CHARS = 240
+# Each role's scored calls shown to the reflector, kept in sequence order.
+TOOL_INPUT_LIMIT = 3
+
+
+def format_tool_input_lines(role: str, pairs: Sequence[Sequence[str]]) -> list[str]:
+    """One reflector line per scored call: ``role tool: payload``."""
+    lines: list[str] = []
+    for pair in pairs:
+        if not isinstance(pair, list | tuple) or len(pair) != 2 or not pair[1]:
+            continue
+        tool, payload = pair
+        text = str(payload)
+        if len(text) > _TOOL_INPUT_CHARS:
+            text = text[:_TOOL_INPUT_CHARS] + "... (truncated)"
+        lines.append(f"{role} {tool or 'unknown'}: {text}")
+    return lines
+
+
+def tool_input_evidence(output: Mapping[str, Any]) -> list[str]:
+    """Teacher calls, then student calls, for one reflective example.
+
+    At most ``TOOL_INPUT_LIMIT`` calls per role, in sequence order, so the
+    arguments sit next to the tool sequence without crowding the prompt.
+    """
+    lines: list[str] = []
+    for role in ("teacher", "student"):
+        raw = output.get(f"{role}_tool_inputs") or ()
+        lines.extend(format_tool_input_lines(role, raw)[:TOOL_INPUT_LIMIT])
+    return lines
 
 
 def aggregate_tool_match_metrics(
@@ -279,9 +339,13 @@ def _enrich_action_inputs(
     """Attach each role's first tool call to high-signal entries from traces."""
 
     def apply(metrics: ToolMatchEntryMetrics, fetched: FetchedByRole, entry_id: str) -> ToolMatchEntryMetrics:
-        student = fetched.get("student", {}).get(entry_id, metrics.student_first_tool_input)
-        teacher = fetched.get("teacher", {}).get(entry_id, metrics.teacher_first_tool_input)
-        return replace(metrics, student_first_tool_input=student, teacher_first_tool_input=teacher)
+        student = fetched.get("student", {}).get(entry_id, metrics.student_tool_inputs)
+        teacher = fetched.get("teacher", {}).get(entry_id, metrics.teacher_tool_inputs)
+        return replace(
+            metrics,
+            student_tool_inputs=tuple(student),
+            teacher_tool_inputs=tuple(teacher),
+        )
 
     return enrich_action_inputs(
         evalcli,
@@ -290,8 +354,9 @@ def _enrich_action_inputs(
         high_signal_entry_ids,
         apply=apply,
         roles=("student", "teacher"),
-        first_tool_only=True,
+        named_pairs=True,
         skip_tools=skip_tools,
+        limit=TOOL_INPUT_LIMIT,
     )
 
 
@@ -299,24 +364,107 @@ def _enrich_action_inputs(
 # Objective
 # ---------------------------------------------------------------------------
 
-EXECUTION_DISCIPLINE_RESPONSIBILITY = (
-    "You are rewriting the bullets under '### Execution Discipline', which set how much effort "
-    "the assistant spends before answering: how many tool loops to use, how many queries to "
-    "issue, whether to retry after an empty result, and when to stop searching and respond. "
-    "Each line must start with '- '. Do not add a heading. This module governs effort and "
-    "stopping conditions only: leave response formatting, citation mechanics, and shell or SDK "
-    "syntax to other modules. Prefer stating the condition under which more work is warranted "
-    "over raising a numeric cap, so the rule generalizes to requests of different sizes. "
-    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+# How the first-tool score is decided, so the reflector targets the one decision that moves it.
+SCORE_MODEL_NOTE = (
+    "HOW THE SCORE IS DECIDED. An entry scores 1 when the first scored tool the student called is "
+    "the tool the teacher called first, otherwise 0. Calls to skipped tools (the automatic vault "
+    "retrieval, shell, skill lookup) are ignored, so the 'first tool' is the first call that reaches "
+    "a search, reader, lister, discovery, or action tool. Nothing after that first call counts, "
+    "answer quality does not count, a different but reasonable tool still scores 0, and calling no "
+    "scored tool at all is itself a first-tool choice (it matches only when the teacher also called "
+    "none). The only lever is therefore the decision the student makes before any tool result "
+    "exists, using the user's request, earlier turns, and preloaded context. A rule helps only if "
+    "it changes that one decision for the class of requests in the evidence."
 )
 
-RULES_EXT_RESPONSIBILITY = (
-    "You are writing at most two markdown bullets that will be appended after the existing "
-    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
-    "existing Rules, do not add a heading, and do not exceed two bullets. Target first-tool "
-    "mismatches whose tools are not core tools (for example Write vs (none)). Keep each "
-    f"bullet operational and concise. {NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+# What kinds of prompt edits have changed first-tool behavior, and what has not.
+EDIT_EFFECTIVENESS_NOTE = (
+    "WHAT KIND OF EDIT WORKS. A rule changes the first call only if its trigger is something the "
+    "student can see in the request before acting: a tagged or pasted URL or attachment, a request "
+    "for the contents of a folder, channel, or project, a verb that names an action in another "
+    "system (send, create, update, book), a question about a specific named person, account, "
+    "system, or ticket, a request with several independent parts. State the trigger and the tool "
+    "together: 'when the request contains a document URL, open it before searching for it'. "
+    "Abstract policy ('choose the most appropriate tool', 'consider whether search is needed', 'be "
+    "thorough') does not change behavior. In measured runs, rewording a description without adding "
+    "or removing a trigger condition left the student's invocation counts for that tool flat, so do "
+    "not spend a rewrite on synonyms for text the student already follows. Competing instructions "
+    "cancel new rules: if the current text tells the student to answer from preloaded context, "
+    "minimize tool loops, cap searches, or try reasoning before tools, and the evidence shows the "
+    "teacher calling a tool first, remove or invert that wording rather than appending a counter-rule "
+    "beside it. When a tool description and an Execution Discipline bullet disagreed, the student "
+    "followed the tool description at the moment of the call, so put the rule in the text that is "
+    "read at that moment. Each rewrite should address one or two mismatch mechanisms, name the "
+    "trigger and the tool, and stay short; long additions dilute the module. Do not add a rule for a "
+    "mechanism that appears in only one supplied example, and do not add a rule for a request class "
+    "the student already routes correctly: most entries already match, and a trigger stated too "
+    "broadly breaks those matches."
 )
+
+# Procedure the reflector should follow before proposing text.
+ANALYSIS_PROCEDURE_NOTE = (
+    "HOW TO READ EACH EXAMPLE. First read FEEDBACK for the pair: which tool the teacher called "
+    "first and which the student called first, or that one side called no scored tool. Then read "
+    "the user query and any earlier turns for the cue that should have selected the teacher's tool: "
+    "a URL or attachment, a container reference, a verb that names an action, a named entity, a "
+    "multi-part ask. Then compare the ACTION_INPUT arguments: the teacher's first call shows what it "
+    "searched for, opened, listed, or looked up; the student's first call shows what it did instead. "
+    "Classify the mismatch by mechanism, not by tool names alone: a substitute (searching for a "
+    "document it was given the URL of), a skip (answering from preloaded context or memory with no "
+    "scored call), or an extra step (discovering, listing, or searching before the tool the teacher "
+    "went to directly). Only then tally the mechanisms across all supplied examples and state the "
+    "tally, with counts, in your diagnosis. A rule needs at least two examples showing the same "
+    "mechanism."
+)
+
+TOOL_MATCH_GAP_ANALYSIS_GUIDE = "\n\n".join([SCORE_MODEL_NOTE, EDIT_EFFECTIVENESS_NOTE, ANALYSIS_PROCEDURE_NOTE])
+
+EXECUTION_DISCIPLINE_RESPONSIBILITY = compose_responsibility(
+    EXECUTION_DISCIPLINE_FRAME,
+    "That covers whether to call any tool at all or answer from preloaded context and memory, whether "
+    "to retrieve before acting, how many loops and queries to spend, whether to retry after an empty "
+    "result, and when to stop and respond. For first-tool matching this module decides one thing: "
+    "whether a scored tool gets called at all. It is the place to fix mismatches where the student "
+    "called no scored tool and the teacher did (or the reverse), by stating the condition under which "
+    "retrieval or lookup is warranted before answering. It does not pick which tool: do not list tool "
+    "names with conditions or restate a tool's description here, because the choice between tools is "
+    "made by the descriptions the student reads at the call. If the current text tells the student to "
+    "answer from context, minimize loops, cap searches, or reason before using tools, and the evidence "
+    "shows the teacher calling a tool first, remove or invert that wording. Preserve factual "
+    "search-first. Prefer stating the condition under which more work is warranted over raising a "
+    "numeric cap, so the rule generalizes to requests of different sizes. Leave response formatting, "
+    "citation mechanics, and shell or SDK syntax to other modules.",
+    guide=TOOL_MATCH_GAP_ANALYSIS_GUIDE,
+)
+
+RULES_EXT_RESPONSIBILITY = compose_responsibility(
+    RULES_EXT_FRAME,
+    "These bullets govern how the student composes its first shell script: which SDK call it issues "
+    "first when several are possible, and that a resource the request already identifies (a URL, an "
+    "id, a container) is passed straight to the tool that handles it rather than searched for or "
+    "rediscovered first. Use them only when a mismatch is caused by how the first script is written "
+    "rather than by a wrong tool choice or by not calling a tool at all; the former belongs in the "
+    "tool description, the latter in Execution Discipline. Do not restate either of those here. Keep "
+    "each bullet operational, checkable, and concise.",
+    guide=TOOL_MATCH_GAP_ANALYSIS_GUIDE,
+)
+
+
+def core_tool_responsibility(tool_name: str) -> str:
+    """Reflection instructions for one core-tool ``schema.description`` under first-tool matching."""
+    return compose_responsibility(
+        core_tool_frame(tool_name),
+        "The description acts at one moment: when the student decides which tool to call first. "
+        "Rewrite it so the student calls this tool first exactly when the request carries the cue the "
+        "teacher responded to, and does not call it first when the teacher chose another tool. Say "
+        "what in the request selects this tool; if the evidence shows the student reaching for this "
+        "tool as a substitute for another, say which kind of request belongs to the other tool so this "
+        "one is not chosen for it. Do not add rules about how many loops to run, when to stop, or "
+        "whether to retrieve at all — those belong in Execution Discipline. Do not rewrite merely to "
+        "match the preferred run's later tool order; only the first call is scored.",
+        guide=TOOL_MATCH_GAP_ANALYSIS_GUIDE,
+        closing=f"Keep the text operational and concise. {GENERALITY_RULES}",
+    )
 
 
 def _rollout_output(
@@ -328,8 +476,8 @@ def _rollout_output(
     teacher_tools: list[str],
     student_tool_calls: int | None = None,
     teacher_tool_calls: int | None = None,
-    student_first_tool_input: tuple[str, str] | None = None,
-    teacher_first_tool_input: tuple[str, str] | None = None,
+    student_tool_inputs: Sequence[Sequence[str]] = (),
+    teacher_tool_inputs: Sequence[Sequence[str]] = (),
 ):
     """One rollout row. Tool-call counts default to the listed events."""
     output = paired_rollout_output(
@@ -341,10 +489,10 @@ def _rollout_output(
         student_tool_calls=student_tool_calls,
         teacher_tool_calls=teacher_tool_calls,
     )
-    if student_first_tool_input:
-        output["student_first_tool_input"] = list(student_first_tool_input)
-    if teacher_first_tool_input:
-        output["teacher_first_tool_input"] = list(teacher_first_tool_input)
+    if student_tool_inputs:
+        output["student_tool_inputs"] = [list(pair) for pair in student_tool_inputs]
+    if teacher_tool_inputs:
+        output["teacher_tool_inputs"] = [list(pair) for pair in teacher_tool_inputs]
     return output
 
 
@@ -359,9 +507,15 @@ class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis])
     teacher_compared_key = "teacher_tool_events"
     student_compared_key = "student_tool_events"
     mismatch_pair = first_tool_mismatch_pair
+    reflection_selection_justification: ClassVar[str] = (
+        "Justification: high-signal first-tool mismatches in eval order, up to the reflection cap. "
+        "Entries are not bucketed by teacher/student tool pair, and that pair does not decide "
+        "which tool descriptions can be edited."
+    )
     module_responsibilities: ClassVar[Mapping[str, str]] = {
         RULES_EXT_KEY: RULES_EXT_RESPONSIBILITY,
         EXECUTION_DISCIPLINE_KEY: EXECUTION_DISCIPLINE_RESPONSIBILITY,
+        **{tool: core_tool_responsibility(tool) for tool in CORE_TOOLS},
     }
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
@@ -371,7 +525,7 @@ class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis])
         self._paired_analysis_cache: dict[tuple[str, str], EvalRunToolMatchAnalysis] = {}
 
     def _skipped_tools(self) -> frozenset[str]:
-        raw = self.pack_param("skipped_tools", None)
+        raw = self.experiment_param("skipped_tools", None)
         if raw is None:
             return SKIPPED_TOOL_NAMES
         return frozenset(str(name) for name in raw)
@@ -471,44 +625,31 @@ class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis])
                 query=ctx.query,
                 student_tools=list(metrics.student_tools),
                 teacher_tools=list(metrics.teacher_tools),
-                student_first_tool_input=metrics.student_first_tool_input,
-                teacher_first_tool_input=metrics.teacher_first_tool_input,
+                student_tool_inputs=metrics.student_tool_inputs,
+                teacher_tool_inputs=metrics.teacher_tool_inputs,
             ),
         )
 
-    def _component_trajectories(
+    def _select_mismatch_groups(
         self,
-        component_name: str,
-        selected: list[Any],
-        selected_keys: list[tuple[str, str] | None],
+        mismatch_keys: Sequence[tuple[str, str] | None],
         *,
-        trajectories: list[Any],
-        mismatch_keys: list[tuple[str, str] | None],
-    ) -> list[Any]:
-        """Route mismatches to the tool-description or rules module they implicate."""
-        if component_name in CORE_TOOL_KEYS:
-            return [
-                trajectory
-                for trajectory, pair in zip(selected, selected_keys, strict=True)
-                if pair is not None
-                and any(tool_description_override_key(name) == component_name for name in pair if name)
-            ]
-        if component_name == RULES_EXT_KEY:
-            non_core = [
-                (trajectory, key)
-                for trajectory, key in zip(trajectories, mismatch_keys, strict=True)
-                if key is not None and not any(is_core_tool_span(name) for name in key if name)
-            ]
-            indices, _ = select_mismatch_groups([key for _, key in non_core])
-            return [non_core[index][0] for index in indices]
-        return selected
+        trajectories: Sequence[Any] = (),
+        max_entries: int | None = REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT,
+    ) -> tuple[list[int], list[tuple[str, str, int]]]:
+        """Take high-signal entries in order, up to the cap. No frequency grouping."""
+        del trajectories
+        if max_entries is None:
+            max_entries = len(mismatch_keys)
+        selected = [index for index, key in enumerate(mismatch_keys) if key is not None]
+        return selected[:max_entries], []
 
     def failure_pattern(self, component_name: str, trajectory: TeacherStudentALTrajectory) -> tuple[Any, ...]:
         del component_name
         output = trajectory["output"]
         tool_alignment = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(tool_alignment < float(self.pack_param("failure_score_below", 0.7))),
+            int(tool_alignment < float(self.experiment_param("failure_score_below", 0.7))),
             int(self._mismatch_key(output) is not None),
         )
 
@@ -538,17 +679,10 @@ class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis])
         if tool_alignment < 1.0:
             feedback_parts.append(f"Tool alignment issue: score={tool_alignment:.2f}.")
         feedback_parts.extend(self.wired_signal_issues(objective_scores))
+        verdict = output.get(f"{CUSTOMER_AGENTIC_PREFERENCE_METRIC}_feedback")
+        if isinstance(verdict, str) and verdict.strip():
+            feedback_parts.append(f"Agentic judge verdict:\n{verdict.strip()}")
 
-        action_inputs: list[str] = []
-        for role in ("teacher", "student"):
-            pair = output.get(f"{role}_first_tool_input")
-            if isinstance(pair, list | tuple) and len(pair) == 2 and pair[1]:
-                tool, payload = pair
-                payload_text = str(payload)
-                if len(payload_text) > 240:
-                    payload_text = payload_text[:240] + "... (truncated)"
-                action_inputs = [f"{role} first tool ({tool or 'unknown'}): {payload_text}"]
-                break
         return self.reflective_example(
             trajectory,
             feedback=" ".join(feedback_parts) if feedback_parts else "General teacher/student tool divergence.",
@@ -558,11 +692,9 @@ class FirstToolMatchObjective(TeacherStudentObjective[EvalRunToolMatchAnalysis])
                 "student_tools": student_tools,
                 "teacher_tools": teacher_tools,
             },
-            action_inputs=action_inputs,
+            action_inputs=tool_input_evidence(output),
+            action_input_limit=2 * TOOL_INPUT_LIMIT,
         )
-
-    def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
-        return high_signal_core_tool_keys(trajectories)
 
 
 __all__ = ["FirstToolMatchObjective"]

@@ -112,6 +112,22 @@ def test_concrete_adapters_own_screening_configuration():
         )
         == 1.0
     )
+    weighted = _teacher_student(
+        primary_objective=TOOL_ALIGNMENT_OBJECTIVE,
+        screening_weights={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "agentic_preference_rate": 0.5},
+    )
+    blended = GleanEvaluationBatch(
+        outputs=[],
+        scores=[0.4],
+        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.8, "agentic_preference_rate": 0.4},
+    )
+    assert weighted.get_screening_score(blended) == 0.8
+    assert weighted.child_screen_score(
+        GleanEvaluationBatch(outputs=[], scores=[0.2], trajectories=[{"score": 0.2}]),
+        blended,
+    ) == pytest.approx(0.6)
+    assert weighted.child_screen_score(tool_match_eval, GleanEvaluationBatch(outputs=[], scores=[])) == float("-inf")
+
     assert pick_modules_to_edit(single_rules_ext) == [RULES_EXT_KEY]
     assert not hasattr(single_adapter, "judging_mode")
     assert not hasattr(teacher_adapter, "judge")

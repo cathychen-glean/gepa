@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.experiment_config import experiment_objective_pack, load_experiment_config
+from glean_gepa.experiment_config import experiment_objective_spec, load_experiment_config
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.utils.agentspan import bounds_query
@@ -151,12 +151,18 @@ def test_aggregate_and_empty_analysis():
         CitationMatchObjective().require_compared_entries(empty)
 
 
-def test_citations_pack_constructs_the_citation_match_objective(tmp_path):
+def test_citation_match_signal_constructs_the_citation_match_objective(tmp_path):
     mode = tmp_path / "mode.yaml"
-    mode.write_text("schema_version: 1\nmode: teacher_student\npacks: [citations]\n")
+    mode.write_text(
+        "schema_version: 1\n"
+        "mode: teacher_student\n"
+        "signals:\n  - name: citation_match\n    source: citation_match\n"
+        "objective:\n  primary: citation_match\n  composite:\n    citation_match: 1.0\n"
+        "  focused_bucket_type: QUERY_CANONICAL\n"
+    )
     config = load_experiment_config(mode)
     objective = build_objective(
-        "teacher_student", config.signals, bigquery_client=MagicMock(), pack=experiment_objective_pack(config)
+        "teacher_student", config.signals, bigquery_client=MagicMock(), experiment=experiment_objective_spec(config)
     )
     assert config.primary_objective == "citation_match"
     assert isinstance(objective, CitationMatchObjective)

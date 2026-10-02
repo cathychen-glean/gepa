@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from glean_gepa.al_adapter import AGENTIC_LOOP_MODEL_OVERRIDES, CODING_HARNESS_SC_PARAMS, ALRunner
+from glean_gepa.al_adapter import (
+    AGENTIC_LOOP_MODEL_OVERRIDES,
+    AGENTIC_LOOP_REASONING_EFFORT,
+    CODING_HARNESS_SC_PARAMS,
+    ALRunner,
+)
 from glean_gepa.evalcli_client import (
     COMPLETENESS_JUDGE_TYPE,
     COMPLETENESS_RUN_PARAMS,
@@ -75,6 +80,20 @@ def test_build_sc_params_overrides_claude_models(alias: str):
 
     assert f"co.lo.oai_model_for_agentic_loop={AGENTIC_LOOP_MODEL_OVERRIDES[alias]}" in params
     assert "co.internal_looping_pyagent_default_route_override=coding_agent_loop" in params
+    if alias not in AGENTIC_LOOP_REASONING_EFFORT:
+        assert "co.lo.advanced_mode_reasoning_effort=" not in params
+
+
+def test_build_sc_params_pins_sol_6_1_to_high_reasoning():
+    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
+
+    params = runner._build_sc_params("gpt6_1_sol_high", "")
+
+    assert "co.lo.oai_model_for_agentic_loop=GPT6_1_SOL" in params
+    assert "co.lo.advanced_mode_reasoning_effort=high" in params
+    assert "co.lo.advanced_mode_model_reasoning_overrides=GPT6_1_SOL:high" in params
+    for tier in ("economical", "balanced", "frontier"):
+        assert f"co.lo.mro.{tier}.driver_reasoning_effort=high" in params
 
 
 def test_build_sc_params_rejects_unknown_and_legacy_claude_alias():
@@ -415,12 +434,12 @@ def _metrics_payload(
                 }
             },
             0.8,
-            True,
+            False,
         ),
         (
             {"judgeMetrics": {"COMPLETENESS": [{"judgeRunId": "judge-1", "test": 0.75, "sampleSize": 4}]}},
             0.75,
-            True,
+            False,
         ),
         (
             {"judgeMetrics": {"COMPLETENESS": {"passRate": None, "judgeRunId": "judge-1"}}},
@@ -434,7 +453,7 @@ def _metrics_payload(
         ),
         (_metrics_payload(pass_rate=4.31, sample_size=42, total=104, missing=62), 4.31, False),
         (_metrics_payload(pass_rate=4.51, sample_size=104, total=104, missing=0), 4.51, True),
-        (_metrics_payload(pass_rate=4.22, sample_size=104), 4.22, True),
+        (_metrics_payload(pass_rate=4.22, sample_size=104), 4.22, False),
     ],
     ids=["wrapped", "test_key", "null_rate", "pass_rate_only", "partial", "finished", "omitted_totals"],
 )
@@ -549,6 +568,178 @@ def test_wait_for_judge_metrics_waits_for_analysis_view_to_catch_sample_size():
 
     assert evalcli.get_analysis_view.call_count == 2
     assert set(analysis.per_entry) == {"one", "two"}
+
+
+def _view(eval_id: str, judge_id: str, scores: list[float | None], *, unscored: int = 0) -> dict:
+    """Analyze view with one run entry per score; ``unscored`` adds entries the judge has not reached yet."""
+    return {
+        "entries": [
+            {
+                "entryId": f"e{i}",
+                "evalRunEntries": [
+                    {"evalRunId": eval_id, "metadata": {"judgeScores": {judge_id: score}}},
+                ],
+            }
+            for i, score in enumerate([*scores, *([None] * unscored)])
+        ]
+    }
+
+
+def test_wait_for_judge_metrics_without_totals_ignores_a_stall_below_minimum_coverage():
+    """A count frozen at 2 of 195 for longer than the settle window is a judge still queuing, not a finished one.
+
+    Once the count reaches coverage and holds still, the same settle rule applies.
+    """
+    evalcli = MagicMock()
+    sample_sizes = [2] * 6 + [190] * 3
+    evalcli.get_eval_metrics.side_effect = [_metrics_payload(pass_rate=5.0, sample_size=n) for n in sample_sizes]
+    evalcli.get_analysis_view.side_effect = [
+        _view("run-1", "judge-1", [0.5] * n, unscored=195 - n) for n in sample_sizes
+    ]
+
+    with patch("glean_gepa.judge_metrics_util.time.sleep") as sleep:
+        analysis = wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=3600,
+            settle_sec=120,
+        )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
+    assert sleep.call_count == 8
+    assert len(analysis.per_entry) == 190
+    assert analysis.aggregate == 5.0
+
+
+def test_wait_for_judge_metrics_without_totals_never_settles_below_minimum_coverage():
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=5.5, sample_size=8)
+    evalcli.get_analysis_view.return_value = _view("run-1", "judge-1", [0.55] * 8, unscored=192)
+
+    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="8 scored"):
+        wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=1800,
+            settle_sec=120,
+        )
+
+
+def test_wait_for_judge_metrics_without_totals_needs_the_view_to_accept_a_stall():
+    """With no totals and no analyze view there is nothing to measure coverage against, so a flat count is not proof."""
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=5.0, sample_size=2)
+    evalcli.get_analysis_view.side_effect = EvalCliError("503 Unable to load eval run creation dates")
+
+    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="2 scored"):
+        wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=600,
+            settle_sec=120,
+        )
+
+
+def test_wait_for_judge_metrics_without_totals_waits_until_sample_stops_growing():
+    """The agentic judge reports no coverage totals; a growing sample must not be read as final."""
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.side_effect = [
+        _metrics_payload(pass_rate=3.71, sample_size=7),
+        _metrics_payload(pass_rate=4.10, sample_size=90),
+        _metrics_payload(pass_rate=4.34, sample_size=190),
+        _metrics_payload(pass_rate=4.34, sample_size=190),
+        _metrics_payload(pass_rate=4.34, sample_size=190),
+    ]
+    evalcli.get_analysis_view.side_effect = [
+        _view("run-1", "judge-1", [0.4] * 7),
+        _view("run-1", "judge-1", [0.4] * 90),
+        _view("run-1", "judge-1", [0.4] * 190),
+        _view("run-1", "judge-1", [0.4] * 190),
+        _view("run-1", "judge-1", [0.4] * 190),
+    ]
+
+    with patch("glean_gepa.judge_metrics_util.time.sleep") as sleep:
+        analysis = wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=600,
+            settle_sec=120,
+        )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
+    assert sleep.call_count == 4
+    assert evalcli.get_eval_metrics.call_count == 5
+    assert analysis.aggregate == 4.34
+    assert len(analysis.per_entry) == 190
+
+
+def test_wait_for_judge_metrics_without_totals_uses_per_entry_mean_when_summary_lags():
+    """A metrics summary frozen at 17 entries must not be recorded while the view already has 152."""
+    evalcli = MagicMock()
+    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=3.71, sample_size=17)
+    evalcli.get_analysis_view.side_effect = [
+        _view("run-1", "judge-1", [0.5] * 100),
+        _view("run-1", "judge-1", [0.5] * 152),
+        _view("run-1", "judge-1", [0.5] * 152),
+        _view("run-1", "judge-1", [0.5] * 152),
+    ]
+
+    with patch("glean_gepa.judge_metrics_util.time.sleep"):
+        analysis = wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=600,
+            settle_sec=120,
+        )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
+    assert evalcli.get_analysis_view.call_count == 4
+    assert analysis.aggregate == pytest.approx(5.0)
+    assert len(analysis.per_entry) == 152
+
+
+def test_wait_for_judge_metrics_without_totals_times_out_while_sample_grows():
+    evalcli = MagicMock()
+    sizes = iter(range(1, 1000))
+
+    def metrics(_eval_id, **_kwargs):
+        return _metrics_payload(pass_rate=4.0, sample_size=next(sizes))
+
+    evalcli.get_eval_metrics.side_effect = metrics
+    evalcli.get_analysis_view.return_value = {"entries": []}
+    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="scored"):
+        wait_for_all_judge_metrics(
+            evalcli,
+            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
+            poll_interval_sec=60,
+            timeout_sec=180,
+            settle_sec=120,
+        )
+
+
+def test_get_analysis_details_pages_entry_ids_and_retries_transient_pages():
+    client = EvalCliClient(binary="/fake/evalcli")
+    entry_ids = [f"entry-{i:02d}" for i in range(23)]
+    calls: list[list[str]] = []
+    failed_once = {"done": False}
+
+    def fake_invoke(*args):
+        ids = list(args[args.index("--entry-ids") + 1 : args.index("--eval-run-ids")])
+        calls.append(ids)
+        if len(calls) == 2 and not failed_once["done"]:
+            failed_once["done"] = True
+            raise EvalCliError("evalcli failed (exit 1): evalcli analyze details\nstderr: Error:\nstdout: ")
+        return [{"evalSetEntry": {"id": entry_id}} for entry_id in ids]
+
+    with (
+        patch.object(client, "_invoke_json", side_effect=fake_invoke),
+        patch("glean_gepa.evalcli_client.time.sleep"),
+    ):
+        details = client.get_analysis_details(
+            entry_ids=entry_ids, eval_run_ids=["run-1", "run-2"], deployment_id="scio-prod"
+        )
+
+    assert [len(ids) for ids in calls] == [10, 10, 10, 3]
+    assert [item["evalSetEntry"]["id"] for item in details] == entry_ids
 
 
 def test_wait_for_all_judge_metrics_reads_views_only_after_every_child_is_complete():
@@ -738,6 +929,11 @@ def test_subprocess_env_ssl_cert(monkeypatch, tmp_path, initial, expect_resolved
         EvalCliError("stderr: Error: API request failed: 502\nResponse: Connection refused"),
         EvalCliError("stderr: Error: Could not find valid __Host-GCP_IAP_AUTH_TOKEN_* cookie in any browser."),
         EvalCliError("evalcli failed (exit 1): evalcli run status\nstderr: Error:\nstdout: "),
+        EvalCliError(
+            "evalcli failed (exit 1): evalcli run status\n"
+            "stderr: Error: [Errno 8] nodename nor servname provided, or not known\nstdout: "
+        ),
+        EvalCliError("stderr: Error: [Errno -3] Temporary failure in name resolution\nstdout: "),
     ],
 )
 def test_wait_for_eval_run_retries_transient_errors(error, capsys):
@@ -1003,6 +1199,7 @@ def test_invoke_raises_on_nonzero_exit():
             },
             "usable",
         ),
+        # Cancellation-dominated runs are not reusable: recreate rather than score a stub.
         (
             {
                 "taskCountsByStatus": [
@@ -1010,9 +1207,29 @@ def test_invoke_raises_on_nonzero_exit():
                     {"status": "TASK_CANCELLED", "count": 123},
                 ]
             },
+            "missing",
+        ),
+        ({"taskCountsByStatus": [{"status": "TASK_CANCELLED", "count": 200}]}, "missing"),
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_CANCELLED", "count": 178},
+                    {"status": "TASK_SUCCEEDED", "count": 14},
+                    {"status": "TASK_EXECUTING", "count": 1},
+                ]
+            },
+            "missing",
+        ),
+        # A handful of cancelled tasks in an otherwise finished run is still usable.
+        (
+            {
+                "taskCountsByStatus": [
+                    {"status": "TASK_SUCCEEDED", "count": 190},
+                    {"status": "TASK_CANCELLED", "count": 10},
+                ]
+            },
             "usable",
         ),
-        ({"taskCountsByStatus": [{"status": "TASK_CANCELLED", "count": 200}]}, "usable"),
     ],
 )
 def test_classify_eval_run_status(status, expected):

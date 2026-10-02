@@ -39,7 +39,7 @@ from glean_gepa.objectives.utils.core import (
 )
 from glean_gepa.objectives.utils.traces import FetchedByRole, enrich_action_inputs
 from glean_gepa.prompt_constants import RULES_EXT_KEY, WRITING_CODE_KEY
-from glean_gepa.reflection_prompts import NO_EXAMPLE_SPECIFICS_RULE, TEACHER_IS_OFFLINE_RULE
+from glean_gepa.reflection_prompts import GENERALITY_RULES, RULES_EXT_FRAME, compose_responsibility
 
 CITATION_MATCH_OBJECTIVE = "citation_match"
 CITATION_ARRAY_PATH = "jsonPayload.agent_run.citations_data.positioned_citations"
@@ -306,16 +306,13 @@ WRITING_CODE_RESPONSIBILITY = (
     "printing raw SDK results, carrying each result's `citationId` through any filtering, ranking, or "
     "summarizing step, and not truncating output the answer still has to cite. Change other guidance "
     "only where it produces missing or extra citations. "
-    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE} Propose minimal deltas."
+    f"{GENERALITY_RULES} Propose minimal deltas."
 )
 
-RULES_EXT_RESPONSIBILITY = (
-    "You are writing at most two markdown bullets that will be appended after the existing "
-    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
-    "existing Rules, do not add a heading, and do not exceed two bullets. Target citation "
-    "mismatches (missing teacher sources, extra student sources, or dropped citationId values "
-    "after filtering SDK results). Keep each bullet operational and concise. "
-    f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
+RULES_EXT_RESPONSIBILITY = compose_responsibility(
+    RULES_EXT_FRAME,
+    "Target citation mismatches (missing teacher sources, extra student sources, or dropped "
+    "citationId values after filtering SDK results). Keep each bullet operational and concise.",
 )
 
 
@@ -449,7 +446,7 @@ class CitationMatchObjective(TeacherStudentObjective[EvalRunCitationMatchAnalysi
         output = trajectory["output"]
         citation_match = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(citation_match < float(self.pack_param("failure_score_below", 1.0))),
+            int(citation_match < float(self.experiment_param("failure_score_below", 1.0))),
             int(self._mismatch_key(output) is not None),
         )
 

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from glean_gepa.evalcli_client import (
+    AGENTIC_CORRECTNESS_JUDGE_NAME,
+    AGENTIC_CORRECTNESS_RUN_PARAMS,
     AGENTIC_INPUT_MAPPINGS,
     AGENTIC_JUDGE_NAME,
     AGENTIC_JUDGE_TYPE,
@@ -23,6 +26,21 @@ from glean_gepa.evalcli_client import (
 )
 
 PREFERENCE_TIE = 0.5
+# How long a judge's sample size must stay unchanged before a payload with no coverage
+# totals is accepted as finished. The agentic judge scores ~10 entries/minute, so a
+# still-running judge cannot hold its sample size flat for this long.
+JUDGE_SAMPLE_SETTLE_SEC = 180
+# The agentic judge's summary "rate" is exactly 10x the mean of its 0-1 per-entry scores
+# (verified on every completed judge run in run_ts_agentic_2), so a lagging summary can be
+# replaced by the per-entry mean without changing scale.
+AGENTIC_VIEW_SCORE_SCALE = 10.0
+# A judge with no coverage totals may only be accepted on the "count stopped growing" rule
+# once it has scored at least this share of the entries the student eval run produced. The
+# agentic judge can sit at 2-8 scored entries for several minutes while its tasks queue,
+# which is indistinguishable from "finished" by count alone: that stall produced a 5.0 val
+# score over 2 entries and a reflection round fed 8 of ~200 entries. Completed judges cover
+# 93-96% (the remainder are failed eval tasks the judge cannot grade).
+MIN_JUDGE_COVERAGE = 0.85
 
 _PendingJudge = tuple[str, str, str | None, str | None]
 _JudgeKey = tuple[str, str, str | None]
@@ -40,7 +58,8 @@ class JudgeAnalysis:
     per_entry_feedback: dict[str, str] = field(default_factory=dict)
 
 
-def _run_entry_id(run_entry: Mapping[str, Any]) -> str:
+def run_entry_id(run_entry: Mapping[str, Any]) -> str:
+    """Eval-run id on an analyze-view run entry, across the payload's key names."""
     for key in ("runId", "run_id", "evalRunId", "eval_run_id"):
         value = run_entry.get(key)
         if value:
@@ -74,7 +93,7 @@ def per_entry_from_analysis_view(
         if not entry_id:
             continue
         for run_entry in entry.get("evalRunEntries") or entry.get("runs") or []:
-            if not isinstance(run_entry, Mapping) or _run_entry_id(run_entry) != eval_id:
+            if not isinstance(run_entry, Mapping) or run_entry_id(run_entry) != eval_id:
                 continue
             metadata = run_entry.get("metadata") or {}
             if not isinstance(metadata, Mapping):
@@ -97,6 +116,30 @@ def per_entry_from_analysis_view(
     return scores, feedback
 
 
+def judgeable_entry_count(view: Mapping[str, Any], *, eval_id: str) -> int:
+    """Entries in an analyze-view payload that carry a run entry for ``eval_id``.
+
+    This is the population the judge is working through, so ``scored / judgeable`` is the
+    judge's coverage even when Cortex's metrics summary reports no totals.
+    """
+    count = 0
+    for entry in view.get("entries") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        runs = entry.get("evalRunEntries") or entry.get("runs") or []
+        if any(isinstance(run_entry, Mapping) and run_entry_id(run_entry) == eval_id for run_entry in runs):
+            count += 1
+    return count
+
+
+@dataclass(frozen=True)
+class _ViewScores:
+    per_entry: dict[str, float]
+    feedback: dict[str, str]
+    loaded: bool
+    judgeable: int = 0
+
+
 def _per_entry_from_evalcli(
     evalcli: EvalCliClient,
     *,
@@ -104,22 +147,22 @@ def _per_entry_from_evalcli(
     judge_run_id: str | None,
     judge_type: str,
     base_eval_id: str | None,
-) -> tuple[dict[str, float], dict[str, str], bool]:
-    """Load per-entry scores from analyze view. ``view_loaded`` is False if the view is not ready."""
+) -> _ViewScores:
+    """Load per-entry scores from analyze view. ``loaded`` is False if the view is not ready."""
     get_view = getattr(evalcli, "get_analysis_view", None)
     if not callable(get_view) or not judge_run_id:
-        return {}, {}, False
+        return _ViewScores({}, {}, False)
     try:
         view = get_view(eval_id, base_eval_id=base_eval_id)
     except Exception as exc:
         print(f"[{eval_id}] Could not load analysis view for per-entry judge scores: {exc}")
-        return {}, {}, False
+        return _ViewScores({}, {}, False)
     if not isinstance(view, Mapping):
-        return {}, {}, False
+        return _ViewScores({}, {}, False)
     scores, feedback = per_entry_from_analysis_view(
         view, eval_id=eval_id, judge_run_id=judge_run_id, judge_type=judge_type
     )
-    return scores, feedback, True
+    return _ViewScores(scores, feedback, True, judgeable_entry_count(view, eval_id=eval_id))
 
 
 def _as_int(value: Any) -> int | None:
@@ -197,15 +240,25 @@ class JudgeMetricsSnapshot:
     missing_entries: int | None = None
 
     @property
+    def coverage_known(self) -> bool:
+        """Whether Cortex reported enough to decide completeness from this payload alone."""
+        return self.missing_entries is not None or (self.total_entries is not None and self.sample_size is not None)
+
+    @property
     def coverage_complete(self) -> bool:
-        """True once Cortex has finished scoring this judge, not merely published a mean."""
+        """True once Cortex has finished scoring this judge, not merely published a mean.
+
+        When Cortex reports neither ``missingEntries`` nor ``totalEntries`` (the agentic
+        judge does this while it is still scoring), a partial sample is indistinguishable
+        from a finished one here; the caller must confirm the sample has stopped growing.
+        """
         if self.rate is None:
             return False
         if self.missing_entries == 0:
             return True
         if self.total_entries is not None and self.sample_size is not None:
             return self.sample_size >= self.total_entries
-        return self.missing_entries is None and self.total_entries is None and self.sample_size is not None
+        return False
 
     def view_caught_up(self, per_entry_count: int) -> bool:
         """True when analyze-view rows have caught the metrics sample (or there is no sample)."""
@@ -277,27 +330,132 @@ def _load_complete_analysis(
     rate = snapshot.rate
     if rate is None:
         return None
-    per_entry, per_entry_feedback, view_loaded = _per_entry_from_evalcli(
+    view = _per_entry_from_evalcli(
         evalcli,
         eval_id=eval_id,
         judge_run_id=judge_run_id,
         judge_type=judge_type,
         base_eval_id=base_eval_id,
     )
-    if view_loaded and not snapshot.view_caught_up(len(per_entry)):
+    if view.loaded and not snapshot.view_caught_up(len(view.per_entry)):
         print(
             f"[{judge_type}] {eval_id}: {rate:.2f} "
-            f"({len(per_entry)} per-entry view, {snapshot.progress_label()}; waiting)"
+            f"({len(view.per_entry)} per-entry view, {snapshot.progress_label()}; waiting)"
         )
         return None
-    print(f"[{judge_type}] {eval_id}: {rate:.2f} ({len(per_entry)} per-entry)")
+    print(f"[{judge_type}] {eval_id}: {rate:.2f} ({len(view.per_entry)} per-entry)")
     return JudgeAnalysis(
         eval_id=eval_id,
         aggregate=rate,
+        per_entry=view.per_entry,
+        judge_run_id=judge_run_id,
+        judge_type=judge_type,
+        per_entry_feedback=view.feedback,
+    )
+
+
+def _count_has_settled(
+    count: int,
+    key: _JudgeKey,
+    stable_polls: dict[_JudgeKey, tuple[int, int]],
+    *,
+    poll_interval_sec: int,
+    settle_sec: int,
+) -> bool:
+    """True once ``count`` has held still for ``settle_sec`` (at least two polls)."""
+    if count <= 0:
+        stable_polls.pop(key, None)
+        return False
+    previous = stable_polls.get(key)
+    if previous is None or previous[0] != count:
+        stable_polls[key] = (count, 1)
+        return False
+    polls = previous[1] + 1
+    stable_polls[key] = (count, polls)
+    interval = poll_interval_sec if poll_interval_sec > 0 else 1
+    return polls >= 2 and (polls - 1) * interval >= settle_sec
+
+
+def _settle_without_totals(
+    evalcli: EvalCliClient,
+    *,
+    eval_id: str,
+    judge_type: str,
+    judge_run_id: str | None,
+    base_eval_id: str | None,
+    snapshot: JudgeMetricsSnapshot,
+    key: _JudgeKey,
+    stable_polls: dict[_JudgeKey, tuple[int, int]],
+    poll_interval_sec: int,
+    settle_sec: int,
+) -> JudgeAnalysis | None:
+    """Completeness fallback for judges whose metrics payload carries no coverage totals.
+
+    The agentic judge publishes a running mean with ``totalEntries``/``missingEntries``
+    both null, and that summary can lag far behind the analyze view (a summary stuck at 17
+    entries while the view already held 152). So progress is measured by the larger of the
+    summary sample and the view's per-entry rows, the judge counts as finished only once
+    that number has held still for ``settle_sec``, and when the summary is behind the view
+    the aggregate is recomputed from the per-entry scores (the summary is exactly their mean).
+
+    A flat count is not enough on its own: the judge also stalls for minutes right after it
+    starts, so the analyze view must be loaded and the scored count must cover at least
+    ``MIN_JUDGE_COVERAGE`` of the entries the student run produced before a stall counts as
+    completion. Below that the judge is treated as still running, whatever the count does.
+    """
+    if snapshot.rate is None:
+        stable_polls.pop(key, None)
+        return None
+    view = _per_entry_from_evalcli(
+        evalcli,
+        eval_id=eval_id,
+        judge_run_id=judge_run_id,
+        judge_type=judge_type,
+        base_eval_id=base_eval_id,
+    )
+    per_entry = view.per_entry
+    sample = snapshot.sample_size or 0
+    if not view.loaded:
+        stable_polls.pop(key, None)
+        print(
+            f"[{judge_type}] {eval_id}: {snapshot.rate:.2f} ({snapshot.progress_label()}; no coverage totals "
+            f"and the analyze view is unavailable, so coverage cannot be checked; waiting)"
+        )
+        return None
+    count = max(sample, len(per_entry))
+    settled = _count_has_settled(count, key, stable_polls, poll_interval_sec=poll_interval_sec, settle_sec=settle_sec)
+    required = math.ceil(MIN_JUDGE_COVERAGE * view.judgeable)
+    if view.judgeable > 0 and count < required:
+        print(
+            f"[{judge_type}] {eval_id}: {snapshot.rate:.2f} ({count} of {view.judgeable} entries scored, "
+            f"need {required} before a stalled count can mean complete; waiting)"
+        )
+        return None
+    if not settled:
+        print(
+            f"[{judge_type}] {eval_id}: {snapshot.rate:.2f} ({count} of {view.judgeable} entries scored; "
+            f"no coverage totals, waiting for the count to settle)"
+        )
+        return None
+    if len(per_entry) > sample:
+        aggregate = AGENTIC_VIEW_SCORE_SCALE * sum(per_entry.values()) / len(per_entry)
+        print(
+            f"[{judge_type}] {eval_id}: metrics summary lagged ({snapshot.rate:.2f} over {sample} scored); "
+            f"using {aggregate:.2f} from {len(per_entry)} per-entry scores, unchanged for {settle_sec}s"
+        )
+    else:
+        aggregate = snapshot.rate
+        print(
+            f"[{judge_type}] {eval_id}: {aggregate:.2f} ({count} of {view.judgeable} entries scored; Cortex "
+            f"reported no coverage totals, sample unchanged for {settle_sec}s, treating as complete)"
+        )
+    return JudgeAnalysis(
+        eval_id=eval_id,
+        aggregate=aggregate,
         per_entry=per_entry,
         judge_run_id=judge_run_id,
         judge_type=judge_type,
-        per_entry_feedback=per_entry_feedback,
+        per_entry_feedback=view.feedback,
     )
 
 
@@ -307,6 +465,7 @@ def wait_for_all_judge_metrics(
     *,
     poll_interval_sec: int = 60,
     timeout_sec: int = 3600,
+    settle_sec: int = JUDGE_SAMPLE_SETTLE_SEC,
 ) -> dict[tuple[str, str, str | None], JudgeAnalysis]:
     """Poll every pending judge, then read analyses only after all have finished."""
     unique = _dedupe_pending(pending)
@@ -316,10 +475,16 @@ def wait_for_all_judge_metrics(
     print(f"Waiting for metrics on {len(unique)} judge run(s)...")
     elapsed = 0
     snapshots: dict[_JudgeKey, JudgeMetricsSnapshot] = {}
+    # (last scored count, consecutive polls at that count) for judges whose payload omits coverage totals.
+    stable_polls: dict[_JudgeKey, tuple[int, int]] = {}
+    # Analyses already finalized through the no-totals path; they are not re-read from the summary.
+    settled: dict[_JudgeKey, JudgeAnalysis] = {}
     while elapsed <= timeout_sec:
         coverage_ready = True
         for eval_id, judge_type, judge_run_id, base_eval_id in unique:
             key = _pending_judge_key((eval_id, judge_type, judge_run_id, base_eval_id))
+            if key in settled:
+                continue
             try:
                 payload = evalcli.get_eval_metrics(eval_id, base_eval_id=base_eval_id)
             except EvalCliError as exc:
@@ -330,18 +495,36 @@ def wait_for_all_judge_metrics(
             snapshots[key] = snapshot
             if snapshot.coverage_complete:
                 continue
+            if not snapshot.coverage_known:
+                analysis = _settle_without_totals(
+                    evalcli,
+                    eval_id=eval_id,
+                    judge_type=judge_type,
+                    judge_run_id=judge_run_id,
+                    base_eval_id=base_eval_id,
+                    snapshot=snapshot,
+                    key=key,
+                    stable_polls=stable_polls,
+                    poll_interval_sec=poll_interval_sec,
+                    settle_sec=settle_sec,
+                )
+                if analysis is not None:
+                    settled[key] = analysis
+                    continue
             coverage_ready = False
-            if snapshot.rate is not None:
+            if snapshot.rate is not None and snapshot.coverage_known:
                 print(
                     f"[{judge_type}] {eval_id}: {snapshot.rate:.2f} "
                     f"({snapshot.progress_label()}; waiting for remaining entries)"
                 )
 
         if coverage_ready and len(snapshots) == len(unique):
-            analyses: dict[_JudgeKey, JudgeAnalysis] = {}
+            analyses: dict[_JudgeKey, JudgeAnalysis] = dict(settled)
             views_ready = True
             for eval_id, judge_type, judge_run_id, base_eval_id in unique:
                 key = _pending_judge_key((eval_id, judge_type, judge_run_id, base_eval_id))
+                if key in analyses:
+                    continue
                 analysis = _load_complete_analysis(
                     evalcli,
                     eval_id=eval_id,
@@ -372,6 +555,12 @@ def wait_for_all_judge_metrics(
 
 CUSTOMER_CORRECTNESS_METRIC = "correctness"
 CUSTOMER_AGENTIC_PREFERENCE_METRIC = "agentic_preference_rate"
+CUSTOMER_AGENTIC_CORRECTNESS_METRIC = "agentic_correctness_rate"
+# Adapter-side key for the single-dimension agentic correctness judge. It is NOT a Cortex
+# judge type; Cortex sees AGENTIC_JUDGE (``JudgeSpec.cortex_judge_type``). A distinct key
+# keeps its judge runs and cached analyses apart from the multi-dimension judge, which
+# shares the Cortex type.
+AGENTIC_CORRECTNESS_JUDGE_TYPE = "AGENTIC_CORRECTNESS_JUDGE"
 COMPLETENESS_METRIC = "completeness"
 
 
@@ -397,6 +586,15 @@ class JudgeSpec:
     #: mode in ``run_params``. Keep the two in sync.
     per_entry_scale: float = 1.0
     score_keys: tuple[str, ...] = ("test", "passRate", "pass_rate", "testValue", "test_value")
+    #: Judge type sent to Cortex when it differs from ``judge_type``. ``judge_type`` is the
+    #: adapter's cache / dedupe key; several specs may map onto one Cortex type.
+    cortex_type_override: str | None = None
+    #: ``judge_skill_name`` in ``run_params``; disambiguates runs that share a Cortex type.
+    judge_skill_name: str | None = None
+
+    @property
+    def cortex_judge_type(self) -> str:
+        return self.cortex_type_override or self.judge_type
 
     def matches_row(self, category: str, row: Mapping[str, Any]) -> bool:
         metric = str(row.get("metric", ""))
@@ -453,6 +651,27 @@ JUDGE_SPECS: dict[str, JudgeSpec] = {
             # scoring_mode randomized_single_0_10: 0-4 lost to the baseline,
             # 5 ties, 6-10 won. Normalizing puts the tie on PREFERENCE_TIE.
             per_entry_scale=10.0,
+            judge_skill_name=AGENTIC_JUDGE_NAME,
+        ),
+        JudgeSpec(
+            name=CUSTOMER_AGENTIC_CORRECTNESS_METRIC,
+            kind="pairwise",
+            default_min=0.50,
+            judge_type=AGENTIC_CORRECTNESS_JUDGE_TYPE,
+            cortex_type_override=AGENTIC_JUDGE_TYPE,
+            run_params=AGENTIC_CORRECTNESS_RUN_PARAMS,
+            input_mappings=AGENTIC_INPUT_MAPPINGS,
+            strict=False,
+            category_aliases=(AGENTIC_CORRECTNESS_JUDGE_NAME.upper(),),
+            judge_type_aliases=(AGENTIC_CORRECTNESS_JUDGE_NAME,),
+            row_metric=AGENTIC_PREFERENCE_RATE_METRIC,
+            metrics_label=f"{AGENTIC_CORRECTNESS_JUDGE_NAME} {AGENTIC_PREFERENCE_RATE_METRIC}",
+            score_source=AGENTIC_CORRECTNESS_JUDGE_NAME,
+            label="agentic correctness rate",
+            # Same randomized_single_0_10 scoring as the multi-dimension judge; this one
+            # scores correctness only. 0.5 = parity with the teacher on correctness.
+            per_entry_scale=10.0,
+            judge_skill_name=AGENTIC_CORRECTNESS_JUDGE_NAME,
         ),
         JudgeSpec(
             name=COMPLETENESS_METRIC,
@@ -469,8 +688,14 @@ JUDGE_SPECS: dict[str, JudgeSpec] = {
     )
 }
 JUDGE_SPEC_NAMES = frozenset(JUDGE_SPECS)
+# Gates started when a run names none. The correctness-only agentic judge is opt-in:
+# it duplicates the multi-dimension judge's correctness scorer, so running both by
+# default would double the agentic judge cost for no new signal.
+_OPT_IN_GATES = frozenset({CUSTOMER_AGENTIC_CORRECTNESS_METRIC})
 DEFAULT_CUSTOMER_VALIDATION_GATES = {
-    name: spec.default_min for name, spec in JUDGE_SPECS.items() if spec.kind == "pairwise"
+    name: spec.default_min
+    for name, spec in JUDGE_SPECS.items()
+    if spec.kind == "pairwise" and name not in _OPT_IN_GATES
 }
 
 

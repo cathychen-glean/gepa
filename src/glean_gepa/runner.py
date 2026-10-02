@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from gepa.core.data_loader import ListDataLoader
 from gepa.core.state import FrontierType
 from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import StdOutLogger
@@ -35,14 +36,16 @@ from glean_gepa.experiment_config import (
     composite_weights,
     constant_scores,
     customer_validation_gates,
+    eval_harness,
     evalset_identity,
-    experiment_objective_pack,
+    experiment_objective_spec,
     load_experiment_config,
     pairwise_judges,
     pointwise_judges,
     resolve_config_path,
     runner_arg_defaults,
     screening_threshold,
+    screening_weights,
 )
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.judge_metrics_util import JUDGE_SPECS
@@ -63,14 +66,25 @@ from glean_gepa.prompt_constants import (
     RULES_EXT_KEY,
     WRITING_CODE_KEY,
 )
+from glean_gepa.reflection_prompts import conditional_counts
 from glean_gepa.run_log import capture_run_log, log_section
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
+from glean_gepa.waldo_prompt_constants import (
+    DEFAULT_WALDO_SYSTEM,
+    WALDO_SYSTEM_KEY,
+    WALDO_TOOL_USAGE_KEY,
+    WALDO_TOOL_USAGE_SLOT,
+)
 
 CACHE_DIRECTORY_NAME = "cache"
 ADAPTER_CACHE_FILENAME = "glean_adapter_cache.json"
 EVAL_RUN_CACHE_FILENAME = "glean_eval_run_cache.json"
 CHILDREN_CACHE_FILENAME = "glean_children_cache.json"
+GEPA_STATE_FILENAME = "gepa_state.bin"
+# GEPAState.i starts at -1 and the engine increments it before the first propose.
+_FIRST_ITERATION_ATTEMPT = 0
+_TEACHER_PROMPT_SENTINEL = "<<TEACHER_PROD_PROMPT>>"
 RUN_LOG_FILENAME = "gepa_run.log"
 EVALSET_SCHEDULE_FILENAME = "glean_evalset_schedule.json"
 CUSTOMER_DEPLOYMENTS_FILENAME = "glean_customer_deployments.json"
@@ -104,7 +118,7 @@ TEACHER_STUDENT_DEPLOYMENT_IDS = [
 CUSTOMER_EVAL_ALPHA = 0.05
 # Cortex rejects an eval run with more than five deployments, so each run samples
 # this many from the customer pool above and keeps that sample for every eval.
-MAX_EVAL_RUN_DEPLOYMENTS = 5
+MAX_EVAL_RUN_DEPLOYMENTS = 1
 
 
 def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
@@ -174,6 +188,20 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
     if WRITING_CODE_KEY not in editable_modules:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
+    if WALDO_TOOL_USAGE_KEY in editable_modules:
+        # Pin the Waldo template so the slot is filled at compile time; a seed may override it.
+        seed.setdefault(WALDO_SYSTEM_KEY, raw.get(WALDO_SYSTEM_KEY, DEFAULT_WALDO_SYSTEM))
+        if WALDO_TOOL_USAGE_SLOT not in seed[WALDO_SYSTEM_KEY]:
+            raise SystemExit(
+                f"{WALDO_TOOL_USAGE_KEY} is editable but the seed {WALDO_SYSTEM_KEY} has no "
+                f"{WALDO_TOOL_USAGE_SLOT} slot. Add the slot to {WALDO_SYSTEM_KEY} in the seed file, "
+                f"or drop {WALDO_TOOL_USAGE_KEY} from editable_modules."
+            )
+        if not conditional_counts(seed[WALDO_TOOL_USAGE_KEY]):
+            raise SystemExit(
+                f"seed {WALDO_TOOL_USAGE_KEY} has no <<<[[has_search_tools]]>>> / <<<[[no_search_tools]]>>> "
+                "conditionals. Scio needs both to pick the right branch per request."
+            )
     if RULES_EXT_KEY in editable_modules and "{RULES_EXT}" not in seed.get(
         WRITING_CODE_KEY, seed.get(FULL_PROMPT_KEY, "")
     ):
@@ -260,6 +288,70 @@ def _parse_eval_versions(value: str, *, argument_name: str) -> list[str]:
     if not versions:
         raise SystemExit(f"{argument_name} must contain at least one eval version")
     return versions
+
+
+def _prestart_first_iteration_training(
+    *,
+    runner: ALRunner,
+    policy: UnseenEvalSetPolicy,
+    trainset: list[ALDataInst],
+    seed_candidate: dict[str, str],
+    student_model: str,
+    teacher_model: str,
+    run_dir: Path | None,
+) -> None:
+    """Start the first training slice's teacher and seed-student evals without waiting.
+
+    The seed validation blocks the first iteration, so these runs would otherwise
+    sit idle until it finishes. A resumed run already has ``gepa_state.bin`` and
+    starts its own slice inside propose, so this only runs for a fresh first iteration.
+    ``take_unseen`` records the slice as pending at attempt 0, which is the counter
+    the engine passes on that first propose, so the generation reuses this slice.
+    """
+    if run_dir is not None and (run_dir / GEPA_STATE_FILENAME).is_file():
+        return
+    loader = ListDataLoader(trainset)
+    try:
+        train_ids = policy.take_unseen(
+            loader,
+            purpose="first-iteration training prestart",
+            attempt=_FIRST_ITERATION_ATTEMPT,
+        )
+    except RuntimeError as exc:
+        print(f"[Eval set schedule] Skipping first-iteration training prestart: {exc}")
+        return
+    student_prompt = compile_encoded_prompt(seed_candidate)
+    for item in loader.fetch(train_ids):
+        eval_set_name = str(item["eval_set_name"])
+        eval_set_version = str(item["eval_set_version"])
+        deployment_ids = [str(deployment_id) for deployment_id in item.get("deployment_ids", [])]
+        print(f"[Eval set schedule] Prestarting first-iteration training evals for {eval_set_name}:{eval_set_version}")
+        for role, model, prompt in (
+            ("teacher", teacher_model, _TEACHER_PROMPT_SENTINEL),
+            ("student", student_model, student_prompt),
+        ):
+            eval_id, wait_required = runner.start(
+                model,
+                prompt,
+                eval_set_name,
+                eval_set_version,
+                deployment_ids,
+            )
+            print(f"[Prestart] {role} {eval_set_name}:{eval_set_version} -> {eval_id} (wait={wait_required})")
+
+
+def _val_eval_set_name(args: argparse.Namespace, train_eval_set_name: str) -> str:
+    """Eval set for validation.
+
+    A pinned val set otherwise reuses the training eval set. Automatic customer
+    validation stays on ``Glean Chat V2 Medium`` unless this override is set.
+    """
+    override = getattr(args, "val_eval_set_name", None)
+    if override:
+        return str(override)
+    if args.val_eval_versions:
+        return train_eval_set_name
+    return GLEAN_CHAT_EVAL_SET_NAME
 
 
 def _make_evalset(
@@ -467,28 +559,45 @@ def _resolve_eval_version_split(
     customer_deployments: list[str],
 ) -> tuple[list[str], list[str]]:
     eval_set_name, deployment_ids = evalset_identity(args.experiment)
-    if bool(args.train_eval_versions) != bool(args.val_eval_versions):
-        raise SystemExit("Set both --train_eval_versions and --val_eval_versions, or neither for automatic selection.")
-    if args.train_eval_versions:
-        train_versions = _parse_eval_versions(args.train_eval_versions, argument_name="--train_eval_versions")
+    # TEMP: pinned val versions are scored on data.deployment_ids. This skips the
+    # customer publication check. Delete this branch to restore customer validation.
+    if args.val_eval_versions:
         val_versions = _parse_eval_versions(args.val_eval_versions, argument_name="--val_eval_versions")
-        _require_customer_publication(evalcli, val_versions, customer_deployments)
-    else:
-        rows = evalcli.list_eval_set_versions(eval_set_name=eval_set_name, deployment_ids=deployment_ids)
-        days_back = getattr(args, "eval_version_days_back", 0) or 0
-        as_of = date.today() - timedelta(days=days_back)
-        train_versions = _select_recent_train_versions(
-            rows,
-            as_of=as_of,
-            lookback_days=args.eval_version_lookback_days,
-        )
-        val_versions = _resolve_customer_val_versions(args, evalcli, customer_deployments)
-        as_of_note = f" as of {as_of.isoformat()} ({days_back}d back)" if days_back else ""
+        if args.train_eval_versions:
+            train_versions = _parse_eval_versions(args.train_eval_versions, argument_name="--train_eval_versions")
+        else:
+            rows = evalcli.list_eval_set_versions(eval_set_name=eval_set_name, deployment_ids=deployment_ids)
+            days_back = getattr(args, "eval_version_days_back", 0) or 0
+            as_of = date.today() - timedelta(days=days_back)
+            train_versions = _select_recent_train_versions(
+                rows,
+                as_of=as_of,
+                lookback_days=args.eval_version_lookback_days,
+            )
         print(
-            f"[Eval set schedule] Auto-selected{as_of_note} "
-            f"train versions={','.join(train_versions)} (scio-prod) and "
-            f"val versions={','.join(val_versions)} on {','.join(customer_deployments)}"
+            f"[Eval set schedule] TEMP pinned val versions={','.join(val_versions)} "
+            f"on {','.join(deployment_ids)} from data, not customer deployments"
         )
+        if not 1 <= len(val_versions) <= 2:
+            raise SystemExit("Validation must contain one or two eval versions.")
+        return train_versions, val_versions
+    if args.train_eval_versions:
+        raise SystemExit("Set --val_eval_versions with --train_eval_versions, or neither for automatic selection.")
+    rows = evalcli.list_eval_set_versions(eval_set_name=eval_set_name, deployment_ids=deployment_ids)
+    days_back = getattr(args, "eval_version_days_back", 0) or 0
+    as_of = date.today() - timedelta(days=days_back)
+    train_versions = _select_recent_train_versions(
+        rows,
+        as_of=as_of,
+        lookback_days=args.eval_version_lookback_days,
+    )
+    val_versions = _resolve_customer_val_versions(args, evalcli, customer_deployments)
+    as_of_note = f" as of {as_of.isoformat()} ({days_back}d back)" if days_back else ""
+    print(
+        f"[Eval set schedule] Auto-selected{as_of_note} "
+        f"train versions={','.join(train_versions)} (scio-prod) and "
+        f"val versions={','.join(val_versions)} on {','.join(customer_deployments)}"
+    )
 
     if not 1 <= len(val_versions) <= 2:
         raise SystemExit("Validation must contain one or two eval versions.")
@@ -672,6 +781,8 @@ def _validate_best_candidate_on_customer_eval(
                 run_params=spec.run_params,
                 base_eval_run_id=baseline_eval_id if spec.kind == "pairwise" else None,
                 input_mappings=spec.input_mappings or None,
+                cortex_judge_type=spec.cortex_judge_type,
+                judge_skill_name=spec.judge_skill_name,
             )
             wait_ids.append(judge_run_id)
             judge_run_details.append(f"{spec.name}_judge_run_id={judge_run_id}")
@@ -704,7 +815,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         default=None,
-        help="Experiment YAML path or packaged name (teacher_student, single_model). "
+        help="Experiment YAML path or packaged name (teacher_student, single_model_shell). "
         "YAML supplies defaults; explicit CLI flags override it.",
     )
     parser.add_argument(
@@ -715,17 +826,24 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max_metric_calls", type=int, default=10)
     parser.add_argument("--run_dir", type=Path, default=None)
-    parser.add_argument(
-        "--student_model",
-        default="gpt",
-        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus.",
+    # Keep this short: argparse wraps help text, and a test asserts "(default: X)" stays on one line.
+    model_help = (
+        "gpt, fast, claude_sonnet, claude_opus, gpt6_luna, gpt6_sol, or gpt6_1_sol_high. "
+        "waldo[:PROVIDER:MODEL[:effort]] runs the Waldo router instead."
     )
-    parser.add_argument(
-        "--teacher_model",
-        default="gpt",
-        help="gpt, fast, claude_sonnet (4.6 coding harness), or claude_opus.",
-    )
-    parser.add_argument("--reflection_lm_model", default="OPEN_AI:GPT5_LATEST")
+    parser.add_argument("--student_model", default="gpt", help=model_help)
+    parser.add_argument("--teacher_model", default="gpt", help=model_help)
+    # glean-dev runs on LKS_CUSTOMER_KEY with a LiteLLM custom provider (customV2) since
+    # 2026-09-30; OPEN_AI:* models are not enabled there. CUSTOM:GPT5_6_LUNA is aliased to
+    # gpt-5.1 on that proxy and is the enabled-in-agents model that resolves. Pass
+    # --reflection_lm_model OPEN_AI:GPT5_LATEST when pointing at a Glean-key instance.
+    parser.add_argument("--reflection_lm_model", default="CUSTOM:GPT5_6_LUNA")
+    # Reflection calls the instance's /qe/llm endpoint with a perf-eval secret derived from
+    # qe_project. scio-prod's Cloud Armor policy denies every non-public /qe/ path, including
+    # /qe/llm, for clients outside the IP green list, so a laptop gets an HTML 403 before QE
+    # runs. glean-dev still serves that path; its GCP project is dev-sandbox-334901, and the
+    # secret is the hash of that project id, not the instance name. Evals stay on scio-prod
+    # via data.deployment_ids; these flags are only the reflection client.
     parser.add_argument("--qe_project", default="dev-sandbox-334901")
     parser.add_argument("--qe_instance", default="glean-dev")
     parser.add_argument("--qe_authenticated_email", default="cathy.chen@glean.com")
@@ -799,6 +917,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "(same eval set as the final customer gate).",
     )
     parser.add_argument(
+        "--val_eval_set_name",
+        default=None,
+        help="Eval set for validation. When versions are pinned, defaults to the training eval set; "
+        "otherwise defaults to Glean Chat V2 Medium.",
+    )
+    parser.add_argument(
         "--eval_version_lookback_days",
         type=_nonnegative_int,
         default=14,
@@ -841,6 +965,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "EXECUTION_DISCIPLINE, or individual core-tool keys)."
         ),
     )
+    customer_eval_group = parser.add_mutually_exclusive_group()
+    customer_eval_group.add_argument(
+        "--customer_eval",
+        dest="customer_eval",
+        action="store_true",
+        default=True,
+        help=(
+            "After the search, run the seed and best prompts on the external (customer) eval set and "
+            "enforce objective.validation gates. On by default. YAML: run.customer_eval."
+        ),
+    )
+    customer_eval_group.add_argument(
+        "--no_customer_eval",
+        dest="customer_eval",
+        action="store_false",
+        help="Skip the external eval; the search still runs and the best candidate is still written.",
+    )
     parser.add_argument(
         "--fake_flow",
         action="store_true",
@@ -867,8 +1008,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if experiment is not None and args.judging_mode != experiment.mode:
         raise SystemExit(
             f"--judging_mode {args.judging_mode} conflicts with {experiment.source_path} "
-            f"(mode: {experiment.mode}); its {','.join(experiment.packs)} pack is not scorable in "
-            f"{args.judging_mode} mode"
+            f"(mode: {experiment.mode}); its signals are not scorable in {args.judging_mode} mode"
         )
     return args
 
@@ -884,6 +1024,7 @@ def _format_run_config(
         f"judging_mode={judging_mode}",
         f"student_model={args.student_model}",
         f"teacher_model={args.teacher_model}",
+        f"reflection_lm={args.reflection_lm_model} via {args.qe_instance} project={args.qe_project}",
         f"editable_modules={','.join(editable_modules)}",
         f"seed_candidate={args.seed_candidate}",
         f"run_dir={args.run_dir}",
@@ -894,7 +1035,6 @@ def _format_run_config(
         lines.extend(
             [
                 f"config={experiment.source_path}",
-                f"packs={','.join(experiment.packs) or '(none)'}",
                 f"primary_objective={experiment.primary_objective}",
                 f"frontier_type={experiment.frontier_type}",
                 f"screening={experiment.screening.get('kind')} threshold={experiment.screening.get('threshold')}",
@@ -915,7 +1055,7 @@ def _build_adapter(
         experiment.signals if experiment is not None else None,
         bigquery_client=kwargs.get("bigquery_client"),
         lookback_days=int(kwargs.get("agentspan_lookback_days") or 1),
-        pack=experiment_objective_pack(experiment) if experiment is not None else None,
+        experiment=experiment_objective_spec(experiment) if experiment is not None else None,
     )
     kwargs["objective"] = objective
     if experiment is not None:
@@ -930,6 +1070,7 @@ def _build_adapter(
             kwargs["pointwise_judges"] = pointwise_judges(experiment)
             kwargs["pairwise_judges"] = pairwise_judges(experiment)
             kwargs["screening_kind"] = experiment.screening.get("kind")
+            kwargs["screening_weights"] = screening_weights(experiment)
         return TeacherStudentAdapter(**kwargs, teacher_model=args.teacher_model)
     return SingleModelAdapter(**kwargs)
 
@@ -984,10 +1125,20 @@ def _run_from_args(args: argparse.Namespace) -> None:
     train_versions, val_versions = _resolve_eval_version_split(args, evalcli, customer_deployments)
     eval_set_name, deployment_ids = evalset_identity(experiment)
     trainset = _make_evalset(train_versions, eval_set_name=eval_set_name, deployment_ids=deployment_ids)
+    # TEMP: a pinned val set uses data.deployment_ids. The val eval set defaults to
+    # the training set and can be overridden with data.val_eval_set_name.
+    if args.val_eval_versions:
+        val_set_name = _val_eval_set_name(args, eval_set_name)
+        val_deployment_ids = deployment_ids
+    else:
+        val_set_name = _val_eval_set_name(args, GLEAN_CHAT_EVAL_SET_NAME)
+        val_deployment_ids = customer_deployments
+    if val_set_name != eval_set_name:
+        print(f"[Eval set schedule] train={eval_set_name}; validation={val_set_name}")
     valset = _make_evalset(
         val_versions,
-        eval_set_name=GLEAN_CHAT_EVAL_SET_NAME,
-        deployment_ids=customer_deployments,
+        eval_set_name=val_set_name,
+        deployment_ids=val_deployment_ids,
         validation_only=True,
     )
     cache_file = args.cache_file or _default_cache_file(args.run_dir, ADAPTER_CACHE_FILENAME)
@@ -999,6 +1150,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         cache_file=str(eval_run_cache_file) if eval_run_cache_file else None,
         eval_run_timeout_sec=args.eval_run_timeout_sec,
         eval_run_grace_period_sec=args.eval_run_grace_period_sec,
+        harness=eval_harness(experiment),
     )
     adapter_kwargs = {
         "runner": al_runner,
@@ -1036,9 +1188,20 @@ def _run_from_args(args: argparse.Namespace) -> None:
         "reflect_k": args.reflection_samples,
         "reflection_hamming_distance_k": args.reflection_hamming_distance_k,
         "baseline_prompt_hash": hashlib.md5(json.dumps(seed_candidate, sort_keys=True).encode()).hexdigest(),
-        "evalset_policy": UnseenEvalSetPolicy(state_file=evalset_schedule_file),
         "children_cache_file": children_cache_file,
     }
+    evalset_policy = UnseenEvalSetPolicy(state_file=evalset_schedule_file)
+    if judging_mode == "teacher_student":
+        _prestart_first_iteration_training(
+            runner=al_runner,
+            policy=evalset_policy,
+            trainset=trainset,
+            seed_candidate=seed_candidate,
+            student_model=args.student_model,
+            teacher_model=args.teacher_model,
+            run_dir=args.run_dir,
+        )
+    proposer_kwargs["evalset_policy"] = evalset_policy
     if experiment is not None:
         offspring_count = experiment.search.get("offspring_count")
         if offspring_count is not None:
@@ -1060,6 +1223,13 @@ def _run_from_args(args: argparse.Namespace) -> None:
         frontier_type=cast(FrontierType, adapter.default_frontier_type),
     )
     best_candidate = result.best_candidate
+    if not args.customer_eval:
+        log_section(
+            "CUSTOMER EVAL",
+            "Skipped: customer_eval is off (run.customer_eval / --no_customer_eval). "
+            "Best candidate was not validated against objective.validation gates.",
+        )
+        return
     if not isinstance(best_candidate, dict):
         raise SystemExit("Customer eval requires a dict prompt candidate")
     _validate_best_candidate_on_customer_eval(

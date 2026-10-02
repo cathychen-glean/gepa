@@ -5,7 +5,7 @@ This is a short handoff guide for the `glean_gepa` integration.
 ## Target architecture
 
 ```text
-CLI / experiment setup (`runner.py`)
+CLI / experiment setup (`runner.py`, `--config configs/<experiment>.yaml`)
         |
         v
 GEPA engine wiring (`api.py`)
@@ -69,16 +69,33 @@ Keep evaluation behavior stable while changing the surrounding code. Do not simu
 ## Customer eval after optimization
 
 When a real (non-`--fake_flow`) run finishes, `runner.py` runs the seed baseline
-and best candidate on the same **Glean Chat V2 Medium** customer entries. The
-eval-set **version is not configured**: EvalCLI is queried at runtime, and the
-newest `YYYYMMDD` version available to every configured customer is used.
+and best candidate on the validation set and enforces the `objective.validation`
+gates from the experiment YAML (judge metrics with a `min`). A failed gate exits
+the run unsuccessfully. These evals do not feed the search.
 
-The best run is judged for pairwise correctness against the baseline. The
-held-out check passes only when correctness is above 80% and the EvalCLI paired
-comparison finds no statistically significant change (Benjamini-Hochberg
-adjusted `p >= 0.05`) in average cost, average loops, or any tool invocation
-rate. A failed gate exits the run unsuccessfully. These evals do not feed the
-search.
+**Toggle.** `run.customer_eval: false` in the YAML, or `--no_customer_eval` on
+the CLI, skips this step. The search still runs and the best candidate is still
+written; the log records that the gates were not enforced. The CLI flag wins over
+the YAML (`--customer_eval` re-enables it). Default is on. Use this while external
+(customer) deployments are unavailable.
+
+**Where validation runs.** Two paths, chosen by whether `data.val_eval_versions`
+is set:
+
+- *Unpinned* (no `val_eval_versions`): the runner samples customer deployments
+  from the pool, persists the sample in `<run_dir>/cache/glean_customer_deployments.json`,
+  and picks the `val_version_count` newest **Glean Chat V2 Medium** versions fully
+  published to that sample. In-loop validation evals then run on those customer
+  deployments. This path needs external evals.
+- *Pinned* (`val_eval_versions: [YYYYMMDD]`): validation is scored on
+  `data.deployment_ids` (normally `scio-prod`) with `data.val_eval_set_name`
+  (defaults to the training set). Set `train_eval_versions` too so train and val
+  are disjoint; otherwise training is every `scio-prod` version in the
+  `lookback_days` window. One or two val versions are allowed. Use this path when
+  customer deployments are off.
+
+`customer_eval: false` only skips the post-search gate. It does not change which
+path the in-loop validation set uses; pin `val_eval_versions` for that.
 
 ## Reflection sampling CLI
 
@@ -98,6 +115,57 @@ uv run python -m glean_gepa.runner \
   --reflection_hamming_distance_k 10
 ```
 
+## Experiment YAML (`configs/*.yaml`)
+
+Each file under `src/glean_gepa/configs/` is one complete experiment. There is
+no inheritance or pack merging: the `signals`, `objective`, `screening`, and
+`reflection` sections in the file are the whole experiment. A `packs:` key fails
+the load. Run one with `--config <stem>` (or a path); CLI flags override YAML.
+
+```bash
+uv run python -m glean_gepa.runner --config teacher_student_waldo
+uv run python -m glean_gepa.runner --config single_model_shell --max_metric_calls 4
+```
+
+Shipped experiments:
+
+| File | Mode | Primary | Notes |
+|---|---|---|---|
+| `single_model_shell.yaml` | single_model | `shell_success_rate` | Loops variant (`loop_efficiency`) shown in comments. |
+| `teacher_student.yaml` | teacher_student | `agentic_preference_rate` | Pairwise AGENTIC_JUDGE vs the teacher; screens on the same judge. |
+| `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match; citations variant (`citation_match`) in comments. Weighted screen. |
+| `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
+| `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
+
+Sections:
+
+- `signals` -- every metric the run scores or reports. `source` is a telemetry
+  source registered for the mode in `objectives/registry.py` (`tool_match`,
+  `citation_match`, `agentic_preference`; `shell_telemetry`, `loop_telemetry`),
+  `cortex_judge` (with `type` and `kind`), or `constant`. Names must be unique.
+  A telemetry source not registered for the file's `mode` fails the load.
+- `objective` -- `primary` (parent selection; must be scorable), `composite`
+  (weights summing to 1; every name must be scorable), `frontier_type`,
+  `focused_bucket_type`, `params` (objective knobs such as `skipped_tools`,
+  `failure_score_below`), and `validation` (judge-metric floors for the
+  post-search customer eval).
+- `screening` -- the focused child gate. `kind: high_signal_fix_rate` with
+  `threshold` and `high_signal`; `kind: correctness_floor`; `kind: none`; or
+  `weights` for a blend of summary metrics. A judge named only in `weights`
+  is still started.
+- `reflection` -- `editable_modules`, `failure_label`, `report_title`, and
+  per-module prompt overrides under `modules.<KEY>`.
+- `run`, `models`, `data`, `search` -- runner defaults (`run.customer_eval`,
+  `data.train_eval_versions`, `data.val_eval_versions`, ...) that CLI flags override.
+- `eval` -- eval-run creation overrides: `runner_type` and `sc_params`
+  (string or list of `key=value`; the Waldo config uses `GLEAN_CHAT` and the
+  production Waldo harness params).
+
+In teacher_student mode, pairwise judges run on full-train and validation evals.
+On a focused screen slice only the judges the screen reads are started: the
+pairwise primary, or anything named in `screening.weights`. A telemetry primary
+with a plain fix-rate screen starts no judge on the slice.
+
 ## Implementation rules
 
 1. Select the concrete adapter explicitly in `runner.py`; keep each adapter free of branches for the other evaluation path.
@@ -107,6 +175,7 @@ uv run python -m glean_gepa.runner \
 5. Preserve the distinction between a selection score and reflection diagnostics. Scores choose candidates; traces, error strings, and per-entry data explain what to edit.
 6. Cache keys must include every result-changing input: eval-set identity/version, model, prompt hash, and run label. Keep fresh eval-set cache behavior explicit.
 7. Every extraction step gets characterization tests before cleanup. Remote EvalCLI/BigQuery runs are smoke tests, not unit tests.
+8. A cached eval run is reused only when Cortex reports it `usable`: every task terminal, or succeeded+failed more than 9x the unfinished remainder. A run whose cancelled tasks are at least its finished tasks (someone killed it) is `missing` and is dropped from `glean_eval_run_cache.json` and relaunched. Cancelling an eval therefore needs no manual cache edit; restarting the runner recreates it.
 
 ## Adding an objective
 
@@ -163,8 +232,8 @@ template marks where each goes.
 | File | What goes there |
 |---|---|
 | `objectives/<signal>.py` | The copied template. One file: types, parsing, source, feedback, class. |
-| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string a pack YAML uses to select you. |
-| `configs/packs/<pack>.yaml` | A pack that names your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `loops.yaml`. |
+| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string an experiment YAML's `signals[].source` uses to select you. |
+| `configs/<experiment>.yaml` | A self-contained experiment that declares a signal with your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `single_model_shell.yaml` or `teacher_student.yaml`. |
 | `tests/test_<signal>_objective.py` | At least the contract test (below), a scoring test, and a reflective-example test. |
 
 Do not touch the adapters, `base.py`, `protocol.py`, or anything under
@@ -173,7 +242,7 @@ Do not touch the adapters, `base.py`, `protocol.py`, or anything under
 ### Class attributes
 
 ```python
-name = "loop_efficiency"                 # objective score key; also the pack signal name
+name = "loop_efficiency"                 # objective score key; also the signal name in the experiment YAML
 telemetry_dimensions = ("loop_efficiency",)
 focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
 failure_label = "HIGH-SIGNAL FAILURES (extra loops)"
@@ -211,7 +280,7 @@ Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 - Every score is higher-is-better in `[0.0, 1.0]`. `scored_rows_are_normalized`
   in `protocol.py` rejects anything else.
 - `objective_scores` in each row must contain `self.name`. Extra keys are fine;
-  the pack decides which ones enter the composite.
+  the experiment YAML's `objective.composite` decides which ones enter the composite.
 - Provisional results (telemetry not yet ingested) return an analysis whose
   aggregate reports `0` entries. `is_pending` sees that and the adapter retries.
 
@@ -267,7 +336,7 @@ and `agentic_preference.py` (no SQL, no aggregate on the frame).
 - [ ] `analyze` goes through the shared cache helper.
 - [ ] `build_reflective_example` goes through `self.reflective_example`.
 - [ ] `ObjectiveSpec` added; `uv run pytest tests/test_objectives_catalog.py` passes.
-- [ ] Pack YAML added; `uv run pytest tests/test_experiment_config.py` passes.
+- [ ] Experiment YAML added or extended; `uv run pytest tests/test_experiment_config.py` passes.
 - [ ] `uv run ruff check src/ && uv run pyright src/` clean.
 
 ## Children cache (`glean_children_cache.json`)

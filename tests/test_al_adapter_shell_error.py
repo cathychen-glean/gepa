@@ -274,6 +274,88 @@ def test_proposals_that_drop_a_render_slot_are_rejected():
     assert "{RULES_EXT}" in prompts[0]
 
 
+def test_empty_module_variants_are_bounded_by_the_patches_not_the_token_budget():
+    """Two patches for an empty RULES_EXT must not come back as a seven-topic rulebook."""
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"RULES_EXT": ""},
+        module_specs={"RULES_EXT": ModuleSpec("RULES_EXT", "free_text", 512)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    patch_a = "- After writing or editing a file, re-open it and quote only the changed region."
+    patch_b = "- Update the existing artifact instead of creating a new file."
+    diagnosis = (
+        "DIAGNOSIS:\n- unverified edit claims: 6 of 25 LOSS examples\n- new-file drift: 4 of 25\n"
+        f"PATCHES:\nBEFORE:\n[empty]\nAFTER:\n{patch_a}\nWHY: a\n\nBEFORE:\n[empty]\nAFTER:\n{patch_b}\nWHY: b"
+    )
+    tight = f"{patch_a}\n{patch_b}"
+    sprawl = "\n".join(f"- {topic}: " + "x" * 150 for topic in ("Artifact", "Claims", "Calibration", "Data", "Access"))
+    assert len(sprawl) < 512 * 4  # would have passed the old token-budget filter
+    prompts: list[str] = []
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return diagnosis if len(prompts) == 1 else f"{sprawl}\n===VARIANT===\n{tight}"
+
+    variants, _, _ = adapter.propose_new_texts(reflection_lm, candidate, ["RULES_EXT"], [])
+
+    assert variants == [tight]
+    assert "write 2 rules, one per AFTER snippet" in prompts[1]
+    assert "each variant applies those patches and nothing else" in prompts[1]
+
+
+def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
+    """A rewrite in place of a diagnosis is re-requested once, and the tally reaches the consolidation pass."""
+    current = (
+        "- Resolve the request in as few tool loops as possible while ensuring accuracy. "
+        "Do not follow up for minor doubts; ask only when a missing detail would change the deliverable. "
+        "Deliver a best-effort answer and state assumptions when the request is answerable. "
+        "Do not offer optional next steps unless the user asked for options. "
+        "Keep the final message focused on the result rather than the process you followed."
+    )
+    rewrite = current.replace("Do not follow up for minor doubts", "Never ask a follow-up question")
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"EXECUTION_DISCIPLINE": current},
+        module_specs={"EXECUTION_DISCIPLINE": ModuleSpec("EXECUTION_DISCIPLINE", "free_text", 1024)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    prompts: list[str] = []
+    replies = [
+        rewrite,
+        "DIAGNOSIS:\n- asks in prose: 4 of 6 LOSS examples\nPATCHES:\nBEFORE: Do not follow up\nAFTER: Deliver\nWHY: w",
+        rewrite,
+    ]
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    variants, _, diagnosis = adapter.propose_new_texts(reflection_lm, candidate, ["EXECUTION_DISCIPLINE"], [])
+
+    assert len(prompts) == 3
+    assert prompts[1].startswith("IMPORTANT: a previous attempt")
+    assert prompts[1].endswith(prompts[0])
+    assert "DIAGNOSIS (failure-mode tally from the first pass):\n- asks in prose: 4 of 6 LOSS examples" in prompts[2]
+    assert "SUGGESTIONS:\nBEFORE: Do not follow up" in prompts[2]
+    assert diagnosis.startswith("- asks in prose: 4 of 6 LOSS examples")
+    assert variants == [rewrite]
+
+
 def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     evalcli = EvalCliClient(binary="/fake/evalcli")
     adapter = SingleModelAdapter(

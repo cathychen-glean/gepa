@@ -36,11 +36,8 @@ REFLECTION_EVIDENCE_LIMIT = EVIDENCE_LIMIT
 # The catalog and registry live in ``glean_gepa.objectives.registry``. These
 # names are kept so existing imports keep working; they read from that module.
 TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = _registry._REGISTRY
-MODE_DEFAULT_PACK: dict[JudgingMode, str] = {
-    spec.mode: spec.default_pack for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
-}
 MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
-    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default_pack
+    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default
 }
 
 
@@ -146,15 +143,15 @@ def module_responsibility(
     return DEFAULT_MODULE_RESPONSIBILITY
 
 
-class PackConfigurable:
-    """Pack YAML knobs overlaid onto an objective instance after construction."""
+class ExperimentConfigurable:
+    """Experiment YAML knobs overlaid onto an objective instance after construction."""
 
     params: dict[str, Any]
     # Set from ``screening.high_signal`` and ``signals[].name`` by ``configure_objective``.
     high_signal: str | None = None
     signal_names: tuple[str, ...] = ()
 
-    def pack_param(self, key: str, default: Any) -> Any:
+    def experiment_param(self, key: str, default: Any) -> Any:
         return (getattr(self, "params", None) or {}).get(key, default)
 
     def format_reflective_metrics(self, metrics: ReflectiveExampleMetrics) -> str | None:
@@ -185,7 +182,7 @@ class PackConfigurable:
         """Score plus each signal this run is configured to report.
 
         The objective's own metric is always included. Any other ``signals.name``
-        from the pack YAML, such as a pairwise correctness judge, is included
+        from the experiment YAML, such as a pairwise correctness judge, is included
         only when that trajectory actually scored it.
         """
         from glean_gepa.al_adapter import ReflectiveExampleMetrics
@@ -218,6 +215,7 @@ class PackConfigurable:
         generated: Mapping[str, Any] | None = None,
         action_inputs: Sequence[str] = (),
         execution_errors: Sequence[str] = (),
+        action_input_limit: int | None = None,
     ) -> ReflectiveExample:
         """Assemble one ``ReflectiveExample`` from the parts an objective decides.
 
@@ -251,7 +249,7 @@ class PackConfigurable:
         return {
             "Inputs": inputs,
             "Generated Outputs": outputs,
-            "Action Inputs": list(action_inputs)[:REFLECTION_EVIDENCE_LIMIT],
+            "Action Inputs": list(action_inputs)[: action_input_limit or REFLECTION_EVIDENCE_LIMIT],
             "Execution Errors": list(execution_errors)[:REFLECTION_EVIDENCE_LIMIT],
             "Feedback": feedback,
             "Metrics": self.reflective_metrics(trajectory),
@@ -285,14 +283,14 @@ class PackConfigurable:
         )
 
 
-def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
-    """Apply pack YAML knobs. Class attributes stay the unconfigured defaults."""
+def configure_objective(objective: Any, experiment: Mapping[str, Any] | None) -> None:
+    """Apply experiment YAML knobs. Class attributes stay the unconfigured defaults."""
     if not hasattr(objective, "params"):
         objective.params = {}
-    if not pack:
+    if not experiment:
         return
-    objective_cfg = pack.get("objective") or {}
-    reflection = pack.get("reflection") or {}
+    objective_cfg = experiment.get("objective") or {}
+    reflection = experiment.get("reflection") or {}
     bucket = objective_cfg.get("focused_bucket_type")
     if bucket is not None:
         from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
@@ -315,18 +313,18 @@ def configure_objective(objective: Any, pack: Mapping[str, Any] | None) -> None:
         base = dict(getattr(type(objective), "module_responsibilities", {}) or {})
         base.update({str(name): str(text) for name, text in modules.items()})
         objective.module_responsibilities = base
-    screening = pack.get("screening") or {}
+    screening = experiment.get("screening") or {}
     high_signal = screening.get("high_signal")
     if high_signal:
         objective.high_signal = str(high_signal)
-    signals = pack.get("signals")
+    signals = experiment.get("signals")
     if isinstance(signals, Sequence) and not isinstance(signals, str | bytes):
         objective.signal_names = tuple(
             str(signal["name"]) for signal in signals if isinstance(signal, Mapping) and signal.get("name")
         )
 
 
-class TeacherStudentObjective(PackConfigurable, ABC, Generic[AnalysisT]):
+class TeacherStudentObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     """Paired teacher-vs-student trace comparison."""
 
     name: str
@@ -583,16 +581,12 @@ class TeacherStudentObjective(PackConfigurable, ABC, Generic[AnalysisT]):
         candidate: dict[str, str],
     ) -> ReflectiveExample: ...
 
-    def high_signal_core_tool_keys(self, trajectories: Sequence[Any] | None) -> list[str]:
-        del trajectories
-        return []
-
 
 class TelemetryPendingError(RuntimeError):
     """Raised when an eval has no scorable telemetry yet; callers should retry, not score 0/0."""
 
 
-class SingleModelObjective(PackConfigurable, ABC, Generic[AnalysisT]):
+class SingleModelObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     """Student-only BigQuery / agentspan metric."""
 
     name: str
@@ -798,9 +792,9 @@ def build_objective(
     *,
     bigquery_client: Any | None = None,
     lookback_days: int = 1,
-    pack: Mapping[str, Any] | None = None,
+    experiment: Mapping[str, Any] | None = None,
 ) -> TeacherStudentObjective | SingleModelObjective:
-    """Construct the telemetry objective registered for ``mode`` and the pack source."""
+    """Construct the telemetry objective registered for ``mode`` and the first scorable signal's source."""
     source = _registry.default_source(mode)
     if signals:
         for signal in signals:
@@ -812,12 +806,11 @@ def build_objective(
                 break
     cls = _registry.resolve(mode, source)
     objective = cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
-    configure_objective(objective, pack)
+    configure_objective(objective, experiment)
     return objective
 
 
 __all__ = [
-    "MODE_DEFAULT_PACK",
     "MODE_DEFAULT_TELEMETRY_SOURCE",
     "ScoredRow",
     "SingleModelObjective",

@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 from glean_gepa.objectives.utils.action_input_trace import (
     fetch_action_inputs_by_entry,
     fetch_first_tool_inputs_by_entry,
+    fetch_named_tool_inputs_by_entry,
     trace_locators_for_rows,
 )
 from glean_gepa.objectives.utils.core import EVIDENCE_LIMIT
@@ -39,6 +40,7 @@ def enrich_action_inputs(
     roles: Sequence[str] = ("student",),
     paired_columns: bool | None = None,
     first_tool_only: bool = False,
+    named_pairs: bool = False,
     skip_tools: frozenset[str] = frozenset(),
     limit: int | None = EVIDENCE_LIMIT,
 ) -> dict[str, M]:
@@ -65,10 +67,12 @@ def enrich_action_inputs(
         locators = trace_locators_for_rows(rows, entry_ids=wanted, role=role if use_role_columns else None)
         if not locators:
             continue
-        if first_tool_only:
-            result: Mapping[str, Any] = fetch_first_tool_inputs_by_entry(
-                evalcli, locators, skip_tools=skip_tools, role_label=role
+        if named_pairs:
+            result: Mapping[str, Any] = fetch_named_tool_inputs_by_entry(
+                evalcli, locators, skip_tools=skip_tools, limit=limit, role_label=role
             )
+        elif first_tool_only:
+            result = fetch_first_tool_inputs_by_entry(evalcli, locators, skip_tools=skip_tools, role_label=role)
         else:
             result = fetch_action_inputs_by_entry(
                 evalcli, locators, skip_tools=skip_tools, limit=limit, role_label=role

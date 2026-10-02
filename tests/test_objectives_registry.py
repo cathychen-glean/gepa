@@ -32,29 +32,30 @@ def test_build_objective_defaults_to_the_builtin_source_for_each_mode():
     assert isinstance(single_model, ShellSuccessObjective)
 
 
+_DUMMY_EXPERIMENT = (
+    "schema_version: 1\n"
+    "mode: teacher_student\n"
+    "signals:\n"
+    "  - name: dummy_alignment\n"
+    "    source: dummy_trace\n"
+    "objective:\n"
+    "  primary: dummy_alignment\n"
+    "  composite:\n"
+    "    dummy_alignment: 1.0\n"
+)
+
+
 def test_a_second_registered_source_is_constructible(tmp_path):
     # A bare stub; skip contract validation so this test only covers config wiring.
     register_telemetry_source("teacher_student", "dummy_trace", _DummyTeacherStudentObjective, validate=False)
     try:
         assert is_registered_telemetry_source("teacher_student", "dummy_trace")
-        packs = tmp_path / "packs"
-        packs.mkdir()
-        (packs / "dummy.yaml").write_text(
-            "signals:\n"
-            "  - name: dummy_alignment\n"
-            "    source: dummy_trace\n"
-            "objective:\n"
-            "  primary: dummy_alignment\n"
-            "  composite:\n"
-            "    dummy_alignment: 1.0\n"
-        )
         mode = tmp_path / "mode.yaml"
-        mode.write_text("schema_version: 1\nmode: teacher_student\npacks: [dummy]\n")
+        mode.write_text(_DUMMY_EXPERIMENT)
 
         config = load_experiment_config(mode)
         objective = build_objective("teacher_student", config.signals, bigquery_client=MagicMock())
 
-        assert config.packs == ("dummy",)
         assert config.primary_objective == "dummy_alignment"
         assert isinstance(objective, _DummyTeacherStudentObjective)
     finally:
@@ -62,19 +63,8 @@ def test_a_second_registered_source_is_constructible(tmp_path):
 
 
 def test_unregistered_second_source_still_fails_the_load(tmp_path):
-    packs = tmp_path / "packs"
-    packs.mkdir()
-    (packs / "dummy.yaml").write_text(
-        "signals:\n"
-        "  - name: dummy_alignment\n"
-        "    source: dummy_trace\n"
-        "objective:\n"
-        "  primary: dummy_alignment\n"
-        "  composite:\n"
-        "    dummy_alignment: 1.0\n"
-    )
     mode = tmp_path / "mode.yaml"
-    mode.write_text("schema_version: 1\nmode: teacher_student\npacks: [dummy]\n")
+    mode.write_text(_DUMMY_EXPERIMENT)
 
-    with pytest.raises(ExperimentConfigError, match="cannot score pack"):
+    with pytest.raises(ExperimentConfigError, match="cannot score signal"):
         load_experiment_config(mode)

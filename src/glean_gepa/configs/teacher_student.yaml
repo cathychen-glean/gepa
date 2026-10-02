@@ -1,14 +1,14 @@
 # Teacher-student experiment with pairwise agentic preference as the primary.
 #
-# The agentic pack supplies the scored signal, objective.primary, and the
-# high-signal screen (AGENTIC_JUDGE on teacher-preferred rows). Signals below
-# are merged with the pack's by name; objective/screening keys below override
-# the pack's.
-
+# This file is self-contained. `signals`, `objective`, `screening`, and
+# `reflection` below are the full experiment; nothing is merged in from elsewhere.
+#
+# Do not declare a same-named cortex_judge for agentic_preference_rate: the adapter
+# unions AGENTIC_JUDGE from JUDGE_SPECS when this objective is selected. Screening
+# reuses that judge on the teacher-preferred high-signal slice.
 
 schema_version: 1
 mode: teacher_student
-packs: [agentic]
 
 run:
   dir: run_ts_agentic
@@ -28,13 +28,31 @@ data:
   days_back: 0
   val_version_count: 2
 
+signals:
+  - name: agentic_preference_rate
+    source: agentic_preference
+    lookback_days: 7
+
 objective:
+  primary: agentic_preference_rate
   frontier_type: objective
   composite:
     agentic_preference_rate: 1.0
+  focused_bucket_type: QUERY_CANONICAL
   validation:
     - metric: agentic_preference_rate
       min: 0.50
+
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.449
+  high_signal: agentic_preference_rate
+
+reflection:
+  editable_modules: [RULES_EXT, EXECUTION_DISCIPLINE, CORE_TOOLS]
+  failure_label: "REFLECTION EXAMPLES (teacher-preferred LOSS and student-preferred KEEP)"
+  report_title: "REFLECTION: teacher vs student agentic preference"
+  # Override module reflection prompts with modules.<KEY>.
 
 search:
   offspring_count: 5

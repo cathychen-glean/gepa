@@ -10,7 +10,6 @@ new one. This package re-exports the base API so
 from __future__ import annotations
 
 from glean_gepa.objectives.base import (
-    MODE_DEFAULT_PACK,
     MODE_DEFAULT_TELEMETRY_SOURCE,
     TELEMETRY_SOURCES,
     AnalysisDetail,
@@ -29,7 +28,6 @@ from glean_gepa.objectives.base import (
 )
 
 __all__ = [
-    "MODE_DEFAULT_PACK",
     "MODE_DEFAULT_TELEMETRY_SOURCE",
     "AnalysisDetail",
     "AnalysisRequest",

@@ -17,7 +17,7 @@ Which template?
 Copy to ``objectives/<signal>.py`` and fill every ``TODO``. There is no SQL,
 no shard window, and no trace hydration. The file is importable and
 pyright-clean as-is. Nothing here is registered; add an ``ObjectiveSpec`` to
-``objectives/registry.py`` and a pack YAML when ready.
+``objectives/registry.py`` and a signal to an experiment YAML when ready.
 
 Three decisions, top to bottom:
 
@@ -44,7 +44,7 @@ from glean_gepa.objectives.base import AnalysisRequest, ScoredRow, ScoringContex
 from glean_gepa.objectives.utils.core import RunAnalysis, build_analysis, empty_analysis, log_analysis, pass_rate
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 
-# TODO: the score key. Also the signal name in the pack YAML.
+# TODO: the score key. Also the signal name in the experiment YAML.
 EXAMPLE_OBJECTIVE = "example_rate"
 
 
@@ -196,7 +196,7 @@ class ExampleObjective(SingleModelObjective[ExampleAnalysis]):
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name
         score = trajectory.get("objective_scores", {}).get(self.name, 1.0)
-        return (int(score < float(self.pack_param("failure_score_below", 1.0))),)
+        return (int(score < float(self.experiment_param("failure_score_below", 1.0))),)
 
     def build_reflective_example(
         self, component_name: str, trajectory: SingleModelALTrajectory, candidate: dict[str, str]

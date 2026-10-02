@@ -860,7 +860,7 @@ class ShellSuccessObjective(SingleModelObjective[EvalRunShellToolErrorAnalysis])
         output = trajectory["output"]
         shell_success_rate = trajectory.get("objective_scores", {}).get(self.name, 1.0)
         return (
-            int(shell_success_rate < float(self.pack_param("failure_score_below", 0.9))),
+            int(shell_success_rate < float(self.experiment_param("failure_score_below", 0.9))),
             int(output.get("student_tool_errors", 0) > 0),
             len(output.get("shell_error_messages", [])),
         )

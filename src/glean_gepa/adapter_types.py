@@ -16,9 +16,30 @@ class PointwiseJudge(NamedTuple):
 
 class PairwiseJudge(NamedTuple):
     name: str
+    #: Adapter-side key for caching and dedupe. Usually the Cortex judge type.
     judge_type: str
     run_params: str
     input_mappings: str
+    #: Judge type sent to Cortex when it differs from ``judge_type``. Several
+    #: judges (e.g. the agentic multi-dimension and correctness-only skills) share
+    #: Cortex type AGENTIC_JUDGE and differ only by ``judge_skill_name``.
+    cortex_type_override: str | None = None
+    judge_skill_name: str | None = None
+
+    @property
+    def cortex_judge_type(self) -> str:
+        return self.cortex_type_override or self.judge_type
+
+
+class EvalHarness(NamedTuple):
+    """Per-experiment overrides for eval-run creation (the ``eval:`` config section).
+
+    ``runner_type`` is the EvalCLI ``--runner-type`` (e.g. ``GLEAN_CHAT``). ``sc_params``
+    replaces the model alias's base harness preset when set. ``None`` uses the alias default.
+    """
+
+    runner_type: str | None = None
+    sc_params: str | None = None
 
 
 class EvalSetALDataInst(TypedDict):
@@ -98,8 +119,16 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     teacher_citations: NotRequired[list[str]]
     student_action_inputs: NotRequired[list[str]]
     teacher_action_inputs: NotRequired[list[str]]
-    student_first_tool_input: NotRequired[list[str]]
-    teacher_first_tool_input: NotRequired[list[str]]
+    student_tool_inputs: NotRequired[list[list[str]]]
+    teacher_tool_inputs: NotRequired[list[list[str]]]
+    student_trace_id: NotRequired[str]
+    teacher_trace_id: NotRequired[str]
+    student_deployment_id: NotRequired[str]
+    teacher_deployment_id: NotRequired[str]
+    student_min_start_ms: NotRequired[int]
+    student_max_start_ms: NotRequired[int]
+    teacher_min_start_ms: NotRequired[int]
+    teacher_max_start_ms: NotRequired[int]
     agentic_preference_rate: NotRequired[float]
     agentic_preference_rate_feedback: NotRequired[str]
 

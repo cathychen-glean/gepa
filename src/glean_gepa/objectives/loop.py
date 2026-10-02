@@ -1,16 +1,15 @@
-"""Loop-efficiency objective: reward a single model for answering in few agent loops.
+"""Loop objective: reward a single model for using fewer agent loops.
 
-Score per entry is ``1 / (1 + extra_loops)`` where ``extra_loops`` is how many
-loops the student used beyond ``target_loop_count`` (pack param, default 2).
-A direct answer or one within the cap scores 1.0. The run-level score is the
-mean over entries.
+Score per entry is ``1 / (1 + loop_count)``. Zero loops scores 1.0, and every
+additional loop strictly lowers the score. There is no target cap. The
+run-level score is the mean over entries.
 
 Layout, top to bottom: the entry and aggregate types, row parsing, the
 ``eval_spans`` SQL, the fetch (with the EvalCLI overlay that prefers the eval's
-own ``loopCount`` / CORRECTNESS), then the objective class that maps the
-analysis onto the contract in :mod:`glean_gepa.objectives.protocol`. Shared
-plumbing (bounds query, shard window, trace enrichment, frame) comes from
-``objectives/utils``."""
+own ``loopCount``), then the objective class that maps the analysis onto the
+contract in :mod:`glean_gepa.objectives.protocol`. Shared plumbing (bounds
+query, shard window, trace enrichment, frame) comes from ``objectives/utils``.
+"""
 
 from __future__ import annotations
 
@@ -38,9 +37,11 @@ from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.reflection_prompts import CONDITIONAL_PRESERVE_RULE
 
 LOOP_EFFICIENCY_OBJECTIVE = "loop_efficiency"
-# 1.0 when the student finishes in this many loops or fewer. Extra loops decay
-# as 1 / (1 + extra).
-TARGET_LOOP_COUNT = 2
+
+
+def loop_score(loop_count: int) -> float:
+    """``1 / (1 + loop_count)``. Zero loops is 1.0; each loop lowers the score."""
+    return 1.0 / (1.0 + max(0, loop_count))
 
 
 # ---------------------------------------------------------------------------
@@ -52,20 +53,16 @@ TARGET_LOOP_COUNT = 2
 class LoopCountEntryMetrics:
     entry_id: str
     loop_count: int
-    correctness: float
-    has_error: bool
     action_inputs: tuple[str, ...] = ()
-    target_loops: int = TARGET_LOOP_COUNT
 
     @property
     def loop_efficiency(self) -> float:
-        """Higher-is-better score: 1.0 at or below the loop cap, decaying as loops grow."""
-        extra = max(0, self.loop_count - self.target_loops)
-        return 1.0 / (1.0 + extra)
+        """Higher-is-better score. Every loop lowers it."""
+        return loop_score(self.loop_count)
 
     @property
     def passed(self) -> bool:
-        return self.loop_efficiency >= 1.0
+        return self.loop_count <= 0
 
     @property
     def score(self) -> float:
@@ -75,10 +72,8 @@ class LoopCountEntryMetrics:
 @dataclass(frozen=True)
 class LoopCountMetrics:
     compared_entries: int
-    matching_entries: int
     mean_loop_count: float
     loop_efficiency: float
-    mean_correctness: float
 
 
 class EvalRunLoopCountAnalysis(RunAnalysis[LoopCountMetrics, LoopCountEntryMetrics]):
@@ -93,37 +88,18 @@ class EvalRunLoopCountAnalysis(RunAnalysis[LoopCountMetrics, LoopCountEntryMetri
 # ---------------------------------------------------------------------------
 
 
-def loop_count_entry_from_cache(
-    entry_id: str, metrics: Mapping[str, Any], *, target_loops: int
-) -> LoopCountEntryMetrics:
+def loop_count_entry_from_cache(entry_id: str, metrics: Mapping[str, Any]) -> LoopCountEntryMetrics:
     return LoopCountEntryMetrics(
         entry_id=str(metrics.get("entry_id") or entry_id),
         loop_count=int(metrics.get("loop_count") or 0),
-        correctness=float(metrics.get("correctness") or 0.0),
-        has_error=bool(metrics.get("has_error")),
         action_inputs=tuple(metrics.get("action_inputs") or ()),
-        target_loops=target_loops,
     )
 
 
-def parse_loop_count_entry_metrics(
-    row: Mapping[str, Any], *, target_loops: int = TARGET_LOOP_COUNT
-) -> LoopCountEntryMetrics:
-    loop_count = int(row.get("loop_count") or 0)
-    has_error = bool(row.get("has_error"))
-    raw_correctness = row.get("correctness")
-    if raw_correctness is None:
-        correctness = 0.0 if has_error else 1.0
-    else:
-        correctness = float(raw_correctness)
-        if has_error:
-            correctness = min(correctness, 0.0)
+def parse_loop_count_entry_metrics(row: Mapping[str, Any]) -> LoopCountEntryMetrics:
     return LoopCountEntryMetrics(
         entry_id=str(row.get("entry_id") or ""),
-        loop_count=loop_count,
-        correctness=correctness,
-        has_error=has_error,
-        target_loops=target_loops,
+        loop_count=int(row.get("loop_count") or 0),
     )
 
 
@@ -131,10 +107,8 @@ def aggregate_loop_count_metrics(per_entry: Mapping[str, LoopCountEntryMetrics])
     compared = len(per_entry)
     return LoopCountMetrics(
         compared_entries=compared,
-        matching_entries=sum(1 for m in per_entry.values() if m.passed),
         mean_loop_count=(sum(m.loop_count for m in per_entry.values()) / compared) if compared else 0.0,
         loop_efficiency=mean_score(per_entry),
-        mean_correctness=(sum(m.correctness for m in per_entry.values()) / compared) if compared else 0.0,
     )
 
 
@@ -156,10 +130,6 @@ WITH eval_spans AS (
   SELECT
     {EVAL_ENTRY_ID_EXPR} AS entry_id,
     {EXECUTE_ACTION_FILTER} AS is_loop,
-    (
-      jsonPayload.action.execution_status = 'ERROR'
-      OR jsonPayload.span_info.execution_status.code = 'ERROR'
-    ) AS is_error,
     jsonPayload.context.agent_trace.trace_id AS trace_id,
     resource.labels.project_id AS deployment_id,
     SAFE_CAST(jsonPayload.span_info.start_end_timestamps.start_time_millis AS INT64) AS start_ms
@@ -170,7 +140,6 @@ WITH eval_spans AS (
 SELECT
   entry_id,
   COUNTIF(is_loop) AS loop_count,
-  COUNTIF(is_error) > 0 AS has_error,
   ANY_VALUE(trace_id) AS trace_id,
   ANY_VALUE(deployment_id) AS deployment_id,
   MIN(start_ms) AS min_start_ms,
@@ -208,14 +177,13 @@ def fetch_eval_run_loop_count_analysis(
     agentspan_table: str = DEFAULT_AGENTS_SPAN_TABLE,
     evalcli: Any | None = None,
     include_action_inputs: bool = True,
-    target_loops: int = TARGET_LOOP_COUNT,
 ) -> EvalRunLoopCountAnalysis:
     def parse(row: Mapping[str, Any]) -> LoopCountEntryMetrics | None:
-        metrics = parse_loop_count_entry_metrics(row, target_loops=target_loops)
+        metrics = parse_loop_count_entry_metrics(row)
         return metrics if metrics.entry_id else None
 
     def overlay(per_entry: Mapping[str, LoopCountEntryMetrics]) -> Mapping[str, LoopCountEntryMetrics]:
-        return overlay_evalcli_loop_and_correctness(evalcli, eval_id, dict(per_entry), target_loops=target_loops)
+        return overlay_evalcli_loop_counts(evalcli, eval_id, dict(per_entry))
 
     def enrich(
         per_entry: Mapping[str, LoopCountEntryMetrics], rows: Rows, high_signal: tuple[str, ...]
@@ -262,14 +230,12 @@ def _enrich_action_inputs(
     return enrich_action_inputs(evalcli, per_entry, rows, high_signal_entry_ids, apply=apply)
 
 
-def overlay_evalcli_loop_and_correctness(
+def overlay_evalcli_loop_counts(
     evalcli: Any,
     eval_id: str,
     per_entry: dict[str, LoopCountEntryMetrics],
-    *,
-    target_loops: int = TARGET_LOOP_COUNT,
 ) -> dict[str, LoopCountEntryMetrics]:
-    """Prefer eval ``loopCount`` and CORRECTNESS judge scores when the view has them."""
+    """Prefer eval ``metadata.loopCount`` when the analysis view has it."""
     get_view = getattr(evalcli, "get_analysis_view", None)
     if not callable(get_view):
         return per_entry
@@ -281,33 +247,23 @@ def overlay_evalcli_loop_and_correctness(
     if not isinstance(view, dict):
         return per_entry
 
-    loops_by_entry, correctness_by_entry = _parse_analysis_view(view, eval_id)
-    if not loops_by_entry and not correctness_by_entry:
+    loops_by_entry = _loop_counts_from_view(view, eval_id)
+    if not loops_by_entry:
         return per_entry
 
     updated = dict(per_entry)
-    for entry_id in {*updated, *loops_by_entry, *correctness_by_entry}:
+    for entry_id, loop_count in loops_by_entry.items():
         current = updated.get(entry_id)
-        loop_count = loops_by_entry.get(entry_id, current.loop_count if current else 0)
-        has_error = current.has_error if current else False
-        correctness = correctness_by_entry.get(
-            entry_id,
-            current.correctness if current is not None else (0.0 if has_error else 1.0),
-        )
         updated[entry_id] = LoopCountEntryMetrics(
             entry_id=entry_id,
             loop_count=int(loop_count),
-            correctness=float(correctness),
-            has_error=has_error,
             action_inputs=current.action_inputs if current else (),
-            target_loops=target_loops,
         )
     return updated
 
 
-def _parse_analysis_view(view: dict[str, Any], eval_id: str) -> tuple[dict[str, int], dict[str, float]]:
+def _loop_counts_from_view(view: dict[str, Any], eval_id: str) -> dict[str, int]:
     loops_by_entry: dict[str, int] = {}
-    correctness_by_entry: dict[str, float] = {}
     for entry in view.get("entries") or []:
         if not isinstance(entry, dict):
             continue
@@ -323,13 +279,7 @@ def _parse_analysis_view(view: dict[str, Any], eval_id: str) -> tuple[dict[str, 
             metadata = eval_run_entry.get("metadata") or {}
             if "loopCount" in metadata:
                 loops_by_entry[entry_id] = int(metadata.get("loopCount") or 0)
-        for judge_entry in entry.get("judgeRunEntries") or []:
-            if not isinstance(judge_entry, dict):
-                continue
-            for output in judge_entry.get("outputs") or []:
-                if isinstance(output, dict) and str(output.get("name") or "").upper() == "CORRECTNESS":
-                    correctness_by_entry[entry_id] = float(output.get("score") or 0.0)
-    return loops_by_entry, correctness_by_entry
+    return loops_by_entry
 
 
 # ---------------------------------------------------------------------------
@@ -337,22 +287,21 @@ def _parse_analysis_view(view: dict[str, Any], eval_id: str) -> tuple[dict[str, 
 # ---------------------------------------------------------------------------
 
 WRITING_CODE_RESPONSIBILITY = (
-    "Focus ONLY on instructions that reduce extra agent loops: batch independent tool calls in one "
+    "Focus ONLY on instructions that reduce agent loops: batch independent tool calls in one "
     "turn, stop once the answer is grounded, and avoid re-running searches that already returned the "
-    f"needed evidence. Use the loop counts and tool payloads above as evidence. {CONDITIONAL_PRESERVE_RULE} "
-    "Propose minimal deltas."
+    f"needed evidence. Fewer loops is always better. {CONDITIONAL_PRESERVE_RULE} Propose minimal deltas."
 )
 
 CACHE_SCHEMA_VERSION = 1
 
 
 class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
-    """Score student evals by how few agent loops each entry needed."""
+    """Score student evals by ``1 / (1 + loop_count)``. Fewer loops always score higher."""
 
     name = LOOP_EFFICIENCY_OBJECTIVE
     telemetry_dimensions = (LOOP_EFFICIENCY_OBJECTIVE,)
     focused_bucket_type = QUERY_CANONICAL_BUCKET_TYPE
-    failure_label = "HIGH-SIGNAL FAILURES (extra loops)"
+    failure_label = "HIGH-SIGNAL FAILURES (too many loops)"
     pending_telemetry_label = "loop count"
     # ``compared_entries`` is 0 until Execute Action spans have landed for the run.
     pending_count = "compared_entries"
@@ -369,12 +318,6 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
         # hydrating request refetches these instead of serving payload-less entries.
         self._unhydrated_eval_ids: set[str] = set()
 
-    # --- configuration -----------------------------------------------------
-
-    @property
-    def target_loops(self) -> int:
-        return int(self.pack_param("target_loop_count", TARGET_LOOP_COUNT))
-
     # --- scoring -----------------------------------------------------------
 
     def analyze(self, eval_id: str, *, request: AnalysisRequest) -> EvalRunLoopCountAnalysis:
@@ -390,33 +333,30 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
                 lookback_days=self.lookback_days,
                 evalcli=req.evalcli,
                 include_action_inputs=req.hydrate_action_inputs,
-                target_loops=self.target_loops,
             )
 
         return self.cached_eval_analysis(eval_id, request=request, fetch=fetch, label="loop count analysis")
 
     def focused_pass_rate(self, analysis: EvalRunLoopCountAnalysis, requested_entry_ids: Sequence[str]) -> float:
+        """Mean ``1 / (1 + loop_count)`` over the request. Missing telemetry scores 0."""
         if not requested_entry_ids:
             return 0.0
-        passed = sum(
-            1
-            for entry_id in requested_entry_ids
-            if (metrics := analysis.per_entry.get(entry_id)) is not None and metrics.loop_efficiency >= 1.0
-        )
-        return passed / len(requested_entry_ids)
+        total = 0.0
+        for entry_id in requested_entry_ids:
+            metrics = analysis.per_entry.get(entry_id)
+            total += metrics.score if metrics is not None else 0.0
+        return total / len(requested_entry_ids)
 
     def log_analysis(self, analysis: EvalRunLoopCountAnalysis) -> None:
         aggregate = analysis.aggregate
-        target_loops = next(iter(analysis.per_entry.values())).target_loops if analysis.per_entry else TARGET_LOOP_COUNT
         log_analysis(
             analysis,
             label="Loop Count",
             headline=(
-                f"efficiency={aggregate.loop_efficiency:.2%} "
-                f"({aggregate.matching_entries}/{aggregate.compared_entries} at <= {target_loops} loops), "
-                f"mean_loops={aggregate.mean_loop_count:.2f}, correctness={aggregate.mean_correctness:.2f}"
+                f"score={aggregate.loop_efficiency:.2%}, "
+                f"mean_loops={aggregate.mean_loop_count:.2f} ({aggregate.compared_entries} entries)"
             ),
-            entry_line=lambda m: f"loops={m.loop_count} correctness={m.correctness:.2f} score={m.loop_efficiency:.2f}",
+            entry_line=lambda m: f"loops={m.loop_count} score={m.loop_efficiency:.2f}",
         )
 
     def aggregate_row(self, analysis: EvalRunLoopCountAnalysis, ctx: ScoringContext) -> ScoredRow:
@@ -446,7 +386,7 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
             "query": ctx.entry_query(entry_id),
             "entry_id": entry_id,
             "student_tool_calls": metrics.loop_count,
-            "student_tool_errors": int(metrics.has_error),
+            "student_tool_errors": 0,
             "shell_error_messages": [],
             "student_eval_run_id": ctx.student_eval_id,
             "student_loops": metrics.loop_count,
@@ -464,12 +404,7 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
 
     def failure_pattern(self, component_name: str, trajectory: SingleModelALTrajectory) -> tuple[Any, ...]:
         del component_name
-        loops = int(trajectory["output"].get("student_loops", 0))
-        score = trajectory.get("objective_scores", {}).get(self.name, 1.0)
-        return (
-            int(score < float(self.pack_param("failure_score_below", 1.0))),
-            max(0, loops - self.target_loops),
-        )
+        return (int(trajectory["output"].get("student_loops", 0)),)
 
     def build_reflective_example(
         self,
@@ -480,13 +415,13 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
         del component_name, candidate
         output = trajectory["output"]
         loops = int(output.get("student_loops", 0))
-        if loops > self.target_loops:
+        if loops > 0:
             feedback = (
-                f"Used {loops} loops; stay at or below {self.target_loops} by batching independent calls "
-                "and stopping once the answer is grounded."
+                f"Used {loops} loops. Use fewer: batch independent tool calls in one turn "
+                "and stop once the answer is grounded."
             )
         else:
-            feedback = "Reduce extra agent loops."
+            feedback = "Answered without a tool loop."
         return self.reflective_example(trajectory, feedback=feedback, action_inputs=output.get("action_inputs", []))
 
     # --- cache -------------------------------------------------------------
@@ -503,8 +438,6 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
                     entry_id: {
                         "entry_id": m.entry_id,
                         "loop_count": m.loop_count,
-                        "correctness": m.correctness,
-                        "has_error": m.has_error,
                         "action_inputs": list(m.action_inputs),
                     }
                     for entry_id, m in analysis.per_entry.items()
@@ -514,23 +447,18 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
         }
 
     def load_cache(self, raw_cache: Any) -> None:
-        """Rebuild analyses from cached loop counts under the *current* ``target_loop_count``.
-
-        Scores and the high-signal list are derived, not stored, so retuning the
-        cap between runs takes effect on resume.
-        """
+        """Rebuild analyses from cached loop counts. Scores are derived, not stored."""
         self._eval_analysis_cache = {}
         self._unhydrated_eval_ids = set()
         if not isinstance(raw_cache, dict):
             return
-        target = self.target_loops
         for eval_id, raw in raw_cache.items():
             try:
                 if not isinstance(raw, dict) or raw.get("schema_version") != CACHE_SCHEMA_VERSION:
                     print(f"[Cache] Refreshing legacy loop analysis for eval_id: {eval_id}")
                     continue
                 per_entry: dict[str, LoopCountEntryMetrics] = {
-                    entry_id: loop_count_entry_from_cache(entry_id, metrics, target_loops=target)
+                    entry_id: loop_count_entry_from_cache(entry_id, metrics)
                     for entry_id, metrics in (raw.get("per_entry") or {}).items()
                 }
                 if not per_entry:
@@ -547,7 +475,6 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
     def _rebuild(
         self, eval_id: str, raw: Mapping[str, Any], per_entry: dict[str, LoopCountEntryMetrics]
     ) -> EvalRunLoopCountAnalysis:
-        per_entry = {entry_id: replace(m, target_loops=self.target_loops) for entry_id, m in per_entry.items()}
         return EvalRunLoopCountAnalysis(
             eval_ids=(eval_id,),
             aggregate=aggregate_loop_count_metrics(per_entry),
