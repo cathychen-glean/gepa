@@ -498,20 +498,23 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def _pairwise_judges_for_pair(self, pair: _StartedPair) -> tuple[PairwiseJudge, ...]:
         """Pairwise judges to start for this eval pair.
 
-        Full-train and val evals start every configured judge. Focused screen
-        slices (``eval_entry_ids`` set) start a judge only when the screen reads
-        it: ``screening.kind=correctness_floor`` runs CORRECTNESS there, a pairwise
-        primary (agentic preference) runs itself there, and ``screening.weights`` runs
-        whatever it names. A telemetry primary with a plain fix-rate screen starts
-        no judge on the slice; correctness is gated at validation instead.
+        Validation evals (``validation_only``) start every configured judge: the
+        post-search gate and the frontier read them there. Full-train evals and
+        focused screen slices start only the judges the search itself reads --
+        the primary, anything in ``objective.composite``, and anything in
+        ``screening.weights``. A judge configured only as a validation gate
+        (the Waldo correctness judge) therefore runs once per candidate, on val.
+
+        ``screening.kind=correctness_floor`` keeps its split: CORRECTNESS on
+        focused slices, AGENTIC on full evals.
         """
         is_focused = bool(pair.al_data_inst.get("eval_entry_ids"))
         if self.screening_kind == "correctness_floor":
             wanted_type = CORRECTNESS_JUDGE_TYPE if is_focused else AGENTIC_JUDGE_TYPE
             return tuple(judge for judge in self.pairwise_judges if judge.judge_type == wanted_type)
-        if not is_focused:
+        if pair.al_data_inst.get("validation_only"):
             return self.pairwise_judges
-        needed = {self.objective.name, *self.screening_weights}
+        needed = {self.objective.name, *self.composite_weights, *self.screening_weights}
         return tuple(judge for judge in self.pairwise_judges if judge.name in needed)
 
     def _start_judges(
