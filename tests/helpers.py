@@ -5,12 +5,11 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
-from glean_gepa.al_adapter import ALRunner, Thresholds
+from glean_gepa.al_adapter import ALRunner
 from glean_gepa.objectives.tool_match import EvalRunToolMatchAnalysis, ToolMatchEntryMetrics, ToolMatchMetrics
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 
-THRESHOLDS = Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000)
 
 EVAL_SET = {
     "eval_set_name": "Glean Chat V2 Medium",
@@ -24,7 +23,7 @@ def teacher_student_adapter(evalcli: MagicMock | None = None, **kwargs) -> Teach
     kwargs.setdefault("teacher_model", "gpt")
     kwargs.setdefault("student_model", "fast")
     return TeacherStudentAdapter(
-        runner=ALRunner(evalcli=evalcli if evalcli is not None else MagicMock()), thresholds=THRESHOLDS, **kwargs
+        runner=ALRunner(evalcli=evalcli if evalcli is not None else MagicMock()), **kwargs
     )
 
 
@@ -32,7 +31,7 @@ def single_model_adapter(evalcli: MagicMock | None = None, **kwargs) -> SingleMo
     kwargs.setdefault("bigquery_client", MagicMock())
     kwargs.setdefault("student_model", "fast")
     return SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli if evalcli is not None else MagicMock()), thresholds=THRESHOLDS, **kwargs
+        runner=ALRunner(evalcli=evalcli if evalcli is not None else MagicMock()), **kwargs
     )
 
 

@@ -1,12 +1,8 @@
 """First-tool-match objective: does the student pick the same first tool the teacher did?
 
-Layout, top to bottom: the entry and aggregate types, row parsing, the
-``tool_spans`` SQL (with the failed-runs prelude that drops entries whose
-teacher or student run errored), the paired fetch, then the objective class
-that maps the analysis onto the contract in :mod:`glean_gepa.objectives.protocol`.
-Shared plumbing (bounds query, shard window, paired FULL OUTER JOIN scaffold,
-trace enrichment, frame) comes from ``objectives/utils``. Pure tool-name helpers
-are in ``objectives/utils/tool_names`` so ``prompt`` can import them too."""
+Entries whose teacher or student run errored are dropped before scoring. Pure
+tool-name helpers live in ``objectives/utils/tool_names`` so ``prompt`` can import
+them without importing this module."""
 
 from __future__ import annotations
 

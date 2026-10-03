@@ -29,21 +29,16 @@ if TYPE_CHECKING:
 # objective's ``reflection_entry_limit``.
 _REFLECTION_K_DEFAULT = object()
 
-# Reflection surfaces at most this many tool payloads / error strings per example.
-# Same cap the utils use for console logging; one number, defined in core.
 REFLECTION_EVIDENCE_LIMIT = EVIDENCE_LIMIT
 
-# The catalog and registry live in ``glean_gepa.objectives.registry``. These
-# names are kept so existing imports keep working; they read from that module.
+# Read-only views of ``glean_gepa.objectives.registry``.
 TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = _registry._REGISTRY
 MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
     spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default
 }
 
 
-# The frame a concrete objective's ``analyze()`` returns. Subclasses bind it:
-# ``class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis])``
-# and every hook below then receives that type instead of ``Any``.
+# The analysis type a concrete objective's ``analyze()`` returns; subclasses bind it.
 AnalysisT = TypeVar("AnalysisT", bound=RunAnalysis[Any, Any])
 
 
@@ -772,10 +767,6 @@ def register_telemetry_source(
 
 def unregister_telemetry_source(mode: JudgingMode, source: str) -> None:
     _registry.unregister(mode, source)
-
-
-def _ensure_builtin_objectives_registered() -> None:
-    _registry.load_builtins()
 
 
 def is_registered_telemetry_source(mode: JudgingMode, source: str | None) -> bool:

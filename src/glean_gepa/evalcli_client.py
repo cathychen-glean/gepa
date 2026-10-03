@@ -853,9 +853,8 @@ class EvalCliClient:
     ) -> list[dict[str, Any]]:
         if not entry_ids:
             return []
-        # One `analyze details` call fans out to a trace + judge lookup per entry on the
-        # server; asking for 40 at once has hung for over an hour before failing opaquely,
-        # so page the request and retry each page on transient Cortex errors.
+        # `analyze details` fans out to a trace + judge lookup per entry on the server
+        # and hangs on large requests, so page it and retry each page on transient errors.
         details: list[dict[str, Any]] = []
         for start in range(0, len(entry_ids), ANALYSIS_DETAILS_PAGE_SIZE):
             page = entry_ids[start : start + ANALYSIS_DETAILS_PAGE_SIZE]

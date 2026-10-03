@@ -221,14 +221,9 @@ def build_upload_entry(
     user = source_entry.get("user") or source_entry.get("user_id")
 
     if bucket_type == QUERY_CANONICAL_BUCKET_TYPE:
-        # Fresh chat: query text only. Copying stt restores the source session.
-        # Restore output is valid as stored. The Anthropic Messages-API adapter
-        # then hoists trailing system messages into the top-level system
-        # parameter and strips OpenAI-shaped reasoning items, leaving messages
-        # ending on an assistant turn (Claude 400). The Responses API keeps
-        # system/reasoning/function-call items inline, so the same restore never
-        # ends on an assistant turn. Restored assistant text can also leak
-        # expectedOutput.
+        # Fresh chat: query text only. Copying stt would restore the source session,
+        # which Claude rejects (restored history ends on an assistant turn) and which
+        # can leak expectedOutput.
         if not query:
             return None
         entry: dict[str, Any] = {"deploymentId": deployment_id, "query": str(query)}

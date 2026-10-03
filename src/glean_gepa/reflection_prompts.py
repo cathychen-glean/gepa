@@ -238,10 +238,10 @@ def patch_after_snippets(patches: str) -> list[str]:
 
 
 def new_module_length_rule(patches: str, hard_cap: int | None) -> tuple[str, int | None]:
-    """Length rule and character budget for consolidating patches into a module that is empty.
+    """Length rule and character budget for consolidating patches into an empty module.
 
-    Without this the only bound is the module's token budget (2,000+ characters for RULES_EXT),
-    and a two-patch diagnosis came back as a 23-line, seven-topic rulebook.
+    Without it the only bound is the module's token budget, and a short diagnosis
+    can come back as a multi-topic rulebook.
     """
     afters = patch_after_snippets(patches)
     if not afters:

@@ -90,27 +90,6 @@ class RunAnalysis(Generic[A, E]):
     def pass_rate(self) -> float:
         return self.passed_entries / self.compared_entries if self.per_entry else 0.0
 
-    @classmethod
-    def of(
-        cls,
-        *,
-        eval_id: str,
-        aggregate: A,
-        per_entry: Mapping[str, E] | None = None,
-        high_signal_entry_ids: Sequence[str] = (),
-        start_date: date | None = None,
-        end_date: date | None = None,
-    ) -> RunAnalysis[A, E]:
-        """Keyword constructor with the single-run field names callers already use."""
-        return cls(
-            eval_ids=(eval_id,),
-            aggregate=aggregate,
-            per_entry=dict(per_entry or {}),
-            high_signal_entry_ids=tuple(high_signal_entry_ids),
-            start_date=start_date,
-            end_date=end_date,
-        )
-
 
 @dataclass(frozen=True)
 class PairedRunAnalysis(RunAnalysis[A, E]):
@@ -123,28 +102,6 @@ class PairedRunAnalysis(RunAnalysis[A, E]):
     @property
     def student_eval_id(self) -> str:
         return self.eval_ids[-1]
-
-    @classmethod
-    def of_pair(
-        cls,
-        *,
-        teacher_eval_id: str,
-        student_eval_id: str,
-        aggregate: A,
-        per_entry: Mapping[str, E] | None = None,
-        high_signal_entry_ids: Sequence[str] = (),
-        start_date: date | None = None,
-        end_date: date | None = None,
-    ) -> PairedRunAnalysis[A, E]:
-        """Keyword constructor with the paired field names callers already use."""
-        return cls(
-            eval_ids=(teacher_eval_id, student_eval_id),
-            aggregate=aggregate,
-            per_entry=dict(per_entry or {}),
-            high_signal_entry_ids=tuple(high_signal_entry_ids),
-            start_date=start_date,
-            end_date=end_date,
-        )
 
 
 # ---------------------------------------------------------------------------

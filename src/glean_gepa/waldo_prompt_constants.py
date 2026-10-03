@@ -5,32 +5,22 @@
 Waldo is the lightweight router in front of the full agent: it answers easy lookups
 with attached search tools and hands everything else to the discover tool.
 
-Source of truth for the stock text: ``scio/data/prompts/templates/waldo_system.prompt``
-(master ``f4da67f7e37``). Keep this copy in sync with that file. The ``[[...]]`` and
-``<<<[[...]]...>>>`` markers are scio template syntax; scio fills them at render time,
-so candidates must preserve them.
+The stock text mirrors scio's ``waldo_system.prompt`` template; keep it in sync. The
+``[[...]]`` and ``<<<[[...]]...>>>`` markers are scio template syntax filled at render
+time, so candidates must preserve them.
 
-Production Waldo evals do NOT run the stock text. They pass a longer, hand-tuned
-prompt through ``llmo.per_prompt_overrides.waldo_system`` (about 6.3k tokens; the
-stock file is about 1.6k). ``data/waldo_seed_candidate.json`` carries that live
-prompt, split into the two modules below. Seed from it, not from these defaults,
-when tuning for the Waldo team.
-
-Eval wiring: scio reads the override from ``ctx.prompt_override_map['waldo_system']``,
-populated from the ``llmo.per_prompt_overrides.waldo_system`` scParam
-(``build_waldo_system_prompt`` in ``python_scio/agents/workflows/waldo_prompts.py``).
+Production Waldo evals do not run the stock text: they pass a longer, hand-tuned prompt
+through the ``llmo.per_prompt_overrides.waldo_system`` scParam. ``data/waldo_seed_candidate.json``
+carries that live prompt split into the two modules below; seed from it, not from these
+defaults, when tuning for the Waldo team.
 
 Modules:
 
-- ``WALDO_SYSTEM`` is the full prompt and the render template. It holds a
-  ``{WALDO_TOOL_USAGE}`` slot that ``compile_waldo_system_prompt`` fills.
-- ``WALDO_TOOL_USAGE`` is the body under "### Tool Usage Guidelines" (the heading stays
-  in the template). In the live prompt that body is the "Glean Search Argument
-  Construction" rules plus the search-tool conditional blocks, so this one module
-  covers both tool selection and when to escalate. Its text carries two scio
-  conditionals, ``<<<[[has_search_tools]] ... >>>`` and ``<<<[[no_search_tools]] ... >>>``,
-  which pick the branch at render time. A rewrite must keep every one of those
-  wrappers; ``reflection_prompts.drops_conditional`` rejects variants that lose one.
+- ``WALDO_SYSTEM`` is the full prompt and render template, with a ``{WALDO_TOOL_USAGE}``
+  slot that ``compile_waldo_system_prompt`` fills.
+- ``WALDO_TOOL_USAGE`` is the body under "### Tool Usage Guidelines". It carries the
+  ``<<<[[has_search_tools]]>>>`` / ``<<<[[no_search_tools]]>>>`` conditionals; a rewrite
+  must keep both, and ``reflection_prompts.drops_conditional`` rejects one that does not.
 """
 
 from collections.abc import Mapping

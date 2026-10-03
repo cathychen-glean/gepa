@@ -7,7 +7,7 @@ from glean_gepa.al_adapter import ALRunner
 from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from base64 import urlsafe_b64decode
 from urllib.parse import unquote_plus
-from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, approx_token_len, total_prompt_tokens
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, approx_token_len, total_prompt_tokens
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evolutionary_proposer import (

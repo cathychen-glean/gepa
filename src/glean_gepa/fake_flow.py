@@ -17,8 +17,6 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
 from glean_gepa.reflection_prompts import FAKE_FLOW_RESPONSIBILITY
 
-FAKE_FLOW_MARKER = "[fake-flow iteration="
-
 
 def fake_evalset(split: str = "train") -> list[ALDataInst]:
     """Return a small, stable eval set that needs progressively better prompts."""
@@ -63,7 +61,6 @@ class FakeFlowAdapter(GleanAdapterBase):
         # overrides the corresponding public methods below.
         super().__init__(
             runner=None,  # type: ignore[arg-type]
-            thresholds=None,  # type: ignore[arg-type]
             student_model="fake-model",
             evaluate_fn=lambda *_args: self.evaluate(*_args),
             failure_pattern_fn=lambda _module, trajectory: (trajectory["output"]["entry_id"],),

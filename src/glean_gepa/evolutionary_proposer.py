@@ -61,7 +61,6 @@ class ChildCacheRecord:
     screening_passed: bool | None = None
 
 
-# TODO(Cathy): pick modules based on holistic performance of the eval
 def pick_modules_to_edit(
     adapter: GleanAdapterBase,
     eval_batch: GleanEvaluationBatch | None = None,
@@ -463,12 +462,10 @@ class EvolutionaryProposer:
         al_adapter: GleanAdapterBase,
         reflection_llm: Any,
         experiment_tracker: ExperimentTracker,
-        # Candidate config (for converting dict[str,str] <-> Candidate)
         model: str,
         module_specs: dict[str, ModuleSpec],
         global_token_cap: int,
         baseline_prompt_hash: str,
-        # Evolutionary hyperparameters
         offspring_count: int = 5,
         reflect_k: int | None = 8,
         evalset_policy: UnseenEvalSetPolicy | None = None,
@@ -484,22 +481,17 @@ class EvolutionaryProposer:
         self.evalset_policy = evalset_policy
         self.high_signal_screen_threshold = high_signal_screen_threshold
 
-        # Candidate conversion config
         self.model = model
         self.module_specs = module_specs
         self.global_token_cap = global_token_cap
         self.baseline_prompt_hash = baseline_prompt_hash
 
-        # Evolutionary hyperparameters
         self.offspring_count = offspring_count
         self.reflect_k = reflect_k
         self.reflection_hamming_distance_k = reflection_hamming_distance_k
-        # Reflection depends on a root candidate and its fixed evaluation
-        # traces. Keep its proposed children keyed by that stable root id so a
-        # root revisited in a later iteration does not trigger reflection again.
+        # A root's traces do not change while it stays on the frontier, so its children
+        # are keyed by root id and reflected at most once per training slice.
         self._children_by_root: dict[str, list[Candidate]] = {}
-        # Incremental training slices need fresh reflection, but each root should
-        # still be reflected at most once within the same slice.
         self._children_by_root_by_train_slice: dict[tuple[Any, ...], dict[str, list[Candidate]]] = {}
         # One record owns the generated child's eval IDs and screening result.
         # Both are scoped by training slice, root candidate, and child ID.
@@ -508,19 +500,15 @@ class EvolutionaryProposer:
         self.children_cache_file = Path(children_cache_file).expanduser() if children_cache_file else None
         self._load_children_cache()
 
-        # Store batch data for eval set (trainset is just metadata for eval set runs)
-        # Extract first batch from trainset
         if isinstance(trainset, list):
             self._batch_data: list[dict[str, Any]] = cast(list[dict[str, Any]], trainset)
         else:
-            # Get first batch from loader
             self._batch_data = []
             try:
                 for _, batch in self.trainset:  # type: ignore
                     self._batch_data = cast(list[dict[str, Any]], batch)
                     break
             except Exception:
-                # Fallback to empty batch
                 self._batch_data = []
 
     def _load_children_cache(self) -> None:
@@ -642,10 +630,7 @@ class EvolutionaryProposer:
             root_records = records_by_root.setdefault(root_id, {})
             return root_records.setdefault(child.candidate_id, ChildCacheRecord())
 
-        # Compatibility for callers that construct Candidate objects directly
-        # without parent_id (the public generation helper historically allowed
-        # that). Existing child IDs are unique within a training slice in the
-        # normal proposer path.
+        # Candidate built without parent_id: child ids are unique within a slice.
         for root_records in records_by_root.values():
             record = root_records.get(child.candidate_id)
             if record is not None:
@@ -802,7 +787,6 @@ class EvolutionaryProposer:
     def propose(self, state: GEPAState) -> list[CandidateProposal]:
         i = self.get_display_iteration(state)
 
-        # 1. Get frontier program indices from Pareto front
         front_mapping = state.get_pareto_front_mapping()
         frontier_idxs: set[int] = set()
         for prog_set in front_mapping.values():
@@ -818,9 +802,9 @@ class EvolutionaryProposer:
         existing_keys = {self._program_key(program) for program in state.program_candidates}
         tried_slices: set[tuple[Any, ...]] = set()
         while True:
-            # 2. Reveal one training slice for this generation. Resume retries an
-            # in-flight slice; finished slices whose passers are already in the
-            # pool are skipped so a restart cannot re-accept the same child.
+            # Reveal one training slice. Resume retries an in-flight slice; finished
+            # slices whose passers are in the pool are skipped so a restart cannot
+            # re-accept the same child.
             train_ids = self._select_train_ids(existing_keys, iteration=i, attempt=state.i)
             if train_ids is None:
                 return []
@@ -859,9 +843,8 @@ class EvolutionaryProposer:
         existing_keys: set[str],
     ) -> list[CandidateProposal] | None:
         i = iteration
-        # 3. Convert frontier programs to Candidate objects. Cached mutations
-        # are scoped to the current training slice, so a fresh slice prompts a
-        # new reflection while duplicate attempts within that slice are avoided.
+        # Cached mutations are scoped to the training slice: a fresh slice reflects
+        # again, repeat attempts within a slice do not.
         frontier_candidates: list[Candidate] = []
         prog_idx_to_cand_id: dict[int, str] = {}
         for idx in frontier_idxs_sorted:
@@ -893,7 +876,7 @@ class EvolutionaryProposer:
                 "skipping root error-example fetches"
             )
 
-        # 4. Score the frontier roots, reusing cached root scores when possible.
+        # Score the frontier roots, reusing cached root scores when possible.
         frontier_evals: dict[str, GleanEvaluationBatch] = {}
         cached_frontier_evals: set[str] = set()
         uncached_frontier = []
@@ -921,7 +904,6 @@ class EvolutionaryProposer:
                     self.al_adapter.get_screening_score(eval_batch),
                 )
 
-        # 5. Generate children using evolutionary strategies.
         children = make_children_for_generation(
             adapter=self.al_adapter,
             frontier_candidates=frontier_candidates,
@@ -939,8 +921,8 @@ class EvolutionaryProposer:
             self.logger.log(f"Iteration {i}: Evolutionary proposer generated no children")
             return []
 
-        # 6. Filter children by prompt budget. Rejected children are recorded as
-        # failed screens so the cache does not describe them as awaiting one.
+        # Over-budget children are recorded as failed screens so the cache does
+        # not describe them as awaiting one.
         valid_children = []
         for child in children:
             if within_prompt_budget(child):
@@ -953,9 +935,8 @@ class EvolutionaryProposer:
             self.logger.log(f"Iteration {i}: No children passed budget check")
             return []
 
-        # 6. Screen children on the parent's high-signal failures first.
-        # Keep a child whose fix rate is at least half
-        # (or high_signal_screen_threshold).
+        # Screen children on the parent's high-signal failures; keep those whose
+        # fix rate reaches high_signal_screen_threshold.
         best_parent_idx = max(frontier_idxs_sorted, key=lambda idx: state.program_full_scores_val_set[idx])
         best_parent_cand_id = prog_idx_to_cand_id[best_parent_idx]
         parent_eval = frontier_evals[best_parent_cand_id]
@@ -1118,12 +1099,9 @@ class EvolutionaryProposer:
             )
             return None
 
-        # 7. The engine runs selected children on the full eval set. A
-        # high-signal score is a rate over the parent's errors, so it is not
-        # comparable to the parent's overall screening score. Treat it as a
-        # zero-baseline gate: any positive fix rate is an improvement and the
-        # child can proceed to full validation. Standard screens retain their
-        # parent-vs-child score comparison.
+        # A high-signal score is a fix rate over the parent's errors, not comparable
+        # to the parent's overall score, so it is a zero-baseline gate: any positive
+        # rate proceeds to full validation. Standard screens keep parent-vs-child.
         subsample_ids = train_ids
         parent_score = self.al_adapter.get_screening_score(parent_eval)
         best_child_score = max(score for _child, _eval, score in pending_children)

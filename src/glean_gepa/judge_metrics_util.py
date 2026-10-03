@@ -26,20 +26,15 @@ from glean_gepa.evalcli_client import (
 )
 
 PREFERENCE_TIE = 0.5
-# How long a judge's sample size must stay unchanged before a payload with no coverage
-# totals is accepted as finished. The agentic judge scores ~10 entries/minute, so a
-# still-running judge cannot hold its sample size flat for this long.
+# How long a judge's sample size must hold still before a payload with no coverage
+# totals counts as finished. The agentic judge scores ~10 entries/minute.
 JUDGE_SAMPLE_SETTLE_SEC = 180
-# The agentic judge's summary "rate" is exactly 10x the mean of its 0-1 per-entry scores
-# (verified on every completed judge run in run_ts_agentic_2), so a lagging summary can be
-# replaced by the per-entry mean without changing scale.
+# The agentic judge's summary "rate" is 10x the mean of its 0-1 per-entry scores, so a
+# lagging summary can be replaced by the per-entry mean.
 AGENTIC_VIEW_SCORE_SCALE = 10.0
-# A judge with no coverage totals may only be accepted on the "count stopped growing" rule
-# once it has scored at least this share of the entries the student eval run produced. The
-# agentic judge can sit at 2-8 scored entries for several minutes while its tasks queue,
-# which is indistinguishable from "finished" by count alone: that stall produced a 5.0 val
-# score over 2 entries and a reflection round fed 8 of ~200 entries. Completed judges cover
-# 93-96% (the remainder are failed eval tasks the judge cannot grade).
+# A judge with no coverage totals is only accepted on the settle rule once it has scored
+# this share of the student run's entries; it stalls for minutes right after starting.
+# Completed judges cover 93-96% (the rest are failed eval tasks it cannot grade).
 MIN_JUDGE_COVERAGE = 0.85
 
 _PendingJudge = tuple[str, str, str | None, str | None]
@@ -391,17 +386,12 @@ def _settle_without_totals(
 ) -> JudgeAnalysis | None:
     """Completeness fallback for judges whose metrics payload carries no coverage totals.
 
-    The agentic judge publishes a running mean with ``totalEntries``/``missingEntries``
-    both null, and that summary can lag far behind the analyze view (a summary stuck at 17
-    entries while the view already held 152). So progress is measured by the larger of the
-    summary sample and the view's per-entry rows, the judge counts as finished only once
-    that number has held still for ``settle_sec``, and when the summary is behind the view
-    the aggregate is recomputed from the per-entry scores (the summary is exactly their mean).
-
-    A flat count is not enough on its own: the judge also stalls for minutes right after it
-    starts, so the analyze view must be loaded and the scored count must cover at least
-    ``MIN_JUDGE_COVERAGE`` of the entries the student run produced before a stall counts as
-    completion. Below that the judge is treated as still running, whatever the count does.
+    The agentic judge publishes a running mean with null ``totalEntries``/``missingEntries``,
+    and that summary can lag far behind the analyze view. Progress is the larger of the
+    summary sample and the view's row count; the judge is finished once that holds still
+    for ``settle_sec`` and covers at least ``MIN_JUDGE_COVERAGE`` of the student run's
+    entries. When the summary is behind the view, the aggregate is recomputed from the
+    per-entry scores.
     """
     if snapshot.rate is None:
         stable_polls.pop(key, None)

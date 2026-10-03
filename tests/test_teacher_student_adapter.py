@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from helpers import THRESHOLDS, evalcli_with_ordered_events, teacher_student_adapter, tool_match_analysis
+from helpers import evalcli_with_ordered_events, teacher_student_adapter, tool_match_analysis
 
 from datetime import date
 from unittest.mock import MagicMock, patch
@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from glean_gepa.objectives.utils.tool_names import SKIPPED_TOOL_NAMES
-from glean_gepa.al_adapter import ALRunner, Thresholds
+from glean_gepa.al_adapter import ALRunner
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
 from glean_gepa.experiment_config import load_experiment_config, pairwise_judges
@@ -954,7 +954,6 @@ def _gate_only_adapter(tmp_path, spec, evalcli=None, **overrides) -> TeacherStud
         runner=ALRunner(evalcli=evalcli or MagicMock()),
         teacher_model="gpt",
         student_model="fast",
-        thresholds=THRESHOLDS,
         pairwise_judges=pairwise_judges(load_experiment_config(path)),
         screening_kind="high_signal_fix_rate",
     )

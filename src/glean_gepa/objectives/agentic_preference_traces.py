@@ -366,12 +366,8 @@ def student_behavior_flags(
 ) -> list[str]:
     """Mechanical, prompt-steerable observations about how the student behaved on this entry.
 
-    Each flag names a behavior that the judge's verdicts track across the whole eval set:
-    answering from context without its own retrieval while the teacher run searched or
-    opened a document, asking or offering instead of delivering, a preamble or closing
-    offer in the handoff, placeholders or raw markup, and a much thinner answer. They are
-    computed from the final answer and tool sequence only, so the rewriter can turn them
-    into rules the student can follow at runtime.
+    Computed from the final answer and tool sequence only, so the rewriter can turn each
+    flag into a rule the student can follow at runtime.
     """
     flags: list[str] = []
     answer = (student_answer or "").strip()

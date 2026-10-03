@@ -1,14 +1,10 @@
 """Trace enrichment for high-signal entries, on top of ``action_input_trace``.
 
-The scrubbed agentspan table drops tool payloads, so objectives carry scrub-safe
-locators (trace id, deployment, time window) out of BigQuery and resolve the
-payloads from each detailed trace through EvalCLI. Three utils had their own
-copy of that loop; :func:`enrich_action_inputs` is the one that remains.
-
-An objective passes ``apply``: a function that returns a new metrics object
-with the fetched values set on whichever field it uses. Everything else --
-locating traces per role, capping fetches, skipping entries with no result --
-is shared.
+BigQuery has no tool payloads (see ``action_input_trace``), so objectives carry
+scrub-safe locators out of their SQL and :func:`enrich_action_inputs` resolves the
+payloads from detailed traces. An objective passes ``apply``, which returns a new
+metrics object with the fetched values set; locating, capping, and skipping
+empty results are shared.
 """
 
 from __future__ import annotations
