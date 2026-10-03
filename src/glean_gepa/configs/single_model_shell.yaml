@@ -4,10 +4,7 @@
 # This file is self-contained. `signals`, `objective`, `screening`, and
 # `reflection` below are the full experiment; nothing is merged in from elsewhere.
 # `signals[].source` must be a telemetry source registered for this mode in
-# glean_gepa/objectives/registry.py (single_model: shell_telemetry, loop_telemetry).
-#
-# To optimize agent loop count instead, swap in the `loop_efficiency` variant
-# shown in comments at each section.
+# glean_gepa/objectives/registry.py.
 
 schema_version: 1
 mode: single_model
@@ -33,19 +30,15 @@ signals:
   - name: shell_success_rate
     source: shell_telemetry
     lookback_days: 1
-  # loops variant (score per entry is 1 / (1 + loop_count); zero loops is 1.0):
-  # - name: loop_efficiency
-  #   source: loop_telemetry
-  #   lookback_days: 1
 
 objective:
-  primary: shell_success_rate # or loop_efficiency
+  primary: shell_success_rate
   frontier_type: objective
   composite:
-    shell_success_rate: 1.0 # or loop_efficiency: 1.0
-  focused_bucket_type: SESSION # loops variant: QUERY_CANONICAL
+    shell_success_rate: 1.0
+  focused_bucket_type: SESSION
   params:
-    failure_score_below: 0.9 # loops variant: omit
+    failure_score_below: 0.9
   validation:
     - metric: correctness
       min: 0.80
@@ -54,12 +47,12 @@ objective:
 
 screening:
   kind: high_signal_fix_rate
-  threshold: 0.5 # loops variant: 0.25 (mean of 1/(1+loops); about three loops)
-  high_signal: shell_success_rate # or loop_efficiency
+  threshold: 0.5
+  high_signal: shell_success_rate
 
 reflection:
-  editable_modules: [WRITING_CODE, CORE_TOOLS] # loops variant: [WRITING_CODE]
-  failure_label: HIGH-SIGNAL FAILURES # loops variant: "HIGH-SIGNAL FAILURES (too many loops)"
+  editable_modules: [WRITING_CODE, CORE_TOOLS]
+  failure_label: HIGH-SIGNAL FAILURES
   # Override module reflection prompts with modules.<KEY>.
 
 search:

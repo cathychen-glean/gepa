@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from helpers import THRESHOLDS, evalcli_with_ordered_events, teacher_student_adapter, tool_match_analysis
+
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -9,7 +11,8 @@ from glean_gepa.objectives.utils.tool_names import SKIPPED_TOOL_NAMES
 from glean_gepa.al_adapter import ALRunner, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
-from glean_gepa.judge_metrics_util import JudgeAnalysis
+from glean_gepa.experiment_config import load_experiment_config, pairwise_judges
+from glean_gepa.judge_metrics_util import JUDGE_SPECS, JudgeAnalysis
 from glean_gepa.objectives.utils.core import NoComparedEntriesError
 from glean_gepa.objectives.tool_match import (
     TOOL_ALIGNMENT_OBJECTIVE,
@@ -35,32 +38,10 @@ EVAL_SET = {
 }
 
 
-def _evalcli_with_ordered_events(events: list[str]) -> MagicMock:
-    evalcli = MagicMock()
-
-    def create_eval_run(**kwargs):
-        eval_run_id = kwargs["eval_run_id"]
-        events.append(f"create:{eval_run_id}")
-        return eval_run_id
-
-    def wait_for_eval_run(eval_run_id, **_kwargs):
-        events.append(f"wait:{eval_run_id}")
-
-    evalcli.create_eval_run.side_effect = create_eval_run
-    evalcli.wait_for_eval_run.side_effect = wait_for_eval_run
-    evalcli.find_judge_run_id.return_value = None
-    evalcli.create_judge_run.side_effect = lambda **kwargs: f"judge-{kwargs['eval_run_id']}"
-    evalcli.get_eval_metrics.return_value = {
-        "judgeMetrics": {"totalEntries": 1, "missingEntries": 0, "CORRECTNESS": {"passRate": 0.0, "sampleSize": 1}}
-    }
-    return evalcli
-
-
 def _teacher_student_adapter(
     evalcli: MagicMock, cache_file: str | None = None, *, judge_correctness: bool = False
 ) -> TeacherStudentAdapter:
-    """Shipped evaluate tests stay on tool_alignment; judge-path tests opt into
-    correctness vs the teacher."""
+    """Shipped evaluate tests stay on tool_alignment; judge-path tests opt into correctness vs the teacher."""
     judge_kwargs = (
         {
             "pairwise_judges": [CORRECTNESS_JUDGE],
@@ -69,14 +50,7 @@ def _teacher_student_adapter(
         if judge_correctness
         else {}
     )
-    return TeacherStudentAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        teacher_model="gpt",
-        student_model="claude_sonnet",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
-        cache_file=cache_file,
-        **judge_kwargs,
-    )
+    return teacher_student_adapter(evalcli, student_model="claude_sonnet", cache_file=cache_file, **judge_kwargs)
 
 
 def _assert_all_creates_before_waits(events: list[str], *, n_creates: int, n_waits: int) -> None:
@@ -87,41 +61,12 @@ def _assert_all_creates_before_waits(events: list[str], *, n_creates: int, n_wai
     assert max(create_idxs) < min(wait_idxs)
 
 
-def _tool_match_analysis(
-    *,
-    teacher_eval_id: str = "teacher-1",
-    student_eval_id: str = "student-1",
-    compared_entries: int = 1,
-) -> EvalRunToolMatchAnalysis:
-    per_entry = {}
-    if compared_entries:
-        per_entry["entry-1"] = ToolMatchEntryMetrics(
-            entry_id="entry-1",
-            student_tools=("search",),
-            teacher_tools=("read",),
-            tools_match=False,
-        )
-    matching = sum(1 for metrics in per_entry.values() if metrics.tools_match)
-    return EvalRunToolMatchAnalysis(
-        eval_ids=(teacher_eval_id, student_eval_id),
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ToolMatchMetrics(
-            compared_entries=len(per_entry),
-            matching_entries=matching,
-            tool_match_rate=(matching / len(per_entry)) if per_entry else 0.0,
-        ),
-        per_entry=per_entry,
-        high_signal_entry_ids=tuple(per_entry),
-    )
-
-
 def test_teacher_and_student_runs_are_created_before_waiting():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
     _assert_all_creates_before_waits(events, n_creates=2, n_waits=2)
@@ -129,14 +74,14 @@ def test_teacher_and_student_runs_are_created_before_waiting():
 
 def test_all_eval_set_runs_in_a_batch_are_created_before_waiting():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
     batch = [
         {**EVAL_SET, "eval_set_version": "20260806"},
         {**EVAL_SET, "eval_set_version": "20260807"},
     ]
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate(batch, {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
     _assert_all_creates_before_waits(events, n_creates=4, n_waits=4)
@@ -144,10 +89,10 @@ def test_all_eval_set_runs_in_a_batch_are_created_before_waiting():
 
 def test_evaluate_many_starts_all_candidate_runs_before_waiting():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate_many(
             [EVAL_SET],
             [
@@ -167,7 +112,7 @@ def test_evaluate_many_starts_all_candidate_runs_before_waiting():
 
 def test_batch_evaluate_shares_teacher_run_across_children():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
     batch = [
         {
@@ -178,7 +123,7 @@ def test_batch_evaluate_shares_teacher_run_across_children():
         }
     ]
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.batch_evaluate(
             [
                 ({"WRITING_CODE": "prompt a"}, batch),
@@ -196,7 +141,7 @@ def test_batch_evaluate_shares_teacher_run_across_children():
 
 def test_batch_evaluate_overlaps_children_that_only_differ_by_cached_eval_ids():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
     base = {
         **EVAL_SET,
@@ -205,7 +150,7 @@ def test_batch_evaluate_overlaps_children_that_only_differ_by_cached_eval_ids():
         "focused_eval_set_version": "20260806_hs_abc",
     }
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.batch_evaluate(
             [
                 ({"WRITING_CODE": "prompt a"}, [{**base, "cached_student_eval_run_id": "child-a"}]),
@@ -219,7 +164,7 @@ def test_batch_evaluate_overlaps_children_that_only_differ_by_cached_eval_ids():
 
 def test_al_runner_run_still_waits_before_returning():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     runner = ALRunner(evalcli=evalcli)
 
     runner.run(
@@ -248,7 +193,7 @@ def test_adapter_aligns_objective_clients_once_and_forwards_bigquery_client():
     adapter.bigquery_client = client
     assert adapter.objective.bigquery_client is client
 
-    with patch.object(adapter.objective, "analyze", return_value=_tool_match_analysis()) as analyze:
+    with patch.object(adapter.objective, "analyze", return_value=tool_match_analysis()) as analyze:
         adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
     request = analyze.call_args.kwargs["request"]
     assert analyze.call_args.args == ("teacher-1", "student-1")
@@ -308,7 +253,7 @@ def test_get_or_fetch_analysis_caches_fetch():
 def test_empty_paired_analysis_is_not_cached():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
-    empty = _tool_match_analysis(compared_entries=0)
+    empty = tool_match_analysis(compared_entries=0)
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
         return_value=empty,
@@ -320,86 +265,11 @@ def test_empty_paired_analysis_is_not_cached():
     assert ("teacher-1", "student-1") not in adapter._analysis_cache
 
 
-def test_empty_trace_refetch_keeps_the_unhydrated_entry():
-    adapter = _teacher_student_adapter(MagicMock())
-    adapter.bigquery_client = MagicMock()
-    unhydrated = _tool_match_analysis()
-    empty = _tool_match_analysis(compared_entries=0)
-    with patch(
-        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
-        side_effect=[unhydrated, empty],
-    ) as fetch:
-        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
-        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
-        third = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
-
-    assert first is unhydrated
-    assert second is unhydrated
-    assert third is unhydrated
-    assert fetch.call_count == 2
-    assert adapter._analysis_cache[("teacher-1", "student-1")] is unhydrated
-    assert ("teacher-1", "student-1") in adapter.objective._unhydrated_pairs
-
-
-def test_missing_bigquery_client_does_not_cache_the_empty_analysis():
-    adapter = _teacher_student_adapter(MagicMock())
-
-    first = adapter._get_or_fetch_analysis("teacher-1", "student-1")
-    second = adapter._get_or_fetch_analysis("teacher-1", "student-1")
-
-    assert first.aggregate.compared_entries == 0
-    assert second.aggregate.compared_entries == 0
-    assert ("teacher-1", "student-1") not in adapter._analysis_cache
-
-
-def test_validation_fetch_then_trace_fetch_rehydrates():
-    evalcli = MagicMock()
-    adapter = _teacher_student_adapter(evalcli)
-    adapter.bigquery_client = MagicMock()
-    unhydrated = _tool_match_analysis()
-    hydrated = _tool_match_analysis()
-    with patch(
-        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
-        side_effect=[unhydrated, hydrated],
-    ) as fetch:
-        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
-        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
-
-    assert first is unhydrated
-    assert second is hydrated
-    assert fetch.call_count == 2
-    assert fetch.call_args_list[0].kwargs["evalcli"] is evalcli
-    assert fetch.call_args_list[0].kwargs["include_action_inputs"] is False
-    assert fetch.call_args_list[1].kwargs["evalcli"] is evalcli
-    assert fetch.call_args_list[1].kwargs["include_action_inputs"] is True
-    assert adapter._analysis_cache[("teacher-1", "student-1")] is hydrated
-    assert ("teacher-1", "student-1") not in adapter.objective._unhydrated_pairs
-
-
-def test_trace_fetch_then_validation_fetch_is_one_call():
-    evalcli = MagicMock()
-    adapter = _teacher_student_adapter(evalcli)
-    adapter.bigquery_client = MagicMock()
-    hydrated = _tool_match_analysis()
-    with patch(
-        "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
-        return_value=hydrated,
-    ) as fetch:
-        first = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=True)
-        second = adapter._get_or_fetch_analysis("teacher-1", "student-1", include_action_inputs=False)
-
-    fetch.assert_called_once()
-    assert fetch.call_args.kwargs["evalcli"] is evalcli
-    assert fetch.call_args.kwargs["include_action_inputs"] is True
-    assert first is hydrated
-    assert second is hydrated
-
-
 def test_seeded_analysis_cache_hits_for_a_trace_call():
     evalcli = MagicMock()
     adapter = _teacher_student_adapter(evalcli)
     adapter.bigquery_client = MagicMock()
-    seeded = _tool_match_analysis()
+    seeded = tool_match_analysis()
     adapter._analysis_cache[("teacher-1", "student-1")] = seeded
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
@@ -413,7 +283,7 @@ def test_seeded_analysis_cache_hits_for_a_trace_call():
 def test_validation_only_skips_action_input_hydration():
     adapter = _teacher_student_adapter(MagicMock())
     adapter.bigquery_client = MagicMock()
-    fetched = _tool_match_analysis()
+    fetched = tool_match_analysis()
 
     with patch(
         "glean_gepa.objectives.tool_match.fetch_eval_run_tool_match_analysis",
@@ -490,7 +360,7 @@ def test_finish_batch_evals_uses_tool_match_and_correctness():
 
 
 def _finish_one_pair(adapter, *, validation_only: bool = False):
-    adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis()
+    adapter._analysis_cache[("teacher-1", "student-1")] = tool_match_analysis()
     al_data_inst = {**EVAL_SET, **({"validation_only": True} if validation_only else {})}
     return adapter._finish_batch_evals(
         [
@@ -640,7 +510,7 @@ def test_full_validation_returns_one_row_per_eval_set_not_per_entry():
 
 def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
     batch = [
         {
@@ -651,7 +521,7 @@ def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
         }
     ]
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate(batch, {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
     creates = [call.kwargs for call in evalcli.create_eval_run.call_args_list]
@@ -709,7 +579,7 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
 
 def test_finish_focused_eval_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
-    adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
+    adapter._analysis_cache[("teacher-1", "student-1")] = tool_match_analysis(compared_entries=0)
 
     with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
@@ -726,7 +596,7 @@ def test_finish_focused_eval_raises_when_no_entries_were_compared():
 
 def test_finish_batch_evals_raises_when_no_entries_were_compared():
     adapter = _teacher_student_adapter(MagicMock())
-    adapter._analysis_cache[("teacher-1", "student-1")] = _tool_match_analysis(compared_entries=0)
+    adapter._analysis_cache[("teacher-1", "student-1")] = tool_match_analysis(compared_entries=0)
 
     with pytest.raises(NoComparedEntriesError, match="No eval entries were compared"):
         adapter._finish_batch_evals(
@@ -743,7 +613,7 @@ def test_finish_batch_evals_raises_when_no_entries_were_compared():
 
 def test_launched_eval_ids_are_tracked_in_flight_before_wait():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
 
     with patch.object(adapter.runner, "wait", side_effect=TimeoutError("terminal timed out")):
@@ -756,14 +626,14 @@ def test_launched_eval_ids_are_tracked_in_flight_before_wait():
 
 def test_in_flight_eval_ids_resume_wait_instead_of_recreating():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     adapter = _teacher_student_adapter(evalcli)
     with patch.object(adapter.runner, "wait", side_effect=TimeoutError("terminal timed out")):
         with pytest.raises(TimeoutError):
             adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
     launched_ids = sorted(adapter.runner._in_flight)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
     assert evalcli.create_eval_run.call_count == 2
@@ -792,11 +662,11 @@ def _stub_correctness_judge(evalcli: MagicMock, events: list[str], *, score: flo
 
 def test_correctness_judge_scores_the_student_against_the_teacher():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     _stub_correctness_judge(evalcli, events)
     adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         result = adapter.evaluate([EVAL_SET], {"WRITING_CODE": "test prompt"}, capture_traces=False)
 
     create_idxs = [i for i, event in enumerate(events) if event.startswith("create:")]
@@ -821,11 +691,11 @@ def test_correctness_judge_scores_the_student_against_the_teacher():
 
 def test_correctness_judge_runs_once_per_student_across_candidates():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     _stub_correctness_judge(evalcli, events)
     adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate_many(
             [EVAL_SET],
             [{"WRITING_CODE": "prompt a"}, {"WRITING_CODE": "prompt b"}],
@@ -840,7 +710,7 @@ def test_correctness_judge_runs_once_per_student_across_candidates():
 
 def test_evaluate_many_starts_each_pairwise_judge_when_that_pair_finishes():
     events: list[str] = []
-    evalcli = _evalcli_with_ordered_events(events)
+    evalcli = evalcli_with_ordered_events(events)
     _stub_correctness_judge(evalcli, events)
 
     def get_eval_metrics(eval_id, **_kwargs):
@@ -856,7 +726,7 @@ def test_evaluate_many_starts_each_pairwise_judge_when_that_pair_finishes():
     evalcli.get_eval_metrics.side_effect = get_eval_metrics
     adapter = _teacher_student_adapter(evalcli, judge_correctness=True)
 
-    with patch.object(adapter, "_get_or_fetch_analysis", return_value=_tool_match_analysis()):
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=tool_match_analysis()):
         adapter.evaluate_many(
             [EVAL_SET],
             [{"WRITING_CODE": "prompt a"}, {"WRITING_CODE": "prompt b"}],
@@ -1045,3 +915,92 @@ def test_make_reflective_dataset_shares_non_core_mismatches_with_tool_modules():
         "First-tool mismatch: teacher used Write and student called no scored tool, "
         "emitting only skipped steps such as the automatic vault retrieval or shell."
     )
+
+
+# --- judges that only gate validation: keyed by adapter judge_type, started only where read ---
+
+_GATE_ONLY_CONFIG = """schema_version: 1
+mode: teacher_student
+signals:
+  - name: tool_alignment
+    source: tool_match
+    lookback_days: 7
+  - name: {judge}
+    source: cortex_judge
+    type: {judge_type}
+    kind: pairwise
+objective:
+  primary: tool_alignment
+  composite:
+    tool_alignment: 1.0
+  params:
+    tool_alignment: {{}}
+  validation:
+    - metric: {judge}
+      min: 0.5
+screening:
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: tool_alignment
+"""
+
+_SHARED_CORTEX_SPECS = [s for s in JUDGE_SPECS.values() if s.kind == "pairwise" and s.cortex_type_override]
+
+
+def _gate_only_adapter(tmp_path, spec, evalcli=None, **overrides) -> TeacherStudentAdapter:
+    path = tmp_path / "gate_only.yaml"
+    path.write_text(_GATE_ONLY_CONFIG.format(judge=spec.name, judge_type=spec.judge_type))
+    kwargs = dict(
+        runner=ALRunner(evalcli=evalcli or MagicMock()),
+        teacher_model="gpt",
+        student_model="fast",
+        thresholds=THRESHOLDS,
+        pairwise_judges=pairwise_judges(load_experiment_config(path)),
+        screening_kind="high_signal_fix_rate",
+    )
+    kwargs.update(overrides)
+    return TeacherStudentAdapter(**kwargs)
+
+
+def _pair(*, focused: bool = False, validation: bool = False) -> _StartedPair:
+    inst = {"eval_set_name": "set", "eval_set_version": "v1", "deployment_ids": ["prod"], "status": "active"}
+    if focused:
+        inst["eval_entry_ids"] = ["e1", "e2"]
+    if validation:
+        inst["validation_only"] = True
+    return _StartedPair(al_data_inst=inst, teacher_eval_id="t", student_eval_id="s")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("spec", _SHARED_CORTEX_SPECS, ids=lambda s: s.name)
+def test_adapter_keys_shared_cortex_judges_by_their_own_judge_type(tmp_path, spec):
+    evalcli = MagicMock()
+    evalcli.find_judge_run_id.return_value = None
+    evalcli.create_judge_run.return_value = "judge-x"
+    adapter = _gate_only_adapter(tmp_path, spec, evalcli)
+    judge = next(j for j in adapter.pairwise_judges if j.name == spec.name)
+    run_id = adapter._ensure_judge(
+        "student-ev",
+        judge_type=judge.judge_type,
+        run_params=judge.run_params,
+        base_eval_run_id="teacher-ev",
+        input_mappings=judge.input_mappings,
+        cortex_judge_type=judge.cortex_judge_type,
+        judge_skill_name=judge.judge_skill_name,
+    )
+    assert run_id == "judge-x"
+    assert evalcli.create_judge_run.call_args.kwargs["judge_type"] == spec.cortex_judge_type
+    assert adapter._judge_runs[("student-ev", "teacher-ev", spec.judge_type)] == "judge-x"
+    assert ("student-ev", "teacher-ev", spec.cortex_judge_type) not in adapter._judge_runs
+
+
+def test_judges_start_only_where_the_search_reads_them(tmp_path):
+    """Validation evals start every judge; train/focused evals only those in the composite or screen."""
+    spec = _SHARED_CORTEX_SPECS[0]
+    names = lambda adapter, pair: [j.name for j in adapter._pairwise_judges_for_pair(pair)]
+    gate_only = _gate_only_adapter(tmp_path, spec)
+    assert names(gate_only, _pair(validation=True)) == [spec.name]
+    assert names(gate_only, _pair()) == [] and names(gate_only, _pair(focused=True)) == []
+    in_composite = _gate_only_adapter(tmp_path, spec, composite_weights={"tool_alignment": 0.5, spec.name: 0.5})
+    assert names(in_composite, _pair()) == [spec.name] and names(in_composite, _pair(focused=True)) == [spec.name]
+    in_screen = _gate_only_adapter(tmp_path, spec, screening_weights={"tool_alignment": 0.5, spec.name: 0.5})
+    assert names(in_screen, _pair(focused=True)) == [spec.name]

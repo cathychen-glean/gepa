@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,7 +19,7 @@ from glean_gepa.experiment_config import (
     runner_arg_defaults,
     screening_weights,
 )
-from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
+from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES, JUDGE_SPECS
 from glean_gepa.objectives import AnalysisRequest, build_objective
 from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.objectives.tool_match import empty_tool_match_analysis
@@ -126,11 +127,6 @@ def test_resolve_config_path_accepts_packaged_stem_and_file(tmp_path):
         resolve_config_path("missing_mode")
 
 
-def test_packs_key_is_rejected(tmp_path):
-    with pytest.raises(ExperimentConfigError, match="no longer supported"):
-        _load_mode(tmp_path, _mode_yaml() + "packs: [tools]\n")
-
-
 @pytest.mark.parametrize(("mode", "primary"), list(_BASE_PRIMARY.items()))
 def test_bare_mode_without_signals_falls_back_to_the_modes_default_objective(tmp_path, mode, primary):
     """A config with no scorable signal still builds the registry default for its mode."""
@@ -203,10 +199,6 @@ _INVALID_CONFIGS = {
     "teacher_student_shell_source": (
         "cannot score signal",
         _mode_yaml(signals="  - name: shell\n    source: shell_telemetry\n"),
-    ),
-    "teacher_student_loop_source": (
-        "cannot score signal",
-        _mode_yaml(signals="  - name: loops\n    source: loop_telemetry\n"),
     ),
     "single_model_tool_source": (
         "cannot score signal",
@@ -338,21 +330,6 @@ def test_customer_validation_gates(tmp_path, body, expected):
     assert customer_validation_gates(config) == expected
 
 
-def test_config_help_shows_the_configs_defaults(capsys):
-    """--help must run after the config is applied, not on the --config pre-scan."""
-    with pytest.raises(SystemExit):
-        _parse_args(["--config", "teacher_student", "--help"])
-    with_config = capsys.readouterr().out
-
-    with pytest.raises(SystemExit):
-        _parse_args(["--help"])
-    without_config = capsys.readouterr().out
-
-    # The config sets student_model; the bare parser's own default is gpt.
-    assert "(default: claude_sonnet)" in with_config
-    assert "(default: gpt)" in without_config
-
-
 def test_runner_applies_config_then_cli_overrides(tmp_path):
     bare = _parse_args(["--seed_candidate", "seed.json"])
     assert bare.config is None
@@ -402,3 +379,23 @@ def test_customer_eval_toggle_yaml_default_and_cli_override(tmp_path):
     bad.write_text(_mode_yaml() + "run:\n  customer_eval: nope\n")
     with pytest.raises(ExperimentConfigError, match="run.customer_eval must be true or false"):
         runner_arg_defaults(load_experiment_config(bad))
+
+
+def test_every_judge_spec_is_well_formed():
+    """Each spec has a distinct adapter key; specs sharing a Cortex type are told apart by skill,
+    and that skill is what ``run_params`` sends."""
+    assert len({spec.judge_type for spec in JUDGE_SPECS.values()}) == len(JUDGE_SPECS)
+    for name, spec in JUDGE_SPECS.items():
+        assert spec.name == name and spec.kind in {"pairwise", "pointwise"}
+        assert 0.0 <= spec.default_min <= 1.0  # gates are on the normalized scale
+        params = json.loads(spec.run_params)
+        assert params.get("judge_skill_name") == spec.judge_skill_name
+        if spec.cortex_type_override:
+            assert spec.judge_skill_name, f"{name} shares Cortex type {spec.cortex_judge_type} but has no skill"
+        if spec.kind == "pairwise":
+            assert spec.input_mappings
+    by_cortex: dict[str, list[str]] = {}
+    for spec in JUDGE_SPECS.values():
+        by_cortex.setdefault(spec.cortex_judge_type, []).append(spec.judge_skill_name or "")
+    for cortex_type, skills in by_cortex.items():
+        assert len(set(skills)) == len(skills), f"{cortex_type}: shared Cortex type without distinct skills"

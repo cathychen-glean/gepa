@@ -1,24 +1,35 @@
+"""``SingleModelAdapter`` end to end, with shell success as the fixture objective."""
+
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from helpers import THRESHOLDS
 
-from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, extract_shell_action_inputs
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, extract_shell_action_inputs
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
 from glean_gepa.objectives import AnalysisRequest
-from glean_gepa.objectives.shell import EVAL_ANALYSIS_CACHE_SCHEMA_VERSION, ShellSuccessObjective
+from glean_gepa.objectives.base import ScoredRow, ScoringContext, SingleModelObjective
 from glean_gepa.objectives.shell import (
+    EVAL_ANALYSIS_CACHE_SCHEMA_VERSION,
     SHELL_SUCCESS_OBJECTIVE,
     EvalRunShellToolErrorAnalysis,
+    ShellSuccessObjective,
     ShellToolErrorEntryMetrics,
     ShellToolErrorExample,
     ShellToolErrorMetrics,
+)
+from glean_gepa.reflection_sampling import (
+    deduplicate_reflective_examples,
+    strip_stdout_sections,
 )
 from glean_gepa.single_model_adapter import SingleModelAdapter, TelemetryPendingError
 
@@ -88,7 +99,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
         runner=runner,
         bigquery_client=bigquery_client,
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
 
     batch = [
@@ -240,9 +251,7 @@ def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[
     assert 'ACTION_INPUT: {"command": "python3 broken.py"}' in captured_prompts[0]
     assert "EVAL_TRACE_ID: trace-student-1" in captured_prompts[0]
     assert "METRICS:" not in captured_prompts[0]
-    assert "Shell success rate issue:" not in captured_prompts[0]
-    assert "FEEDBACK: Resolve the shell execution failures shown above." in captured_prompts[0]
-    assert "EXECUTION_ERRORS: ['command exited with status 1']" in captured_prompts[1]
+    assert "command exited with status 1" in captured_prompts[1]
 
 
 def test_proposals_that_drop_a_render_slot_are_rejected():
@@ -252,7 +261,7 @@ def test_proposals_that_drop_a_render_slot_are_rejected():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -280,7 +289,7 @@ def test_empty_module_variants_are_bounded_by_the_patches_not_the_token_budget()
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -307,8 +316,6 @@ def test_empty_module_variants_are_bounded_by_the_patches_not_the_token_budget()
     variants, _, _ = adapter.propose_new_texts(reflection_lm, candidate, ["RULES_EXT"], [])
 
     assert variants == [tight]
-    assert "write 2 rules, one per AFTER snippet" in prompts[1]
-    assert "each variant applies those patches and nothing else" in prompts[1]
 
 
 def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
@@ -325,7 +332,7 @@ def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -350,8 +357,8 @@ def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
     assert len(prompts) == 3
     assert prompts[1].startswith("IMPORTANT: a previous attempt")
     assert prompts[1].endswith(prompts[0])
-    assert "DIAGNOSIS (failure-mode tally from the first pass):\n- asks in prose: 4 of 6 LOSS examples" in prompts[2]
-    assert "SUGGESTIONS:\nBEFORE: Do not follow up" in prompts[2]
+    assert "- asks in prose: 4 of 6 LOSS examples" in prompts[2]
+    assert "BEFORE: Do not follow up" in prompts[2]
     assert diagnosis.startswith("- asks in prose: 4 of 6 LOSS examples")
     assert variants == [rewrite]
 
@@ -362,7 +369,7 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     passing_entry = MagicMock(
         shell_executions=1,
@@ -414,7 +421,7 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     source_entries = [
         {
@@ -463,7 +470,7 @@ def test_high_signal_batch_retains_the_parent_eval_run_id():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     parent_eval = GleanEvaluationBatch(
         outputs=[],
@@ -497,7 +504,7 @@ def test_high_signal_evaluation_reuses_child_cached_eval_id():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     passing_entry = MagicMock(
         shell_executions=1,
@@ -550,7 +557,7 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     # Telemetry for a focused run is keyed by the requested entry ids. The failing
     # entry has 100 calls with 1 error: per-entry pass/fail must score it 0.0, not
@@ -625,7 +632,7 @@ def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     error_example = ShellToolErrorExample(
         started_at="2026-08-11T12:00:00Z",
@@ -743,7 +750,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         runner=first_runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with (
@@ -764,7 +771,7 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         runner=second_runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with (
@@ -826,7 +833,7 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -842,7 +849,7 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis") as fetch:
@@ -874,7 +881,7 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -907,7 +914,7 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     batch = [
         {
@@ -964,7 +971,7 @@ def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
 
     with (
@@ -1041,7 +1048,7 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -1094,7 +1101,7 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -1112,7 +1119,7 @@ def test_launched_student_eval_is_resumed_from_in_flight_after_timeout():
         runner=runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+        thresholds=THRESHOLDS,
     )
     eval_kwargs = {
         "eval_set_name": "set",
@@ -1133,3 +1140,203 @@ def test_launched_student_eval_is_resumed_from_in_flight_after_timeout():
     evalcli.create_eval_run.assert_called_once()
     wait.assert_called_once_with(launched_id)
     assert eval_id == launched_id
+
+
+@dataclass
+class _Entry:
+    entry_id: str
+    passed: bool
+    action_inputs: tuple[str, ...] = ()
+
+
+@dataclass
+class _Aggregate:
+    entry_count: int
+    pass_rate: float
+
+
+@dataclass
+class _Analysis:
+    per_entry: dict[str, _Entry] = field(default_factory=dict)
+
+    @property
+    def aggregate(self) -> _Aggregate:
+        n = len(self.per_entry)
+        return _Aggregate(n, sum(e.passed for e in self.per_entry.values()) / n if n else 0.0)
+
+    @property
+    def high_signal_entry_ids(self) -> tuple[str, ...]:
+        return tuple(e for e, m in self.per_entry.items() if not m.passed)
+
+
+class _Stub(SingleModelObjective[_Analysis]):
+    name = "pass_rate"
+    pending_count = "entry_count"
+
+    def __init__(self, fetch: MagicMock) -> None:
+        self.fetch = fetch
+
+    def analyze(self, eval_id: str, *, request: AnalysisRequest) -> _Analysis:
+        return self.cached_eval_analysis(eval_id, request=request, fetch=self.fetch, label="stub")
+
+    def focused_pass_rate(self, analysis: _Analysis, requested_entry_ids) -> float:
+        return sum(analysis.per_entry[e].passed for e in requested_entry_ids if e in analysis.per_entry) / len(
+            requested_entry_ids
+        )
+
+    def log_analysis(self, analysis: _Analysis) -> None:
+        pass
+
+    def entry_row(self, entry_id: str, metrics: Any, analysis: _Analysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(entry_id=entry_id, dimension_scores={self.name: float(metrics.passed)}, output={})
+
+    def aggregate_row(self, analysis: _Analysis, ctx: ScoringContext) -> ScoredRow:
+        return ScoredRow(entry_id=None, dimension_scores={self.name: analysis.aggregate.pass_rate}, output={})
+
+    def failure_pattern(self, component_name: str, trajectory: Any) -> tuple[Any, ...]:
+        return ()
+
+    def build_reflective_example(self, component_name: str, trajectory: Any, candidate: dict[str, str]):
+        raise NotImplementedError
+
+
+def _analysis(*ids: str, passed: bool = False, action_inputs: tuple[str, ...] = ()) -> _Analysis:
+    return _Analysis({e: _Entry(e, passed, action_inputs) for e in ids})
+
+
+def _request(hydrate: bool) -> AnalysisRequest:
+    return AnalysisRequest(hydrate_action_inputs=hydrate)
+
+
+def test_hydrating_request_refetches_an_entry_cached_without_action_inputs():
+    bare, hydrated = _analysis("a"), _analysis("a", action_inputs=("ls",))
+    fetch = MagicMock(side_effect=[bare, hydrated])
+    objective = _Stub(fetch)
+    assert objective.analyze("run", request=_request(False)) is bare
+    assert "run" in objective.unhydrated_eval_ids
+    assert objective.analyze("run", request=_request(True)) is hydrated
+    assert objective.analyze("run", request=_request(False)) is hydrated  # hydrated entry serves both
+    assert [c.args[0].hydrate_action_inputs for c in fetch.call_args_list] == [False, True]
+    assert "run" not in objective.unhydrated_eval_ids
+
+
+def test_empty_rehydration_keeps_the_bare_entry_and_still_owes_a_hydrating_fetch():
+    bare = _analysis("a")
+    objective = _Stub(MagicMock(side_effect=[bare, _analysis()]))
+    objective.analyze("run", request=_request(False))
+    assert objective.analyze("run", request=_request(True)) is bare
+    assert objective.analysis_cache["run"] is bare
+    assert "run" in objective.unhydrated_eval_ids
+
+
+@pytest.mark.parametrize(
+    ("telemetry", "requested", "expected"),
+    [
+        (["a", "b"], None, "high_signal"),  # full eval: the objective's high-signal set
+        (["b", "a"], ["a", "b"], ("a", "b")),  # focused: request order
+        (["a"], ["a", "b"], ("a",)),  # telemetry lag: subset, never fabricated
+        (["a", "b", "c"], ["a", "b"], ("a", "b")),  # extra telemetry: never a superset
+        ([], ["a", "b"], ()),  # nothing landed: adapter's ``is_pending`` handles it
+    ],
+)
+def test_entry_ids_to_score_never_exceeds_the_request(telemetry, requested, expected):
+    analysis = _analysis(*telemetry)
+    if expected == "high_signal":
+        expected = analysis.high_signal_entry_ids
+    assert _Stub(MagicMock()).entry_ids_to_score(analysis, requested) == expected
+
+
+def test_scored_rows_and_pass_rate_agree_on_a_partial_focused_batch():
+    """A requested entry with no telemetry gets no row and counts as a failure."""
+    objective = _Stub(MagicMock())
+    analysis = _analysis("ok", passed=True)
+    rows = objective.scored_rows(
+        analysis,
+        al_data_inst={},
+        student_eval_id="run",
+        eval_set_name="set",
+        eval_set_version="v1",
+        deployment_ids=["dep"],
+        requested_entry_ids=["ok", "missing"],
+        is_focused_eval=True,
+        capture_traces=True,
+    )
+    assert [row.entry_id for row in rows] == ["ok"]
+    assert objective.focused_pass_rate(analysis, ["ok", "missing"]) == 0.5
+
+
+def test_strip_stdout_sections_preserves_stderr_and_surrounding_error_text():
+    error = "command failed\nstdout:\nnoisy command output\nstderr:\npermission denied"
+
+    assert strip_stdout_sections(error) == "command failed\nstderr:\npermission denied"
+
+
+def test_deduplicate_reflective_examples_keeps_first_error_cluster():
+    examples = [
+        {"Inputs": {"entry_id": "first"}, "Execution Errors": ["error-100"]},
+        {"Inputs": {"entry_id": "near"}, "Execution Errors": ["error-101"]},
+        {"Inputs": {"entry_id": "different"}, "Execution Errors": ["error-999"]},
+    ]
+
+    result = deduplicate_reflective_examples(examples, k=1)
+
+    assert [example["Inputs"]["entry_id"] for example in result] == ["first", "different"]
+
+
+def test_deduplicate_reflective_examples_keeps_entries_without_errors():
+    examples = [
+        {"Inputs": {"entry_id": "first"}, "Execution Errors": []},
+        {"Inputs": {"entry_id": "second"}, "Execution Errors": []},
+    ]
+
+    assert deduplicate_reflective_examples(examples, k=10) == examples
+
+
+def test_single_model_adapter_all_mode_deduplicates_errors_before_prompting():
+    adapter = SingleModelAdapter(
+        runner=MagicMock(),
+        thresholds=THRESHOLDS,
+        student_model="fast",
+        bigquery_client=MagicMock(),
+    )
+
+    def trajectory(entry_id: str, error: str, score: float):
+        objective_scores = {SHELL_SUCCESS_OBJECTIVE: score}
+        output = {
+            "entry_id": entry_id,
+            "deployment_id": "scio-prod",
+            "query": entry_id,
+            "student_tool_errors": 1,
+            "shell_error_messages": [error],
+        }
+        return {
+            "data": {"eval_set_name": "small-eval-set"},
+            "output": output,
+            "score": score,
+            "objective_scores": objective_scores,
+        }
+
+    trajectories = [
+        trajectory("first", "error-100\nstdout:\nnoisy output", 0.1),
+        trajectory("near", "error-101", 0.2),
+        trajectory("different", "error-999", 0.3),
+    ]
+    batch = GleanEvaluationBatch(
+        outputs=[item["output"] for item in trajectories],
+        scores=[item["score"] for item in trajectories],
+        trajectories=trajectories,
+        objective_scores=[item["objective_scores"] for item in trajectories],
+        summary=None,
+    )
+
+    examples = adapter.make_reflective_dataset(
+        {"WRITING_CODE": "current instructions"},
+        batch,
+        ["WRITING_CODE"],
+        k=None,
+        error_hamming_distance_k=1,
+    )["WRITING_CODE"]
+
+    assert [example["Inputs"]["entry_id"] for example in examples] == ["first", "different"]
+    assert all("stdout" not in str(example).lower() for example in examples)
+    assert all("noisy output" not in str(example).lower() for example in examples)

@@ -3,17 +3,13 @@
 # This file is self-contained. `signals`, `objective`, `screening`, and
 # `reflection` below are the full experiment; nothing is merged in from elsewhere.
 # `signals[].source` must be a telemetry source registered for this mode in
-# glean_gepa/objectives/registry.py (teacher_student: tool_match, citation_match,
-# agentic_preference).
-#
-# To optimize citation-set alignment instead, swap in the `citation_match` variant
-# shown in comments at each section.
+# glean_gepa/objectives/registry.py.
 
 schema_version: 1
 mode: teacher_student
 
 run:
-  dir: run_ts # or dir: run_ts_citations
+  dir: run_ts
   max_metric_calls: 10
   eval_run_timeout_sec: 21600
   seed_candidate: data/seed_candidate.json
@@ -34,10 +30,6 @@ signals:
   - name: tool_alignment
     source: tool_match
     lookback_days: 7
-  # citations variant:
-  # - name: citation_match
-  #   source: citation_match
-  #   lookback_days: 7
   - name: correctness
     source: cortex_judge
     type: CORRECTNESS
@@ -49,13 +41,12 @@ signals:
 
 objective:
   # Parent selection reads the primary. The child gate is screening.weights.
-  primary: tool_alignment # or citation_match
+  primary: tool_alignment
   frontier_type: hybrid
   composite:
-    tool_alignment: 1.0 # or citation_match: 1.0
+    tool_alignment: 1.0
   focused_bucket_type: QUERY_CANONICAL
   params:
-    # tool_match only; citations variant uses failure_score_below: 1.0 and no skipped_tools.
     skipped_tools:
       - Personal Knowledge Vault Retrieve
       - Shell
@@ -71,20 +62,17 @@ objective:
 screening:
   kind: high_signal_fix_rate
   threshold: 0.25
-  high_signal: tool_alignment # or citation_match
+  high_signal: tool_alignment
   # Focused child must clear threshold on this blend. The agentic judge is
   # started because it is named here, even though it is not the primary.
   weights:
-    tool_alignment: 0.5 # or citation_match: 0.5
+    tool_alignment: 0.5
     agentic_preference_rate: 0.5
 
 reflection:
-  editable_modules: [CORE_TOOLS, RULES_EXT] # citations variant: [WRITING_CODE, RULES_EXT]
+  editable_modules: [CORE_TOOLS, RULES_EXT]
   failure_label: "HIGH-SIGNAL FAILURES (teacher vs student tool match)"
   report_title: "REFLECTION: teacher vs student tool sequences"
-  # citations variant:
-  # failure_label: "HIGH-SIGNAL FAILURES (teacher vs student citation match)"
-  # report_title: "REFLECTION: teacher vs student citation sets"
   # Override module reflection prompts with modules.<KEY>.
 
 search:
