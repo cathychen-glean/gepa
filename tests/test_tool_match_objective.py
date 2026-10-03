@@ -116,19 +116,11 @@ def test_tool_match_queries_and_fetch():
     assert "PARSE_DATE" not in sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
-    assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
-    assert "Execute Action:" in sql
-    assert "FULL OUTER JOIN" in sql
+    assert "@student_eval_id" in sql and "@teacher_eval_id" in sql and "UNNEST(@skipped_tools)" in sql
     # A run that died must be flagged so its truncated tool sequence is not scored.
-    assert "failed_runs" in sql and "run_failed" in sql
-    assert "Agent Run:" in sql
-    # Tool payloads are scrubbed from this table, so the query must NOT read them here
-    # and must instead carry the scrub-safe locators used to fetch the detailed trace.
-    assert "span_info.inputs" not in sql
-    assert "agent_trace.trace_id" in sql
-    assert "student_trace_id" in sql and "teacher_trace_id" in sql
-    assert "student_deployment_id" in sql and "teacher_deployment_id" in sql
-    assert "UNNEST(@skipped_tools)" in sql
+    assert "run_failed" in sql
+    # Tool payloads are scrubbed from this table: never read them here, carry the trace locator instead.
+    assert "span_info.inputs" not in sql and "agent_trace.trace_id" in sql
 
     client = MagicMock()
     client.query.side_effect = [

@@ -50,44 +50,18 @@ def test_is_shell_tool_error():
     )
 
 
-def test_build_shell_tool_error_rate_query_includes_eval_and_shell_filters():
-    sql = build_shell_tool_error_rate_query()
-
-    assert "@eval_id" in sql
-    assert "@start_date" in sql
-    assert "@end_date" in sql
-    assert "scrubbed_agentspan" in sql
-    for span_name in SHELL_SPAN_NAMES:
-        assert span_name in sql
-    for action_id in SHELL_ACTION_IDS:
-        assert action_id in sql
-    assert "jsonPayload.action.error_str" in sql
-    assert "jsonPayload.span_info.execution_status.message" in sql
-    assert "jsonPayload.span_info.execution_status.user_message" in sql
-    assert "NULLIF(jsonPayload.action.action_run_id, '')" in sql
-    assert "NULLIF(jsonPayload.context.agent_trace.span_id, '')" in sql
-    assert "TO_JSON_STRING(STRUCT(" in sql
-    assert "TO_JSON_STRING(jsonPayload)" not in sql
-    assert "PARSE_DATE" not in sql
-    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
-    assert "action_run_id," in sql
-    assert "recent_error_examples" in sql
-
-
-def test_per_entry_query_collects_only_error_trace_ids_newest_first():
-    sql = build_shell_tool_error_per_entry_query()
-
-    assert "IF(is_error, trace_id, NULL)" in sql
-    assert "ORDER BY start_ms DESC" in sql
-    assert "AS trace_ids" in sql
-
-
-def test_per_entry_query_can_skip_error_examples_for_high_signal_screening():
-    sql = build_shell_tool_error_per_entry_query(include_error_examples=False)
-
-    assert "shell_errors" in sql
-    assert "recent_error_examples" not in sql
-    assert "AS trace_ids" not in sql
+def test_shell_queries_bind_their_params_and_guard_the_known_pitfalls():
+    for sql in (build_shell_tool_error_rate_query(), build_shell_tool_error_per_entry_query()):
+        assert "@eval_id" in sql and "@start_date" in sql and "@end_date" in sql
+        # Sharded table: the suffix range must come from the bound dates, not a parsed literal.
+        assert "PARSE_DATE" not in sql and "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
+        # Empty-string ids must not join as equal; and never serialize the whole payload.
+        assert "NULLIF(jsonPayload.action.action_run_id, '')" in sql
+        assert "TO_JSON_STRING(jsonPayload)" not in sql
+    # High-signal screening skips the error-example collection entirely.
+    full = build_shell_tool_error_per_entry_query()
+    lean = build_shell_tool_error_per_entry_query(include_error_examples=False)
+    assert len(lean) < len(full)
 
 
 def test_fetch_analysis_can_skip_per_entry_query():

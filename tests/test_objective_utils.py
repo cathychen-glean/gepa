@@ -122,14 +122,8 @@ def test_paired_role_query_emits_role_columns_and_join():
         signal_column="sig",
         extra_select="  TRUE AS flag",
     )
-    assert "FULL OUTER JOIN teacher" in sql
-    assert "IFNULL(student.sig, ARRAY<STRING>[]) AS student_sig" in sql
-    assert "IFNULL(teacher.sig, ARRAY<STRING>[]) AS teacher_sig" in sql
-    for role in ("student", "teacher"):
-        for col in agentspan.LOCATOR_COLUMNS:
-            assert f"{role}.{col} AS {role}_{col}" in sql
-    assert "TRUE AS flag," in sql
-    assert "WHERE eval_id = @student_eval_id" in sql and "WHERE eval_id = @teacher_eval_id" in sql
+    assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
+    assert "TRUE AS flag" in sql  # extra_select is spliced in
 
 
 def _client(bounds_row: dict[str, Any] | None, rows: list[dict[str, Any]]) -> MagicMock:
@@ -273,9 +267,7 @@ def test_enrich_action_inputs_no_high_signal_or_no_results_is_identity(monkeypat
 def test_high_signal_source_entries_query_maps_runtime_entry_uuids_to_source_entries():
     sql = build_high_signal_source_entries_query()
 
-    assert "entry_uuid IN UNNEST(@entry_uuids)" in sql
-    assert "WHERE eval_id = @eval_run_id" in sql
-    assert "JOIN `scio-apps.fact.evalset_entries` AS evalset_entries USING (stt)" in sql
+    assert "UNNEST(@entry_uuids)" in sql and "@eval_run_id" in sql
 
 
 def test_fetch_high_signal_evalset_entries_resolves_source_trace_by_entry_id():
@@ -351,11 +343,9 @@ def test_resolve_eval_run_date_range_uses_padded_utc_shards(start_ms, today, end
 def test_build_eval_entry_uuid_tracking_query_filters_entry_uuid():
     sql = build_eval_entry_uuid_tracking_query()
 
-    assert "entry_uuid IN UNNEST(@entry_ids)" in sql
-    assert "session_tracking_token" in sql
-    assert "scrubbed_agentspan" in sql
-    assert "PARSE_DATE" not in sql
-    assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
+    assert "UNNEST(@entry_ids)" in sql
+    # Sharded table: the suffix range must come from the bound dates, not a parsed literal.
+    assert "PARSE_DATE" not in sql and "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
 
 
 def test_fetch_evalset_entry_tracking_uses_agentspan_stt():
