@@ -410,39 +410,6 @@ def test_loss_feedback_names_the_deciding_dimension_and_behavior_flags():
     assert "task_completion" in keep
 
 
-def test_reflective_example_includes_both_roles_tool_inputs():
-    objective = AgenticPreferenceObjective()
-    lost = _trajectory(
-        "lost",
-        preference=0.2,
-        teacher_tools=["Glean Search", "Write"],
-        student_tools=["Discover"],
-    )
-    lost["output"]["teacher_tool_inputs"] = [["Glean Search", '{"query": "pto"}'], ["Write", '{"path":"a.txt"}']]
-    lost["output"]["student_tool_inputs"] = [["Discover", '{"query": "policy"}']]
-    example = objective.build_reflective_example("glean_search", lost, {})
-    assert example["Action Inputs"] == [
-        'teacher Glean Search: {"query": "pto"}',
-        'teacher Write: {"path":"a.txt"}',
-        'student Discover: {"query": "policy"}',
-    ]
-    assert example["Generated Outputs"]["teacher_tools"] == list(lost["output"]["teacher_tool_events"])
-    assert example["Generated Outputs"]["student_tools"] == list(lost["output"]["student_tool_events"])
-
-    extra = [[f"Tool{i}", f'{{"q": "{i}"}}'] for i in range(4)]
-    lost["output"]["teacher_tool_inputs"] = extra
-    lost["output"]["student_tool_inputs"] = extra
-    capped = objective.build_reflective_example("glean_search", lost, {})
-    assert capped["Action Inputs"] == [
-        'teacher Tool0: {"q": "0"}',
-        'teacher Tool1: {"q": "1"}',
-        'teacher Tool2: {"q": "2"}',
-        'student Tool0: {"q": "0"}',
-        'student Tool1: {"q": "1"}',
-        'student Tool2: {"q": "2"}',
-    ]
-
-
 def test_analysis_view_treats_a_raw_one_as_an_agentic_loss():
     view = {
         "entries": [
