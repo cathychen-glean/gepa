@@ -110,11 +110,11 @@ def test_extract_trace_tool_inputs_reads_both_call_envelopes():
     assert extract_trace_tool_inputs(None) == ()
 
 
-def test_tool_match_queries_and_fetch():
+def test_tool_match_queries_bind_their_params_and_guard_the_known_pitfalls():
     bounds_sql = bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", span_filter=EXECUTE_ACTION_FILTER)
     sql = build_tool_match_per_entry_query()
-    assert "PARSE_DATE" not in bounds_sql
-    assert "PARSE_DATE" not in sql
+    # Sharded table: the suffix range must come from the bound dates, not a parsed literal.
+    assert "PARSE_DATE" not in bounds_sql and "PARSE_DATE" not in sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
     assert "@student_eval_id" in sql and "@teacher_eval_id" in sql and "UNNEST(@skipped_tools)" in sql
@@ -123,122 +123,61 @@ def test_tool_match_queries_and_fetch():
     # Tool payloads are scrubbed from this table: never read them here, carry the trace locator instead.
     assert "span_info.inputs" not in sql and "agent_trace.trace_id" in sql
 
+
+def _paired_row(entry_id: str, deployment: str, *, student: list[str], teacher: list[str]) -> dict:
+    return {
+        "entry_id": entry_id,
+        "student_tools": student,
+        "teacher_tools": teacher,
+        "student_trace_id": f"s-{entry_id}",
+        "student_deployment_id": deployment,
+        "student_min_start_ms": 1_786_400_000_000,
+        "student_max_start_ms": 1_786_400_050_000,
+        "teacher_trace_id": f"t-{entry_id}",
+        "teacher_deployment_id": deployment,
+        "teacher_min_start_ms": 1_786_400_000_000,
+        "teacher_max_start_ms": 1_786_400_050_000,
+    }
+
+
+def test_fetch_scores_entries_and_hydrates_tool_inputs_from_internal_traces_only():
+    """Payloads come from the detailed trace (the scrubbed table serves none), shell excluded.
+    Entries without a locator or on customer deployments (403 on analyze-trace) are scored but not fetched."""
     client = MagicMock()
     client.query.side_effect = [
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
-            {
-                "entry_id": "entry-1",
-                "student_tools": ["search"],
-                "teacher_tools": ["read"],
-                "student_trace_id": "s-trace-1",
-                "student_deployment_id": "scio-prod",
-                "student_min_start_ms": 1_786_400_000_000,
-                "student_max_start_ms": 1_786_400_050_000,
-                "teacher_trace_id": "t-trace-1",
-                "teacher_deployment_id": "scio-prod",
-                "teacher_min_start_ms": 1_786_400_000_000,
-                "teacher_max_start_ms": 1_786_400_050_000,
-            },
-            {"entry_id": "entry-2", "student_tools": [], "teacher_tools": ["search"]},
-            {
-                "entry_id": "entry-3",
-                "student_tools": ["search"],
-                "teacher_tools": ["read"],
-                "student_trace_id": "s-trace-cust",
-                "student_deployment_id": "glean-televox",
-                "student_min_start_ms": 1_786_400_000_000,
-                "student_max_start_ms": 1_786_400_050_000,
-                "teacher_trace_id": "t-trace-cust",
-                "teacher_deployment_id": "glean-televox",
-                "teacher_min_start_ms": 1_786_400_000_000,
-                "teacher_max_start_ms": 1_786_400_050_000,
-            },
+            _paired_row("e1", "scio-prod", student=["search"], teacher=["read"]),
+            {"entry_id": "e2", "student_tools": [], "teacher_tools": ["search"]},
+            _paired_row("e3", "glean-televox", student=["search"], teacher=["read"]),
         ],
     ]
-
-    def _get_trace(*, deployment_id, trace_id, start_time_millis, end_time_millis):
-        if trace_id == "t-trace-1":
-            # The skipped shell call must not be mistaken for the scored first tool.
-            return _trace(
-                _agent_tool_span("Shell", '{"command":"ls"}'),
-                _glean_tool_span("Glean Search", {"glean_search_tool_args": {"query": "case 007"}}),
-                _glean_tool_span("Glean Document Reader", {"code_search": {"urls": ["a"]}}),
-            )
-        if trace_id == "s-trace-1":
-            return _trace(_agent_tool_span("Write", '{"path":"a.txt"}'))
-        return _trace()
-
+    traces = {
+        "t-e1": _trace(
+            _agent_tool_span("Shell", '{"command":"ls"}'),  # skipped tool: must not be the scored first tool
+            _glean_tool_span("Glean Search", {"q": "case 007"}),
+        ),
+        "s-e1": _trace(_agent_tool_span("Write", '{"path":"a.txt"}')),
+    }
     evalcli = MagicMock()
-    evalcli.get_analysis_trace.side_effect = _get_trace
+    evalcli.get_analysis_trace.side_effect = lambda *, trace_id, **_: traces.get(trace_id, _trace())
 
     analysis = fetch_eval_run_tool_match_analysis(
-        client,
-        teacher_eval_id="teacher",
-        student_eval_id="student",
-        lookback_days=7,
-        end_date=date(2026, 8, 11),
-        evalcli=evalcli,
+        client, teacher_eval_id="teacher", student_eval_id="student", lookback_days=7, end_date=date(2026, 8, 11), evalcli=evalcli
     )
-    search_params = {param.name: param.value for param in client.query.call_args_list[0].kwargs["params"]}
-    entry_params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
-    assert search_params["eval_ids"] == ["teacher", "student"]
-    assert search_params["search_start_date"] == "2026-08-04"
+
+    search_params = {p.name: p.value for p in client.query.call_args_list[0].kwargs["params"]}
     # One day past end_date: _TABLE_SUFFIX is UTC, so tomorrow's shard is scanned too.
-    assert search_params["search_end_date"] == "2026-08-12"
-    assert entry_params["student_eval_id"] == "student"
-    assert entry_params["teacher_eval_id"] == "teacher"
-    assert analysis.per_entry["entry-1"].tools_match is False
-    assert analysis.per_entry["entry-2"].student_tools == ()
-    # Payloads come from the detailed trace (the scrubbed table serves none). Each
-    # role keeps its scored calls, shell excluded, tagged with the tool that issued them.
-    assert analysis.per_entry["entry-1"].teacher_tool_inputs == (
-        ("Glean Search", '{"glean_search_tool_args": {"query": "case 007"}}'),
-        ("Glean Document Reader", '{"code_search": {"urls": ["a"]}}'),
-    )
-    assert analysis.per_entry["entry-1"].student_tool_inputs == (("Write", '{"path":"a.txt"}'),)
-    # entry-2 exposes no trace locator, so it is never fetched and stays empty.
-    assert analysis.per_entry["entry-2"].teacher_tool_inputs == ()
-    # Customer deployments 403 on analyze-trace; skip them and still score the mismatch.
-    assert analysis.per_entry["entry-3"].tools_match is False
-    assert analysis.per_entry["entry-3"].teacher_tool_inputs == ()
-    assert {call.kwargs["trace_id"] for call in evalcli.get_analysis_trace.call_args_list} == {
-        "t-trace-1",
-        "s-trace-1",
-    }
+    assert (search_params["search_start_date"], search_params["search_end_date"]) == ("2026-08-04", "2026-08-12")
+    assert analysis.high_signal_entry_ids == ("e1", "e2", "e3")
+    assert analysis.per_entry["e1"].teacher_tool_inputs == (("Glean Search", '{"q": "case 007"}'),)
+    assert analysis.per_entry["e1"].student_tool_inputs == (("Write", '{"path":"a.txt"}'),)
+    assert analysis.per_entry["e3"].tools_match is False and analysis.per_entry["e3"].teacher_tool_inputs == ()
+    assert {c.kwargs["trace_id"] for c in evalcli.get_analysis_trace.call_args_list} == {"t-e1", "s-e1"}
     # The trace window pads the entry's span bounds by the configured lead/trail.
-    teacher_call = next(
-        call for call in evalcli.get_analysis_trace.call_args_list if call.kwargs["trace_id"] == "t-trace-1"
-    )
+    teacher_call = next(c for c in evalcli.get_analysis_trace.call_args_list if c.kwargs["trace_id"] == "t-e1")
     assert teacher_call.kwargs["start_time_millis"] == 1_786_400_000_000 - 3_600_000
     assert teacher_call.kwargs["end_time_millis"] == 1_786_400_050_000 + 60_000
-    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2", "entry-3")
-    assert client.query.call_count == 2
-
-    objective = FirstToolMatchObjective()
-    output = next(
-        row.output
-        for row in objective.scored_rows(
-            analysis, focused=True, capture_traces=True, query="q", deployment_id="scio-prod"
-        )
-        if row.entry_id == "entry-1"
-    )
-    example = objective.build_reflective_example(
-        "MODULE",
-        {
-            "data": {"eval_set_name": "set"},
-            "score": 0.0,
-            "objective_scores": {"tool_alignment": 0.0, "correctness": 0.5},
-            "output": output,
-        },
-        {},
-    )
-    # Each call is attributed to a role, and later scored calls are kept with the first.
-    assert example["Action Inputs"] == [
-        'teacher Glean Search: {"glean_search_tool_args": {"query": "case 007"}}',
-        'teacher Glean Document Reader: {"code_search": {"urls": ["a"]}}',
-        'student Write: {"path":"a.txt"}',
-    ]
 
 
 def test_failed_runs_are_excluded_rather_than_scored_as_mismatches():

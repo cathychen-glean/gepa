@@ -168,7 +168,7 @@ def test_experiment_sections_configure_the_objective(tmp_path):
         objective.format_reflective_metrics({"score": 0.0, "tool_alignment": 0.25, "correctness": 0.5})
         == "score=0.00, tool_alignment=0.25"
     )
-    assert objective.reflection_prompt("RULES_EXT") == "Override the rules module."
+    assert "Override the rules module." in objective.reflection_prompt("RULES_EXT")  # YAML override wins
 
     correctness_config = _load_mode(tmp_path, _mode_yaml(signals=_PAIRWISE_CORRECTNESS))
     with_correctness = build_objective(

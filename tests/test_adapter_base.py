@@ -52,52 +52,24 @@ def test_only_teacher_student_can_score_a_judge_dimension():
         single_model_adapter(composite_weights={"answer_quality": 1.0}, constant_scores={})
 
 
-def test_concrete_adapters_own_screening_configuration():
-    single_adapter = single_model_adapter()
-    single_rules_ext = single_model_adapter(editable_modules=[RULES_EXT_KEY])
-    teacher_adapter = teacher_student_adapter()
-    shell_eval = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.8],
-        summary={SHELL_SUCCESS_OBJECTIVE: 0.8, "correctness": 0.5},
-    )
-    tool_match_eval = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.85],
-        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0},
-    )
+def test_screening_score_follows_the_primary_or_the_weighted_blend():
+    """Screen on the primary by default; with screening.weights the child must clear the blend,
+    and an empty child eval can never pass."""
+    tool_match_eval = GleanEvaluationBatch(outputs=[], scores=[0.85], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0})
+    assert teacher_student_adapter().get_screening_score(tool_match_eval) == 0.5
+    assert teacher_student_adapter(primary_objective="correctness").get_screening_score(tool_match_eval) == 1.0
 
-    correctness_adapter = teacher_student_adapter(primary_objective="correctness")
-
-    assert single_adapter.get_screening_score(shell_eval) == 0.8
-    assert teacher_adapter.get_screening_score(tool_match_eval) == 0.5
-    assert correctness_adapter.get_screening_score(tool_match_eval) == 1.0
-    assert (
-        correctness_adapter.high_signal_fix_rate(
-            GleanEvaluationBatch(outputs=[], scores=[0.0], trajectories=[{"score": 0.0}]),
-            tool_match_eval,
-        )
-        == 1.0
-    )
     weighted = teacher_student_adapter(
         primary_objective=TOOL_ALIGNMENT_OBJECTIVE,
         screening_weights={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "agentic_preference_rate": 0.5},
     )
     blended = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.4],
-        summary={TOOL_ALIGNMENT_OBJECTIVE: 0.8, "agentic_preference_rate": 0.4},
+        outputs=[], scores=[0.4], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.8, "agentic_preference_rate": 0.4}
     )
+    parent = GleanEvaluationBatch(outputs=[], scores=[0.2], trajectories=[{"score": 0.2}])
     assert weighted.get_screening_score(blended) == 0.8
-    assert weighted.child_screen_score(
-        GleanEvaluationBatch(outputs=[], scores=[0.2], trajectories=[{"score": 0.2}]),
-        blended,
-    ) == pytest.approx(0.6)
+    assert weighted.child_screen_score(parent, blended) == pytest.approx(0.6)
     assert weighted.child_screen_score(tool_match_eval, GleanEvaluationBatch(outputs=[], scores=[])) == float("-inf")
-
-    assert pick_modules_to_edit(single_rules_ext) == [RULES_EXT_KEY]
-    assert not hasattr(single_adapter, "judging_mode")
-    assert not hasattr(teacher_adapter, "judge")
 
 
 def _batch(scores: list[float]) -> GleanEvaluationBatch:

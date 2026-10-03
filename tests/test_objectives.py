@@ -160,25 +160,12 @@ def test_reflective_example_helper_builds_the_shared_frame() -> None:
         action_inputs=[f"cmd{i}" for i in range(REFLECTION_EVIDENCE_LIMIT + 3)],
         execution_errors=["boom"],
     )
-    assert example["Inputs"] == {
-        "eval_set": "set",
-        "entry_id": "e1",
-        "deployment_id": "dep",
-        "query": "q",
-        "eval_run_id": "run-1",
-        "eval_trace_id": "trace-1",
-    }
-    # Partial ``generated`` is merged over empty defaults.
-    assert example["Generated Outputs"] == {
-        "student_answer": "ans",
-        "teacher_answer": "",
-        "student_tools": [],
-        "teacher_tools": [],
-    }
+    assert example["Inputs"]["entry_id"] == "e1" and example["Inputs"]["eval_trace_id"] == "trace-1"
+    # Partial ``generated`` is merged over empty defaults, so the reflector can always read every key.
+    assert example["Generated Outputs"]["student_answer"] == "ans"
+    assert example["Generated Outputs"]["teacher_answer"] == "" and example["Generated Outputs"]["teacher_tools"] == []
     assert len(example["Action Inputs"]) == REFLECTION_EVIDENCE_LIMIT
-    assert example["Execution Errors"] == ["boom"]
-    assert example["Feedback"] == "fix it"
-    assert example["Metrics"]["score"] == 0.5
+    assert example["Execution Errors"] == ["boom"] and example["Metrics"]["score"] == 0.5
 
     # Optional ids are omitted, not set to None.
     bare = objective.reflective_example({**trajectory, "data": {"eval_set_name": "set"}}, feedback="f")

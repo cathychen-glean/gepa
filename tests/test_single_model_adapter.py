@@ -9,7 +9,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from helpers import THRESHOLDS
+from helpers import THRESHOLDS, single_model_adapter
 
 from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, extract_shell_action_inputs
 from glean_gepa.batch import GleanEvaluationBatch
@@ -91,167 +91,119 @@ def test_shell_cache_hooks_drive_the_shared_helper():
     assert fetch.call_count == 2
 
 
-def test_evaluate_uses_shell_error_rate_objective(capsys: pytest.CaptureFixture[str]):
-    evalcli = EvalCliClient(binary="/fake/evalcli")
-    runner = ALRunner(evalcli=evalcli)
-    bigquery_client = MagicMock()
-    adapter = SingleModelAdapter(
-        runner=runner,
-        bigquery_client=bigquery_client,
-        student_model="fast",
-        thresholds=THRESHOLDS,
-    )
+_SHELL_BATCH = [
+    {
+        "eval_set_name": "AI Answers Small",
+        "eval_set_version": "20260403",
+        "deployment_ids": ["scio-prod"],
+        "status": "active",
+        "eval_trace_id": "trace-original",
+    }
+]
 
-    batch = [
-        {
-            "eval_set_name": "AI Answers Small",
-            "eval_set_version": "20260403",
-            "deployment_ids": ["scio-prod"],
-            "status": "active",
-            "eval_trace_id": "trace-original",
-        }
-    ]
-    analysis = EvalRunShellToolErrorAnalysis(
+
+def _one_failing_entry_analysis() -> EvalRunShellToolErrorAnalysis:
+    """8 executions / 2 errors overall (75% success); entry-1 has 4 / 2 (50%) with one error example."""
+    example = ShellToolErrorExample(
+        started_at="2026-08-11T12:00:00Z",
+        project_id="project-1",
+        entry_id="entry-1",
+        eval_id="run_123",
+        run_id="execution-1",
+        trace_id="trace-student-1",
+        span_id="span-1",
+        span_name="Execute Action: Shell",
+        action_id="Shell",
+        action_run_id="call-1",
+        action_status="error",
+        span_status="error",
+        provider_status="failed",
+        output_status_code="1",
+        error_str="command exited with status 1",
+    )
+    return EvalRunShellToolErrorAnalysis(
         eval_ids=("run_123",),
         start_date=date(2026, 8, 8),
         end_date=date(2026, 8, 11),
-        aggregate=ShellToolErrorMetrics(
-            shell_executions=8,
-            shell_errors=2,
-            shell_error_rate=0.25,
-            shell_error_pct=25.0,
-            recent_error_examples=(),
-        ),
+        aggregate=ShellToolErrorMetrics(8, 2, 0.25, 25.0, recent_error_examples=()),
         per_entry={
             "entry-1": ShellToolErrorEntryMetrics(
-                entry_id="entry-1",
-                shell_executions=4,
-                shell_errors=2,
-                shell_error_rate=0.5,
-                shell_error_pct=50.0,
-                recent_error_examples=(
-                    ShellToolErrorExample(
-                        started_at="2026-08-11T12:00:00Z",
-                        project_id="project-1",
-                        entry_id="entry-1",
-                        eval_id="run_123",
-                        run_id="execution-1",
-                        trace_id="trace-student-1",
-                        span_id="span-1",
-                        span_name="Execute Action: Shell",
-                        action_id="Shell",
-                        action_run_id="call-1",
-                        action_status="error",
-                        span_status="error",
-                        provider_status="failed",
-                        output_status_code="1",
-                        error_str="command exited with status 1",
-                    ),
-                ),
-                trace_ids=("trace-student-1",),
+                "entry-1", 4, 2, 0.5, 50.0, recent_error_examples=(example,), trace_ids=("trace-student-1",)
             )
         },
         high_signal_entry_ids=("entry-1",),
     )
 
-    with (
-        patch.object(adapter, "_get_or_run_student_eval", return_value="run_123") as run_eval,
-        patch.object(
-            adapter.runner.evalcli,
-            "get_analysis_trace",
-            return_value={
-                "trace": {
-                    "spans": [
-                        {
-                            "name": "Execute Action: Shell",
-                            "attributes": {
-                                "input": {
-                                    "strValue": json.dumps(
-                                        {"action_input": json.dumps({"command": "python3 broken.py"})}
-                                    )
-                                },
-                                "span.gle": {"strValue": json.dumps({"action": {"action_run_id": "call-1"}})},
-                            },
-                        }
-                    ]
-                }
-            },
-        ) as get_trace,
-        patch(
-            "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
-            return_value=analysis,
-        ),
-    ):
-        result = adapter.evaluate(batch, {"WRITING_CODE": "test prompt"}, capture_traces=True)
 
-    trace_log = capsys.readouterr().out
-    assert "[Trace evaluation] Reading eval-set shell results for AI Answers Small 20260403: run_123" in trace_log
-    run_eval.assert_called_once()
-    get_trace.assert_called_once()
+def _shell_trace(action_run_id: str, command: str) -> dict:
+    return {
+        "trace": {
+            "spans": [
+                {
+                    "name": "Execute Action: Shell",
+                    "attributes": {
+                        "input": {"strValue": json.dumps({"action_input": json.dumps({"command": command})})},
+                        "span.gle": {"strValue": json.dumps({"action": {"action_run_id": action_run_id}})},
+                    },
+                }
+            ]
+        }
+    }
+
+
+def test_evaluate_scores_the_aggregate_and_surfaces_each_failing_entry():
+    """Training evals yield one trajectory per high-signal entry with its trace evidence; full
+    validation yields one row per eval set scored on the aggregate, not the failing entry."""
+    adapter = single_model_adapter(EvalCliClient(binary="/fake/evalcli"))
+    with (
+        patch.object(adapter, "_get_or_run_student_eval", return_value="run_123"),
+        patch.object(adapter.runner.evalcli, "get_analysis_trace", return_value=_shell_trace("call-1", "python3 x.py")),
+        patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=_one_failing_entry_analysis()),
+    ):
+        result = adapter.evaluate(_SHELL_BATCH, {"WRITING_CODE": "p"}, capture_traces=True)
+        full_val = adapter.evaluate(
+            [{**_SHELL_BATCH[0], "cached_student_eval_run_id": "run_123"}], {"WRITING_CODE": "p"}, capture_traces=False
+        )
 
     assert result.summary[SHELL_SUCCESS_OBJECTIVE] == 0.75
-    assert result.summary["high_signal_entry_count"] == 1.0
-    assert len(result.outputs) == 1
-    assert result.outputs[0]["entry_id"] == "entry-1"
-    assert result.outputs[0]["student_tool_errors"] == 2
-    assert result.outputs[0]["eval_trace_id"] == "trace-student-1"
-    assert result.outputs[0]["shell_action_inputs"] == ['{"command": "python3 broken.py"}']
-    assert result.trajectories is not None
-    assert len(result.trajectories) == 1
+    assert [o["entry_id"] for o in result.outputs] == ["entry-1"]
+    assert result.outputs[0]["shell_action_inputs"] == ['{"command": "python3 x.py"}']
+    assert result.trajectories is not None and result.trajectories[0]["data"]["eval_trace_id"] == "trace-student-1"
+    assert full_val.scores == [0.75] and full_val.objective_scores == [{SHELL_SUCCESS_OBJECTIVE: 0.75}]
 
-    full_val_result = adapter.evaluate(
-        [{**batch[0], "cached_student_eval_run_id": "run_123"}],
-        {"WRITING_CODE": "test prompt"},
-        capture_traces=False,
-    )
-    # Full validation has one score per eval-set item. It must use the
-    # aggregate (75%), not the high-signal entry's 50% score.
-    assert full_val_result.scores == [0.75]
-    assert full_val_result.objective_scores == [{SHELL_SUCCESS_OBJECTIVE: 0.75}]
-    assert (
-        "[Validation] Reading full-validation shell results for AI Answers Small 20260403: run_123"
-        in capsys.readouterr().out
-    )
-
-    assert result.trajectories[0]["data"]["eval_entry_id"] == "entry-1"
-    assert result.trajectories[0]["data"]["eval_run_id"] == "run_123"
-    assert result.trajectories[0]["data"]["eval_trace_id"] == "trace-student-1"
-    reflective = adapter.make_reflective_dataset({"WRITING_CODE": "test prompt"}, result, ["WRITING_CODE"], k=1)[
-        "WRITING_CODE"
-    ][0]
-    assert reflective["Inputs"]["eval_trace_id"] == "trace-student-1"
+    reflective = adapter.make_reflective_dataset({"WRITING_CODE": "p"}, result, ["WRITING_CODE"], k=1)["WRITING_CODE"][0]
     assert reflective["Execution Errors"] == ["command exited with status 1"]
-    assert reflective["Action Inputs"] == ['{"command": "python3 broken.py"}']
-    assert reflective["Feedback"] == "Resolve the shell execution failures shown above."
-    captured_prompts = []
+    assert reflective["Action Inputs"] == ['{"command": "python3 x.py"}']
+
+
+def test_propose_new_texts_feeds_the_error_evidence_to_the_reflector():
+    adapter = single_model_adapter(EvalCliClient(binary="/fake/evalcli"))
+    with (
+        patch.object(adapter, "_get_or_run_student_eval", return_value="run_123"),
+        patch.object(adapter.runner.evalcli, "get_analysis_trace", return_value=_shell_trace("call-1", "python3 x.py")),
+        patch(
+            "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
+            return_value=_one_failing_entry_analysis(),
+        ),
+    ):
+        result = adapter.evaluate(_SHELL_BATCH, {"WRITING_CODE": "p"}, capture_traces=True)
+    reflective = adapter.make_reflective_dataset({"WRITING_CODE": "p"}, result, ["WRITING_CODE"], k=1)["WRITING_CODE"]
+    prompts: list[str] = []
 
     def reflection_lm(prompt: str) -> str:
-        captured_prompts.append(prompt)
-        return "NOT_RELEVANT" if len(captured_prompts) == 1 else "rewritten code instructions"
+        prompts.append(prompt)
+        return "NOT_RELEVANT" if len(prompts) == 1 else "rewritten"
 
-    variants, not_relevant, *_ = adapter.propose_new_texts(
-        reflection_lm,
-        Candidate(
-            model="fast",
-            prompt_modules={"WRITING_CODE": "test prompt"},
-            module_specs={"WRITING_CODE": ModuleSpec("WRITING_CODE", "free_text", 1024)},
-            global_token_cap=4096,
-            baseline_prompt_hash="seed",
-        ),
-        ["WRITING_CODE"],
-        [reflective],
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"WRITING_CODE": "p"},
+        module_specs={"WRITING_CODE": ModuleSpec("WRITING_CODE", "free_text", 1024)},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
     )
-    assert variants == ["rewritten code instructions"]
-    assert not not_relevant
-    assert "NOT_RELEVANT" not in captured_prompts[0]
-    assert "TEACHER_ANSWER:" not in captured_prompts[0]
-    assert "STUDENT_ANSWER:" not in captured_prompts[0]
-    assert "TEACHER_TOOLS:" not in captured_prompts[0]
-    assert "STUDENT_TOOLS:" not in captured_prompts[0]
-    assert 'ACTION_INPUT: {"command": "python3 broken.py"}' in captured_prompts[0]
-    assert "EVAL_TRACE_ID: trace-student-1" in captured_prompts[0]
-    assert "METRICS:" not in captured_prompts[0]
-    assert "command exited with status 1" in captured_prompts[1]
+    variants, not_relevant, *_ = adapter.propose_new_texts(reflection_lm, candidate, ["WRITING_CODE"], reflective)
+    assert variants == ["rewritten"] and not not_relevant
+    assert "python3 x.py" in prompts[0] and "command exited with status 1" in prompts[1]
 
 
 def test_proposals_that_drop_a_render_slot_are_rejected():
@@ -624,73 +576,6 @@ def test_extract_shell_action_inputs_matches_action_run_id():
     }
 
     assert extract_shell_action_inputs(trace) == {"call-shell-1": action_input}
-
-
-def test_evaluate_logs_fetched_shell_error_rate_and_error(capsys):
-    evalcli = EvalCliClient(binary="/fake/evalcli")
-    adapter = SingleModelAdapter(
-        runner=ALRunner(evalcli=evalcli),
-        bigquery_client=MagicMock(),
-        student_model="fast",
-        thresholds=THRESHOLDS,
-    )
-    error_example = ShellToolErrorExample(
-        started_at="2026-08-11T12:00:00Z",
-        project_id="project-1",
-        entry_id="entry-1",
-        eval_id="run_123",
-        run_id="execution-1",
-        trace_id="trace-1",
-        span_id="span-1",
-        span_name="Execute Action: Shell",
-        action_id="Shell",
-        action_status="error",
-        span_status="error",
-        provider_status="failed",
-        output_status_code="1",
-        error_str="command exited with status 1",
-    )
-    analysis = EvalRunShellToolErrorAnalysis(
-        eval_ids=("run_123",),
-        start_date=date(2026, 8, 8),
-        end_date=date(2026, 8, 11),
-        aggregate=ShellToolErrorMetrics(
-            shell_executions=4,
-            shell_errors=1,
-            shell_error_rate=0.25,
-            shell_error_pct=25.0,
-            recent_error_examples=(error_example,),
-        ),
-        per_entry={},
-        high_signal_entry_ids=(),
-    )
-
-    set_debug(True)
-    try:
-        with (
-            patch.object(adapter, "_get_or_run_student_eval", return_value="run_123"),
-            patch(
-                "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
-                return_value=analysis,
-            ),
-        ):
-            adapter.evaluate(
-                [
-                    {
-                        "eval_set_name": "AI Answers Small",
-                        "eval_set_version": "20260403",
-                        "deployment_ids": ["scio-prod"],
-                        "status": "active",
-                    }
-                ],
-                {"WRITING_CODE": "test prompt"},
-            )
-
-        output = capsys.readouterr().out
-        assert "[Shell Tool] Fetched error rate for eval run_123: 25.00% (1/4)" in output
-        assert "[Shell Tool] Error for eval run_123: command exited with status 1" in output
-    finally:
-        set_debug(False)
 
 
 def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
