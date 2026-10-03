@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from glean_gepa.experiment_config import (
+    CONFIGS_DIR,
     ExperimentConfig,
     ExperimentConfigError,
     composite_weights,
@@ -95,12 +96,20 @@ def test_screening_weights_blend_the_gate_and_start_the_named_judge(tmp_path):
     assert judges["agentic_preference_rate"] == "AGENTIC_JUDGE"
 
 
-def test_tool_experiment_keeps_tool_match_as_parent_and_blends_the_gate():
-    config = load_experiment_config("teacher_student_tool")
-    assert config.primary_objective == "tool_alignment"
-    assert composite_weights(config) == {"tool_alignment": 1.0}
-    assert screening_weights(config) == {"tool_alignment": 0.5, "agentic_preference_rate": 0.5}
-    assert config.screening["threshold"] == 0.25
+_SHIPPED_CONFIGS = sorted(CONFIGS_DIR.glob("*.yaml"))
+
+
+@pytest.mark.parametrize("path", _SHIPPED_CONFIGS, ids=lambda p: p.stem)
+def test_every_shipped_config_is_well_formed(path: Path):
+    """Loads, and every metric it gates on is one it declares. Values are not pinned: they change."""
+    config = load_experiment_config(path)
+    declared = {str(signal["name"]) for signal in config.signals}
+    assert config.primary_objective in declared
+    assert set(composite_weights(config)) <= declared
+    # Screening weights and validation gates may also name a judge directly; it is started because it is named.
+    assert set(screening_weights(config)) <= declared | set(JUDGE_SPECS)
+    assert set(customer_validation_gates(config)) <= set(JUDGE_SPECS)
+    assert config.screening.get("kind") != "high_signal_fix_rate" or config.screening.get("high_signal") in declared
 
 
 def test_correctness_can_be_weighted_into_the_composite(tmp_path):

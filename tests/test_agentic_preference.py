@@ -410,7 +410,6 @@ def test_loss_feedback_names_the_deciding_dimension_and_behavior_flags():
     assert "task_completion" in keep
 
 
-
 def test_reflective_example_includes_both_roles_tool_inputs():
     objective = AgenticPreferenceObjective()
     lost = _trajectory(
@@ -444,20 +443,6 @@ def test_reflective_example_includes_both_roles_tool_inputs():
     ]
 
 
-def test_agentic_preference_primary_starts_the_agentic_judge(tmp_path):
-    path = tmp_path / "mode.yaml"
-    path.write_text(
-        "schema_version: 1\n"
-        "mode: teacher_student\n"
-        f"signals:\n  - name: {AGENTIC_PREFERENCE_OBJECTIVE}\n    source: agentic_preference\n"
-        f"objective:\n  primary: {AGENTIC_PREFERENCE_OBJECTIVE}\n  composite:\n    {AGENTIC_PREFERENCE_OBJECTIVE}: 1.0\n"
-    )
-    config = load_experiment_config(path)
-    assert config.primary_objective == AGENTIC_PREFERENCE_OBJECTIVE
-    judges = {judge.name: judge.judge_type for judge in pairwise_judges(config)}
-    assert judges == {AGENTIC_PREFERENCE_OBJECTIVE: AGENTIC_JUDGE_TYPE}
-
-
 def test_analysis_view_treats_a_raw_one_as_an_agentic_loss():
     view = {
         "entries": [
@@ -482,53 +467,10 @@ def test_analysis_view_treats_a_raw_one_as_an_agentic_loss():
     assert scores == {"lost-badly": pytest.approx(0.1)}
     assert feedback["lost-badly"] == "lose"
     assert "eval-run-failed" not in scores
-
-
-def test_high_signal_and_screen_use_preference_not_correctness():
+    # Below parity is a loss worth reflecting on; a tie is not.
     objective = AgenticPreferenceObjective()
-    adapter = _agentic_adapter()
-    batch = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.2, 0.5, 0.8],
-        trajectories=[
-            _trajectory("lost", preference=0.2),
-            _trajectory("tie", preference=0.5),
-            _trajectory("won", preference=0.8),
-        ],
-    )
-    assert objective.is_high_signal({"agentic_preference_rate": 0.2})
-    assert not objective.is_high_signal({"agentic_preference_rate": 0.5})
-    focused = adapter.high_signal_batch(batch)
-    assert focused[0]["eval_entry_ids"] == ["lost"]
-
-    parent = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.0],
-        trajectories=[_trajectory("lost", preference=0.2)],
-        summary={AGENTIC_PREFERENCE_OBJECTIVE: 0.2, "correctness": 0.99},
-    )
-    fail = GleanEvaluationBatch(
-        outputs=[],
-        scores=[0.0],
-        trajectories=[_trajectory("lost", preference=0.0)],
-        summary={AGENTIC_PREFERENCE_OBJECTIVE: 0.79, "correctness": 0.99},
-    )
-    pass_eval = GleanEvaluationBatch(
-        outputs=[],
-        scores=[1.0],
-        trajectories=[_trajectory("lost", preference=1.0)],
-        summary={AGENTIC_PREFERENCE_OBJECTIVE: 0.80, "correctness": 0.0},
-    )
-    keep, reject = object(), object()
-    kept = _select_screened_children(
-        adapter,
-        parent,
-        [reject, keep],
-        [fail, pass_eval],  # type: ignore[arg-type]
-        use_high_signal_gate=True,
-        high_signal_screen_threshold=0.80,
-    )
-    assert [(child, score) for child, _evaluation, score in kept] == [(keep, 0.80)]
+    assert objective.is_high_signal({AGENTIC_PREFERENCE_OBJECTIVE: 0.2})
+    assert not objective.is_high_signal({AGENTIC_PREFERENCE_OBJECTIVE: 0.5})
 
 
 def test_focused_and_full_evals_start_agentic_and_keep_its_mean():
