@@ -1,17 +1,35 @@
+from __future__ import annotations
 import json
+from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock
-
+import pytest
 from gepa.core.engine import GEPAEngine
 from gepa.core.state import ValsetEvaluation
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
-from glean_gepa.al_adapter import Candidate, ModuleSpec
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds
 from glean_gepa.batch import GleanEvaluationBatch
+from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.evolutionary_proposer import (
     EvolutionaryProposer,
     make_children_for_generation,
+    modules_after_tool_choice,
+    pick_modules_to_edit,
+    tool_usage_in_examples,
+    tools_with_evidence,
 )
+from glean_gepa.prompt_constants import (
+    CORE_TOOLS,
+    EXECUTION_DISCIPLINE_KEY,
+    RULES_EXT_KEY,
+    WRITING_CODE_KEY,
+)
+from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
+import json
+import pytest
+from gepa.core.data_loader import ListDataLoader
+from glean_gepa.evalset_policy import TrainingScheduleExhaustedStopper, UnseenEvalSetPolicy
 
 
 class _ReflectionAdapter:
@@ -236,11 +254,13 @@ class _ScoredReflectionAdapter(_ReflectionAdapter):
         return [f"{parent_id}-{index}" for index in range(5)], None, ""
 
 
-def test_offspring_slots_split_evenly_and_extra_goes_to_higher_score() -> None:
-    """Two frontier parents share one generation. 5 slots is 3 for the leader and 2 for the other."""
+@pytest.mark.parametrize("high_is_cached", [False, True], ids=["both_reflected", "leader_cached"])
+def test_offspring_slots_split_by_score_and_a_cached_parent_keeps_only_its_share(high_is_cached: bool) -> None:
+    """Two frontier parents share one generation: 5 slots is 3 for the leader and 2 for the other.
+    A parent whose children are already cached fills its 3 from the cache and cannot take the other's 2."""
     adapter = _ScoredReflectionAdapter()
-    high = _candidate("high")
-    low = _candidate("low")
+    high, low = _candidate("high"), _candidate("low")
+    cached = {"high": [_candidate(f"cached-{i}", f"cached-{i}") for i in range(5)]} if high_is_cached else {}
 
     children = make_children_for_generation(
         adapter,
@@ -248,34 +268,14 @@ def test_offspring_slots_split_evenly_and_extra_goes_to_higher_score() -> None:
         {"high": _ScoredEvaluation(0.9), "low": _ScoredEvaluation(0.4)},
         reflection_llm=object(),
         offspring_count=5,
+        children_by_root=cached,
     )
 
     texts = [child.prompt_modules["WRITING_CODE"] for child in children]
-    assert sum(text.startswith("high-") for text in texts) == 3
+    leader_prefix = "cached-" if high_is_cached else "high-"
+    assert sum(text.startswith(leader_prefix) for text in texts) == 3
     assert sum(text.startswith("low-") for text in texts) == 2
-    assert adapter.reflection_calls == 2
-
-
-def test_cached_parent_cannot_take_the_other_parents_slots() -> None:
-    adapter = _ScoredReflectionAdapter()
-    high = _candidate("high")
-    low = _candidate("low")
-    cached = [_candidate(f"cached-{index}", f"cached-{index}") for index in range(5)]
-    children_by_root = {"high": cached}
-
-    children = make_children_for_generation(
-        adapter,
-        [high, low],
-        {"high": _ScoredEvaluation(0.9), "low": _ScoredEvaluation(0.4)},
-        reflection_llm=object(),
-        offspring_count=5,
-        children_by_root=children_by_root,
-    )
-
-    texts = [child.prompt_modules["WRITING_CODE"] for child in children]
-    assert sum(text.startswith("cached-") for text in texts) == 3
-    assert sum(text.startswith("low-") for text in texts) == 2
-    assert adapter.reflected_parents == ["low"]
+    assert adapter.reflected_parents == (["low"] if high_is_cached else ["low", "high"])
 
 
 def test_prints_child_prompt_delta_against_parent(capsys) -> None:
@@ -315,57 +315,6 @@ def test_empty_reflection_result_marks_root_as_cached() -> None:
     assert children_by_root == {root.candidate_id: []}
 
 
-def _children_cache_payload() -> dict:
-    return {
-        "training_slices": [
-            {
-                "train_ids": [0],
-                "root_screening_scores": {"root": 0.75},
-                "roots": {
-                    "root": [
-                        {
-                            "prompt_modules": {"WRITING_CODE": "cached rewrite"},
-                            "eval_run_ids": [
-                                {
-                                    "eval_set_name": "focused",
-                                    "eval_set_version": "v1",
-                                    "student_eval_run_id": "eval-child-1",
-                                }
-                            ],
-                            "screening_score": 0.5,
-                            "screening_passed": True,
-                        }
-                    ]
-                },
-            }
-        ],
-    }
-
-
-def test_loads_children_cache(tmp_path) -> None:
-    cache_file = tmp_path / "children.json"
-    cache_file.write_text(json.dumps(_children_cache_payload()))
-
-    proposer = _proposer(_ReflectionAdapter(), str(cache_file))
-    child = proposer._children_by_root_by_train_slice[(0,)]["root"][0]
-
-    assert child.prompt_modules["WRITING_CODE"] == "cached rewrite"
-    assert proposer._cached_root_screening_score((0,), "root") == 0.75
-    assert proposer._cached_eval_run_ids((0,), child)[0]["student_eval_run_id"] == "eval-child-1"
-    assert proposer._cached_screening_scores((0,), [child], use_high_signal_gate=True) == [(0.5, True)]
-
-
-def test_children_cache_save_has_no_schema_version(tmp_path) -> None:
-    cache_file = str(tmp_path / "children.json")
-    proposer = _proposer(_ReflectionAdapter(), cache_file)
-    proposer._children_by_root_by_train_slice[(0,)] = {"root": []}
-    proposer._save_children_cache()
-
-    saved = json.loads((tmp_path / "children.json").read_text())
-    assert "schema_version" not in saved
-    assert "training_slices" in saved
-
-
 def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None:
     cache_file = str(tmp_path / "children.json")
     root = _candidate("root")
@@ -399,14 +348,16 @@ def test_children_cache_persists_screening_result_with_eval_id(tmp_path) -> None
     first_proposer._record_screening_result((0,), children[1], 1 / 3, True)
     first_proposer._save_children_cache()
 
-    second_proposer = _proposer(_ReflectionAdapter(), cache_file)
-    cached = second_proposer._cached_screening_scores(
-        (0,),
-        second_proposer._children_by_root_by_train_slice[(0,)]["root"],
-        use_high_signal_gate=True,
-    )
+    saved = json.loads(Path(cache_file).read_text())
+    assert "training_slices" in saved and "schema_version" not in saved
 
-    assert cached == [(0.75, True), (1 / 3, False)]
+    second_proposer = _proposer(_ReflectionAdapter(), cache_file)
+    reloaded = second_proposer._children_by_root_by_train_slice[(0,)]["root"]
+    assert second_proposer._cached_eval_run_ids((0,), reloaded[0])[0]["student_eval_run_id"] == "eval-child-1"
+    assert second_proposer._cached_screening_scores((0,), reloaded, use_high_signal_gate=True) == [
+        (0.75, True),
+        (1 / 3, False),
+    ]
 
 
 def test_same_root_and_training_slice_reuses_children_and_screen(tmp_path) -> None:
@@ -775,3 +726,237 @@ def test_stall_limit_reached_only_when_configured() -> None:
     assert limited._stall_limit_reached(3)
     unset = _engine_with_stall_limit(max_stalled_proposals=None)
     assert not unset._stall_limit_reached(1_000_000)
+
+
+def test_pick_modules_to_edit_offers_every_listed_core_tool():
+    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
+    kwargs = {
+        "runner": runner,
+        "teacher_model": "gpt",
+        "student_model": "fast",
+        "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
+    }
+    eval_batch = GleanEvaluationBatch(
+        outputs=[],
+        scores=[],
+        trajectories=[
+            {
+                "output": {
+                    "teacher_tool_events": ["Glean Search"],
+                    "student_tool_events": ["Discover"],
+                },
+                "score": 0.0,
+            }
+        ],
+    )
+    prompt_only = TeacherStudentAdapter(**kwargs, editable_modules=[WRITING_CODE_KEY])
+    core_tools = TeacherStudentAdapter(**kwargs, editable_modules=list(CORE_TOOLS))
+    both = TeacherStudentAdapter(**kwargs, editable_modules=[WRITING_CODE_KEY, *CORE_TOOLS])
+    search_only = TeacherStudentAdapter(**kwargs, editable_modules=["glean_search"])
+
+    assert pick_modules_to_edit(prompt_only) == [WRITING_CODE_KEY]
+    assert pick_modules_to_edit(prompt_only, eval_batch) == [WRITING_CODE_KEY]
+    assert pick_modules_to_edit(core_tools) == list(CORE_TOOLS)
+    assert pick_modules_to_edit(core_tools, eval_batch) == list(CORE_TOOLS)
+    assert pick_modules_to_edit(both, eval_batch) == [WRITING_CODE_KEY, *CORE_TOOLS]
+    assert pick_modules_to_edit(search_only, eval_batch) == ["glean_search"]
+
+    rules_and_core = TeacherStudentAdapter(**kwargs, editable_modules=[*CORE_TOOLS, RULES_EXT_KEY])
+    rules_only = TeacherStudentAdapter(**kwargs, editable_modules=[RULES_EXT_KEY])
+    assert pick_modules_to_edit(rules_and_core) == [RULES_EXT_KEY, *CORE_TOOLS]
+    assert pick_modules_to_edit(rules_and_core, eval_batch) == [RULES_EXT_KEY, *CORE_TOOLS]
+    assert pick_modules_to_edit(rules_only) == [RULES_EXT_KEY]
+    assert pick_modules_to_edit(rules_only, eval_batch) == [RULES_EXT_KEY]
+
+
+def test_modules_after_tool_choice_keeps_only_the_named_descriptions():
+    parent = Candidate(
+        model="gpt",
+        prompt_modules={"glean_search": "search", "discover": "discover", RULES_EXT_KEY: ""},
+        module_specs={},
+        global_token_cap=4096,
+        baseline_prompt_hash="h",
+    )
+    examples = {
+        "glean_search": [
+            {
+                "Inputs": {"query": "q"},
+                "Generated Outputs": {"teacher_tools": ["Glean Search"], "student_tools": ["Discover"]},
+                "Action Inputs": ['teacher Glean Search: {"query": "pto"}'],
+                "Feedback": "mismatch",
+            }
+        ],
+        "discover": [],
+        RULES_EXT_KEY: [],
+    }
+
+    def choose(prompt: str) -> str:
+        assert "glean_search" in prompt
+        assert "discover" in prompt
+        assert 'ACTION_INPUT: teacher Glean Search: {"query": "pto"}' in prompt
+        return "discover\nglean_search"
+
+    chosen = modules_after_tool_choice(
+        choose,
+        parent,
+        [RULES_EXT_KEY, "glean_search", "discover"],
+        examples,
+    )
+    # Non-core modules keep the first offspring slots; chosen tools follow in reflector order.
+    assert chosen == [RULES_EXT_KEY, "discover", "glean_search"]
+
+    def unused(_prompt: str) -> str:
+        raise AssertionError("no examples, so the reflector is not called")
+
+    assert modules_after_tool_choice(unused, parent, ["glean_search", RULES_EXT_KEY], {"glean_search": []}) == [
+        RULES_EXT_KEY
+    ]
+
+
+def _paired_example(student_tools: list[str], teacher_tools: list[str]) -> dict:
+    return {
+        "Inputs": {"query": "q"},
+        "Generated Outputs": {"teacher_tools": teacher_tools, "student_tools": student_tools},
+        "Action Inputs": [],
+        "Feedback": "loss",
+    }
+
+
+def test_tool_usage_counts_examples_per_side_with_trace_event_names():
+    examples = [
+        _paired_example(["Personal Knowledge Vault Retrieve", "Glean Search", "Shell"], ["Glean Document Reader"]),
+        _paired_example(["Ask User Questions"], ["Glean Search", "Glean Search"]),
+        _paired_example([], ["Glean Document Reader", "Glean Search"]),
+    ]
+    usage = tool_usage_in_examples(
+        ["glean_search", "glean_document_reader", "ask_user_questions", "todo_write"], examples
+    )
+    assert usage == {
+        "glean_search": (1, 2),
+        "glean_document_reader": (0, 2),
+        "ask_user_questions": (1, 0),
+        "todo_write": (0, 0),
+    }
+    # Either side's invocations count; the threshold never exceeds the example count.
+    assert tools_with_evidence(usage, example_count=3) == []
+    assert tools_with_evidence(usage, example_count=2) == ["glean_search", "glean_document_reader"]
+    assert tools_with_evidence({"discover": (1, 0)}, example_count=1) == ["discover"]
+
+
+def test_modules_after_tool_choice_drops_tools_nobody_invoked():
+    """A description cannot steer a decision the student never reaches.
+
+    In the agentic run the reflector spent three of five offspring rewriting
+    ask_user_questions while the student invoked it on 4 of 189 entries and asked
+    in prose instead; the val score did not move. Such tools are filtered before
+    the reflector picks, and the reflector is shown the counts for the rest.
+    """
+    parent = Candidate(
+        model="gpt",
+        prompt_modules={"glean_search": "s", "glean_document_reader": "r", "ask_user_questions": "a"},
+        module_specs={},
+        global_token_cap=4096,
+        baseline_prompt_hash="h",
+    )
+    examples = [
+        _paired_example(["Glean Search"], ["Glean Search", "Glean Document Reader"]),
+        _paired_example(["Glean Search"], ["Glean Document Reader"]),
+        _paired_example([], ["Glean Search", "Glean Document Reader"]),
+        _paired_example(["Ask User Questions"], ["Glean Search"]),
+    ]
+    high_signal = dict.fromkeys(("glean_search", "glean_document_reader", "ask_user_questions"), examples)
+
+    def choose(prompt: str) -> str:
+        assert "### ask_user_questions" not in prompt
+        assert "ask_user_questions" not in prompt.split("CURRENT DESCRIPTIONS")[0]
+        assert "glean_document_reader" in prompt
+        return "ask_user_questions\nglean_document_reader\nglean_search"
+
+    chosen = modules_after_tool_choice(
+        choose,
+        parent,
+        [EXECUTION_DISCIPLINE_KEY, "glean_search", "glean_document_reader", "ask_user_questions"],
+        high_signal,
+    )
+    assert chosen == [EXECUTION_DISCIPLINE_KEY, "glean_document_reader", "glean_search"]
+
+
+def test_unseen_evalset_policy_reveals_one_training_id_at_a_time():
+    loader = ListDataLoader(["v1", "v2", "v3"])
+    policy = UnseenEvalSetPolicy()
+
+    assert policy.take_unseen(loader, purpose="reflection and offspring screening") == [0]
+    assert policy.take_unseen(loader, purpose="reflection and offspring screening") == [1]
+    assert policy.take_unseen(loader, purpose="reflection and offspring screening") == [2]
+
+
+def test_unseen_evalset_policy_fails_instead_of_reusing_seen_data():
+    loader = ListDataLoader(["v1"])
+    policy = UnseenEvalSetPolicy()
+    policy.take_unseen(loader, purpose="reflection and offspring screening")
+
+    with pytest.raises(RuntimeError, match="No unseen eval sets remain"):
+        policy.take_unseen(loader, purpose="reflection and offspring screening")
+
+
+def test_restarted_run_continues_after_the_versions_it_already_used(tmp_path):
+    state_file = tmp_path / "schedule.json"
+    loader = ListDataLoader(["v1", "v2", "v3"])
+
+    first = UnseenEvalSetPolicy(state_file=state_file)
+    assert first.take_unseen(loader, purpose="screening", attempt=0) == [0]
+    assert first.take_unseen(loader, purpose="screening", attempt=1) == [1]
+
+    resumed = UnseenEvalSetPolicy(state_file=state_file)
+    assert resumed.take_unseen(loader, purpose="screening", attempt=2) == [2]
+
+    skipped = UnseenEvalSetPolicy(state_file=tmp_path / "skipped.json")
+    skipped.skip_consumed_prefix(loader, 2)
+    assert skipped.take_unseen(loader, purpose="screening") == [2]
+
+
+def test_generation_interrupted_before_it_finished_replays_its_slice(tmp_path):
+    state_file = tmp_path / "schedule.json"
+    loader = ListDataLoader(["v1", "v2", "v3"])
+
+    first = UnseenEvalSetPolicy(state_file=state_file)
+    first.take_unseen(loader, purpose="screening", attempt=0)
+    first.take_unseen(loader, purpose="screening", attempt=1)
+
+    # The engine checkpoints before a generation starts, so a resumed run
+    # repeats the attempt counter of the generation it was killed in.
+    resumed = UnseenEvalSetPolicy(state_file=state_file)
+    assert resumed.take_unseen(loader, purpose="screening", attempt=1) == [1]
+    assert resumed.take_unseen(loader, purpose="screening", attempt=2) == [2]
+
+
+def test_schedule_tracks_eval_set_versions_not_list_positions(tmp_path):
+    state_file = tmp_path / "schedule.json"
+    used = [{"eval_set_name": "Medium", "eval_set_version": version} for version in ("20260820", "20260824")]
+
+    first = UnseenEvalSetPolicy(state_file=state_file)
+    first.take_unseen(ListDataLoader(used), purpose="screening", attempt=0)
+    first.take_unseen(ListDataLoader(used), purpose="screening", attempt=1)
+
+    assert json.loads(state_file.read_text())["consumed"] == ["Medium:20260820"]
+
+    # A restart that prepends a new version must not re-run either used one.
+    reordered = [{"eval_set_name": "Medium", "eval_set_version": "20260828"}, *used]
+    resumed = UnseenEvalSetPolicy(state_file=state_file)
+    assert resumed.take_unseen(ListDataLoader(reordered), purpose="screening", attempt=2) == [0]
+
+
+def test_stopper_ends_the_run_once_every_training_version_is_used(tmp_path):
+    loader = ListDataLoader(["v1", "v2"])
+    policy = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
+    stopper = TrainingScheduleExhaustedStopper(policy, loader)
+
+    assert not stopper(None)
+    policy.take_unseen(loader, purpose="screening", attempt=0)
+    policy.take_unseen(loader, purpose="screening", attempt=1)
+    assert not stopper(None)
+
+    # Starting a third generation retires the last slice and exhausts the schedule.
+    with pytest.raises(RuntimeError, match="No unseen eval sets remain"):
+        policy.take_unseen(loader, purpose="screening", attempt=2)
+    assert stopper(None)

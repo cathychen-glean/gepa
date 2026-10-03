@@ -137,9 +137,9 @@ Shipped experiments:
 
 | File | Mode | Primary | Notes |
 |---|---|---|---|
-| `single_model_shell.yaml` | single_model | `shell_success_rate` | Loops variant (`loop_efficiency`) shown in comments. |
+| `single_model_shell.yaml` | single_model | `shell_success_rate` | Shell-tool success from Agentspan telemetry. |
 | `teacher_student.yaml` | teacher_student | `agentic_preference_rate` | Pairwise AGENTIC_JUDGE vs the teacher; screens on the same judge. |
-| `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match; citations variant (`citation_match`) in comments. Weighted screen. |
+| `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match. Weighted screen. |
 | `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
 | `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
 

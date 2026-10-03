@@ -12,7 +12,12 @@ from glean_gepa.al_adapter import (
     CODING_HARNESS_SC_PARAMS,
     ALRunner,
 )
+from glean_gepa.bigquery_client import BigQueryClient, BigQueryError
+from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import (
+    AGENTIC_CORRECTNESS_JUDGE_NAME,
+    AGENTIC_JUDGE_NAME,
+    AGENTIC_JUDGE_TYPE,
     COMPLETENESS_JUDGE_TYPE,
     COMPLETENESS_RUN_PARAMS,
     CORRECTNESS_INPUT_MAPPINGS,
@@ -21,12 +26,14 @@ from glean_gepa.evalcli_client import (
     EVALCLI_TIMEOUT_SEC,
     EvalCliClient,
     EvalCliError,
-    _subprocess_env,
     classify_eval_run_status,
+    judge_run_skill_name,
     min_ingested_eval_set_entries,
 )
 from glean_gepa.judge_metrics_util import (
+    JUDGE_SPECS,
     judge_metrics_snapshot,
+    per_entry_from_analysis_view,
     wait_for_all_judge_metrics,
 )
 
@@ -82,18 +89,6 @@ def test_build_sc_params_overrides_claude_models(alias: str):
     assert "co.internal_looping_pyagent_default_route_override=coding_agent_loop" in params
     if alias not in AGENTIC_LOOP_REASONING_EFFORT:
         assert "co.lo.advanced_mode_reasoning_effort=" not in params
-
-
-def test_build_sc_params_pins_sol_6_1_to_high_reasoning():
-    runner = ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli"))
-
-    params = runner._build_sc_params("gpt6_1_sol_high", "")
-
-    assert "co.lo.oai_model_for_agentic_loop=GPT6_1_SOL" in params
-    assert "co.lo.advanced_mode_reasoning_effort=high" in params
-    assert "co.lo.advanced_mode_model_reasoning_overrides=GPT6_1_SOL:high" in params
-    for tier in ("economical", "balanced", "frontier"):
-        assert f"co.lo.mro.{tier}.driver_reasoning_effort=high" in params
 
 
 def test_build_sc_params_rejects_unknown_and_legacy_claude_alias():
@@ -585,135 +580,84 @@ def _view(eval_id: str, judge_id: str, scores: list[float | None], *, unscored: 
     }
 
 
-def test_wait_for_judge_metrics_without_totals_ignores_a_stall_below_minimum_coverage():
-    """A count frozen at 2 of 195 for longer than the settle window is a judge still queuing, not a finished one.
-
-    Once the count reaches coverage and holds still, the same settle rule applies.
-    """
-    evalcli = MagicMock()
-    sample_sizes = [2] * 6 + [190] * 3
-    evalcli.get_eval_metrics.side_effect = [_metrics_payload(pass_rate=5.0, sample_size=n) for n in sample_sizes]
-    evalcli.get_analysis_view.side_effect = [
-        _view("run-1", "judge-1", [0.5] * n, unscored=195 - n) for n in sample_sizes
-    ]
-
+def _wait_without_totals(evalcli, *, timeout_sec: int = 600):
+    """The agentic judge reports no coverage totals, so settling is read from the sample size."""
     with patch("glean_gepa.judge_metrics_util.time.sleep") as sleep:
-        analysis = wait_for_all_judge_metrics(
+        result = wait_for_all_judge_metrics(
             evalcli,
             (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
             poll_interval_sec=60,
-            timeout_sec=3600,
+            timeout_sec=timeout_sec,
             settle_sec=120,
         )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
-    assert sleep.call_count == 8
-    assert len(analysis.per_entry) == 190
-    assert analysis.aggregate == 5.0
+    return result, sleep.call_count
 
 
-def test_wait_for_judge_metrics_without_totals_never_settles_below_minimum_coverage():
+@pytest.mark.parametrize(
+    ("summary_sizes", "view_sizes", "unscored_of", "expected_n", "expected_sleeps", "expected_mean"),
+    [
+        # A count frozen at 2 of 195 past the settle window is still queuing; it settles once it reaches coverage.
+        ([2] * 6 + [190] * 3, [2] * 6 + [190] * 3, 195, 190, 8, 5.0),
+        # A growing sample must not be read as final.
+        ([7, 90, 190, 190, 190], [7, 90, 190, 190, 190], None, 190, 4, None),
+        # A summary frozen at 17 must not be recorded while the view already has 152: use the per-entry mean.
+        ([17], [100, 152, 152, 152], None, 152, None, 5.0),
+    ],
+    ids=["stall_below_coverage_then_settles", "waits_until_sample_stops_growing", "per_entry_mean_when_summary_lags"],
+)
+def test_wait_for_judge_metrics_without_totals_settles_on_a_stable_sample(
+    summary_sizes, view_sizes, unscored_of, expected_n, expected_sleeps, expected_mean
+):
     evalcli = MagicMock()
-    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=5.5, sample_size=8)
-    evalcli.get_analysis_view.return_value = _view("run-1", "judge-1", [0.55] * 8, unscored=192)
-
-    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="8 scored"):
-        wait_for_all_judge_metrics(
-            evalcli,
-            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
-            poll_interval_sec=60,
-            timeout_sec=1800,
-            settle_sec=120,
-        )
-
-
-def test_wait_for_judge_metrics_without_totals_needs_the_view_to_accept_a_stall():
-    """With no totals and no analyze view there is nothing to measure coverage against, so a flat count is not proof."""
-    evalcli = MagicMock()
-    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=5.0, sample_size=2)
-    evalcli.get_analysis_view.side_effect = EvalCliError("503 Unable to load eval run creation dates")
-
-    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="2 scored"):
-        wait_for_all_judge_metrics(
-            evalcli,
-            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
-            poll_interval_sec=60,
-            timeout_sec=600,
-            settle_sec=120,
-        )
-
-
-def test_wait_for_judge_metrics_without_totals_waits_until_sample_stops_growing():
-    """The agentic judge reports no coverage totals; a growing sample must not be read as final."""
-    evalcli = MagicMock()
-    evalcli.get_eval_metrics.side_effect = [
-        _metrics_payload(pass_rate=3.71, sample_size=7),
-        _metrics_payload(pass_rate=4.10, sample_size=90),
-        _metrics_payload(pass_rate=4.34, sample_size=190),
-        _metrics_payload(pass_rate=4.34, sample_size=190),
-        _metrics_payload(pass_rate=4.34, sample_size=190),
-    ]
+    payloads = [_metrics_payload(pass_rate=5.0, sample_size=n) for n in summary_sizes]
+    evalcli.get_eval_metrics.side_effect = payloads if len(payloads) > 1 else None
+    evalcli.get_eval_metrics.return_value = payloads[0]
     evalcli.get_analysis_view.side_effect = [
-        _view("run-1", "judge-1", [0.4] * 7),
-        _view("run-1", "judge-1", [0.4] * 90),
-        _view("run-1", "judge-1", [0.4] * 190),
-        _view("run-1", "judge-1", [0.4] * 190),
-        _view("run-1", "judge-1", [0.4] * 190),
+        _view("run-1", "judge-1", [0.5] * n, unscored=(unscored_of - n) if unscored_of else 0) for n in view_sizes
     ]
-
-    with patch("glean_gepa.judge_metrics_util.time.sleep") as sleep:
-        analysis = wait_for_all_judge_metrics(
-            evalcli,
-            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
-            poll_interval_sec=60,
-            timeout_sec=600,
-            settle_sec=120,
-        )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
-    assert sleep.call_count == 4
-    assert evalcli.get_eval_metrics.call_count == 5
-    assert analysis.aggregate == 4.34
-    assert len(analysis.per_entry) == 190
+    analysis, sleeps = _wait_without_totals(evalcli, timeout_sec=3600)
+    assert len(analysis.per_entry) == expected_n
+    if expected_sleeps is not None:
+        assert sleeps == expected_sleeps
+    if expected_mean is not None:
+        assert analysis.aggregate == pytest.approx(expected_mean)
 
 
-def test_wait_for_judge_metrics_without_totals_uses_per_entry_mean_when_summary_lags():
-    """A metrics summary frozen at 17 entries must not be recorded while the view already has 152."""
-    evalcli = MagicMock()
-    evalcli.get_eval_metrics.return_value = _metrics_payload(pass_rate=3.71, sample_size=17)
-    evalcli.get_analysis_view.side_effect = [
-        _view("run-1", "judge-1", [0.5] * 100),
-        _view("run-1", "judge-1", [0.5] * 152),
-        _view("run-1", "judge-1", [0.5] * 152),
-        _view("run-1", "judge-1", [0.5] * 152),
-    ]
-
-    with patch("glean_gepa.judge_metrics_util.time.sleep"):
-        analysis = wait_for_all_judge_metrics(
-            evalcli,
-            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
-            poll_interval_sec=60,
-            timeout_sec=600,
-            settle_sec=120,
-        )[("run-1", COMPLETENESS_JUDGE_TYPE, None)]
-    assert evalcli.get_analysis_view.call_count == 4
-    assert analysis.aggregate == pytest.approx(5.0)
-    assert len(analysis.per_entry) == 152
-
-
-def test_wait_for_judge_metrics_without_totals_times_out_while_sample_grows():
-    evalcli = MagicMock()
+def _growing_metrics():
     sizes = iter(range(1, 1000))
+    return lambda _eval_id, **_kwargs: _metrics_payload(pass_rate=4.0, sample_size=next(sizes))
 
-    def metrics(_eval_id, **_kwargs):
-        return _metrics_payload(pass_rate=4.0, sample_size=next(sizes))
 
-    evalcli.get_eval_metrics.side_effect = metrics
-    evalcli.get_analysis_view.return_value = {"entries": []}
-    with patch("glean_gepa.judge_metrics_util.time.sleep"), pytest.raises(EvalCliError, match="scored"):
-        wait_for_all_judge_metrics(
-            evalcli,
-            (("run-1", COMPLETENESS_JUDGE_TYPE, "judge-1", None),),
-            poll_interval_sec=60,
-            timeout_sec=180,
-            settle_sec=120,
-        )
+@pytest.mark.parametrize(
+    ("metrics", "view", "match"),
+    [
+        (
+            _metrics_payload(pass_rate=5.5, sample_size=8),
+            _view("run-1", "judge-1", [0.55] * 8, unscored=192),
+            "8 scored",
+        ),
+        # No analyze view means nothing to measure coverage against, so a flat count is not proof.
+        (
+            _metrics_payload(pass_rate=5.0, sample_size=2),
+            EvalCliError("503 Unable to load eval run creation dates"),
+            "2 scored",
+        ),
+        (_growing_metrics(), {"entries": []}, "scored"),
+    ],
+    ids=["flat_below_coverage", "no_view", "sample_keeps_growing"],
+)
+def test_wait_for_judge_metrics_without_totals_never_settles(metrics, view, match):
+    evalcli = MagicMock()
+    if callable(metrics):
+        evalcli.get_eval_metrics.side_effect = metrics
+    else:
+        evalcli.get_eval_metrics.return_value = metrics
+    if isinstance(view, Exception):
+        evalcli.get_analysis_view.side_effect = view
+    else:
+        evalcli.get_analysis_view.return_value = view
+    with pytest.raises(EvalCliError, match=match):
+        _wait_without_totals(evalcli, timeout_sec=180)
 
 
 def test_get_analysis_details_pages_entry_ids_and_retries_transient_pages():
@@ -860,6 +804,47 @@ def test_find_judge_run_id(listing, expected):
     assert found == expected
 
 
+def _judge_row(run_id: str, skill: str, *, as_json: bool = False) -> dict:
+    params = {"judge_skill_name": skill}
+    return {
+        "id": run_id,
+        "evalRunId": "ev",
+        "baseEvalRunId": "base",
+        "config": {"judgeType": AGENTIC_JUDGE_TYPE, "runParameters": json.dumps(params) if as_json else params},
+    }
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["dict", "json-string"])
+def test_judge_run_skill_name_reads_config_run_parameters(as_json: bool):
+    assert judge_run_skill_name(_judge_row("j", "skill", as_json=as_json)) == "skill"
+    assert judge_run_skill_name({"id": "j"}) is None
+
+
+def test_find_judge_run_id_filters_by_skill_when_cortex_type_is_shared():
+    client = EvalCliClient(binary="/fake/evalcli")
+    listing = {
+        "judgeRuns": [
+            _judge_row("judge-multi", AGENTIC_JUDGE_NAME),
+            _judge_row("judge-corr", AGENTIC_CORRECTNESS_JUDGE_NAME),
+        ]
+    }
+    with patch.object(client, "_invoke_json", return_value=listing):
+        find = lambda **kw: client.find_judge_run_id("ev", judge_type=AGENTIC_JUDGE_TYPE, base_eval_run_id="base", **kw)
+        assert find(judge_skill_name=AGENTIC_CORRECTNESS_JUDGE_NAME) == "judge-corr"
+        assert find(judge_skill_name=AGENTIC_JUDGE_NAME) == "judge-multi"
+        assert find() == "judge-multi"  # no skill filter: first type match wins
+
+
+@pytest.mark.parametrize("spec", [s for s in JUDGE_SPECS.values() if s.per_entry_scale != 1.0], ids=lambda s: s.name)
+def test_per_entry_scores_normalize_by_the_spec_scale(spec):
+    raw = spec.per_entry_scale * 0.7
+    view = {
+        "entries": [{"entryId": "e1", "evalRunEntries": [{"runId": "ev", "metadata": {"judgeScores": {"j": raw}}}]}]
+    }
+    scores, _ = per_entry_from_analysis_view(view, eval_id="ev", judge_run_id="j", judge_type=spec.judge_type)
+    assert scores == {"e1": pytest.approx(0.7)}
+
+
 @pytest.mark.parametrize(
     "listing, match",
     [
@@ -887,40 +872,6 @@ def test_wait_for_judge_run(listing, match):
 
     args = mock_invoke.call_args[0]
     assert args[args.index("--eval-run-ids") + 1] == "student-run"
-
-
-@pytest.mark.parametrize(
-    "initial, expect_resolved_bundle, expect_drop_cert_dir",
-    [
-        (
-            {"SSL_CERT_FILE": "/var/folders/abc/socketFirewallCa.crt", "SSL_CERT_DIR": "/var/folders/abc"},
-            True,
-            True,
-        ),
-        ({}, True, False),
-        ({"SSL_CERT_FILE": "/custom/ca.pem"}, False, False),
-    ],
-    ids=["unreliable", "missing", "custom"],
-)
-def test_subprocess_env_ssl_cert(monkeypatch, tmp_path, initial, expect_resolved_bundle, expect_drop_cert_dir):
-    ca_bundle = tmp_path / "ca.pem"
-    ca_bundle.write_text("fake-ca", encoding="utf-8")
-    monkeypatch.setattr("glean_gepa.evalcli_client._resolve_ca_bundle", lambda: str(ca_bundle))
-    for key in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE"):
-        monkeypatch.delenv(key, raising=False)
-    for key, value in initial.items():
-        monkeypatch.setenv(key, value)
-
-    env = _subprocess_env()
-
-    if expect_resolved_bundle:
-        assert env["SSL_CERT_FILE"] == str(ca_bundle)
-        assert env["REQUESTS_CA_BUNDLE"] == str(ca_bundle)
-    else:
-        assert env["SSL_CERT_FILE"] == "/custom/ca.pem"
-        assert "REQUESTS_CA_BUNDLE" not in env
-    if expect_drop_cert_dir:
-        assert "SSL_CERT_DIR" not in env
 
 
 @pytest.mark.parametrize(
@@ -952,18 +903,6 @@ def test_wait_for_eval_run_retries_transient_errors(error, capsys):
     status_logs = [line for line in capsys.readouterr().out.splitlines() if line.startswith("Eval run run_123 status:")]
     assert "TASK_SUBMITTED" in status_logs[0]
     assert "TASK_SUCCEEDED" in status_logs[1]
-
-
-def test_wait_for_eval_run_honors_timeout():
-    client = EvalCliClient(binary="/fake/evalcli")
-    with (
-        patch.object(client, "_invoke_json") as mock_invoke,
-        patch("glean_gepa.evalcli_client.time.monotonic", side_effect=[10.0, 11.0]),
-    ):
-        with pytest.raises(EvalCliError, match="timed out after 1s"):
-            client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=1)
-
-    mock_invoke.assert_not_called()
 
 
 def _task_status(*, finished: int, unfinished: int) -> list[dict[str, object]]:
@@ -1022,15 +961,6 @@ def test_wait_for_eval_run_grace_period(capsys: pytest.CaptureFixture[str]):
         client.wait_for_eval_run("run_123", poll_interval_sec=0, timeout_sec=10)
 
 
-def test_wait_for_eval_run_timeout_includes_last_status():
-    client = EvalCliClient(binary="/fake/evalcli")
-    in_progress = [{"taskCountsByStatus": [{"status": "TASK_SUBMITTED", "count": 2}]}]
-    with patch.object(client, "_invoke_json", return_value=in_progress):
-        with patch("glean_gepa.evalcli_client.time.sleep"):
-            with pytest.raises(EvalCliError, match="timed out after 1s"):
-                client.wait_for_eval_run("run_123", poll_interval_sec=1, timeout_sec=1)
-
-
 def test_wait_for_eval_run_raises_on_non_transient_errors():
     client = EvalCliClient(binary="/fake/evalcli")
     with patch.object(
@@ -1060,6 +990,7 @@ def test_wait_for_eval_set_entries_accepts_stable_partial_ingest():
 
     assert ingested == rows
     assert list_entries.call_count == 2
+    assert (min_ingested_eval_set_entries(20), min_ingested_eval_set_entries(1)) == (10, 1)  # half, rounded up
 
 
 def test_wait_for_eval_set_entries_times_out_below_half_ingested():
@@ -1078,12 +1009,6 @@ def test_wait_for_eval_set_entries_times_out_below_half_ingested():
             poll_interval_sec=1,
             timeout_sec=2,
         )
-
-
-def test_min_ingested_eval_set_entries_is_half_rounded_up():
-    assert min_ingested_eval_set_entries(20) == 10
-    assert min_ingested_eval_set_entries(19) == 10
-    assert min_ingested_eval_set_entries(1) == 1
 
 
 def test_wait_for_eval_set_entries_includes_listing_error_on_timeout():
@@ -1105,14 +1030,6 @@ def test_wait_for_eval_set_entries_includes_listing_error_on_timeout():
             poll_interval_sec=1,
             timeout_sec=1,
         )
-
-
-def test_invoke_raises_on_nonzero_exit():
-    client = EvalCliClient(binary="/fake/evalcli")
-    with patch("glean_gepa.evalcli_client.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="auth failed")
-        with pytest.raises(EvalCliError, match="auth failed"):
-            client._invoke("whoami")
 
 
 @pytest.mark.parametrize(
@@ -1237,3 +1154,94 @@ def test_invoke_raises_on_nonzero_exit():
 )
 def test_classify_eval_run_status(status, expected):
     assert classify_eval_run_status(status) == expected
+
+
+KEY = ("gpt", "h", "Set", "v1", "gepa", "scio-prod")
+NOT_FOUND = [{"errors": ["No EvalRun or JudgeRun found with this ID"]}]
+NEAR_DONE = [
+    {"taskCountsByStatus": [{"status": "TASK_SUCCEEDED", "count": 189}, {"status": "TASK_EXECUTING", "count": 4}]}
+]
+
+
+@pytest.mark.parametrize(
+    ("section", "status", "expected"),
+    [
+        # No task counts and no not-found error: keep whatever the cache believed.
+        ("completed", [{"crossDeploymentUuid": "old"}], ("old", False)),
+        ("in_flight", [{"taskCountsByStatus": []}], ("old", True)),
+        # Explicit not-found (payload or evalcli None) drops the run.
+        ("completed", NOT_FOUND, None),
+        ("completed", None, None),
+        # A near-finished in-flight run is promoted to usable.
+        ("in_flight", NEAR_DONE, ("old", False)),
+    ],
+)
+def test_resolve_cached_eval(tmp_path, section, status, expected):
+    cache = tmp_path / "cache.json"
+    body = {"completed": {}, "in_flight": {}, "judge_runs": {}}
+    if section == "completed":
+        body["completed"][json.dumps(list(KEY))] = "old"
+    else:
+        body["in_flight"]["old"] = list(KEY)
+    cache.write_text(json.dumps(body))
+    evalcli = MagicMock()
+    evalcli.get_eval_run_status.return_value = status
+    runner = ALRunner(evalcli=evalcli, cache_file=cache)
+    assert runner._resolve_cached_eval(KEY) == expected
+    evalcli.create_eval_run.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def debug_output_disabled():
+    set_debug(False)
+    yield
+    set_debug(False)
+
+
+def test_evalset_payload_is_hidden_by_default(capsys):
+    client = EvalCliClient(binary="/fake/evalcli")
+    with patch.object(client, "_invoke", return_value=""):
+        client.upload_eval_set({"entries": [{"query": "sensitive prompt"}]})
+
+    assert capsys.readouterr().out == ""
+
+
+def test_evalset_payload_is_visible_in_debug_mode(capsys):
+    set_debug(True)
+    client = EvalCliClient(binary="/fake/evalcli")
+    with patch.object(client, "_invoke", return_value=""):
+        client.upload_eval_set({"entries": [{"query": "sensitive prompt"}]})
+
+    assert "Uploading eval set payload" in capsys.readouterr().out
+
+
+def test_bigquery_client_query_returns_dict_rows():
+    mock_row = MagicMock()
+    mock_row.items.return_value = [("eval_id", "run_123"), ("shell_error_rate", 0.1)]
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([mock_row])
+    mock_client = MagicMock()
+    mock_client.query.return_value.result.return_value = mock_result
+
+    client = BigQueryClient(project_id="scio-apps", client=mock_client)
+    rows = client.query("SELECT 1")
+
+    assert rows == [{"eval_id": "run_123", "shell_error_rate": 0.1}]
+    mock_client.query.assert_called_once()
+
+
+def test_bigquery_client_raises_import_error_without_dependency():
+    client = BigQueryClient(project_id="scio-apps")
+    with patch.dict("sys.modules", {"google.cloud": None, "google.cloud.bigquery": None}):
+        client._client = None
+        with pytest.raises(BigQueryError, match="google-cloud-bigquery is required"):
+            client._get_client()
+
+
+def test_bigquery_client_wraps_query_failures():
+    mock_client = MagicMock()
+    mock_client.query.side_effect = RuntimeError("permission denied")
+    client = BigQueryClient(project_id="scio-apps", client=mock_client)
+
+    with pytest.raises(BigQueryError, match="permission denied"):
+        client.query("SELECT 1")

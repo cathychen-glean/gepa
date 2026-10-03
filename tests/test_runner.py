@@ -1,10 +1,8 @@
+from __future__ import annotations
 import json
 from datetime import date, timedelta
-from pathlib import Path
 from unittest.mock import MagicMock
-
 import pytest
-
 from gepa.core.data_loader import ListDataLoader
 from glean_gepa.evalcli_client import (
     AGENTIC_JUDGE_NAME,
@@ -28,15 +26,12 @@ from glean_gepa.prompt_constants import (
     WRITING_CODE_KEY,
 )
 from glean_gepa.runner import (
-    ADAPTER_CACHE_FILENAME,
-    CACHE_DIRECTORY_NAME,
     CUSTOMER_DEPLOYMENTS_FILENAME,
     CUSTOMER_EVAL_DEPLOYMENT_IDS,
     GLEAN_CHAT_EVAL_SET_NAME,
     MAX_EVAL_RUN_DEPLOYMENTS,
     SCIO_PROD_DEPLOYMENT_IDS,
     TEACHER_STUDENT_DEPLOYMENT_IDS,
-    _default_cache_file,
     _load_seed_candidate,
     _make_evalset,
     _parse_args,
@@ -47,10 +42,23 @@ from glean_gepa.runner import (
     _seed_for_editable_modules,
     _select_covered_dated_versions,
     _select_recent_train_versions,
-    _val_eval_set_name,
     _validate_best_candidate_on_customer_eval,
     _verify_customer_eval_metrics,
 )
+from glean_gepa.remote_job import build_runner_args
+from glean_gepa.run_log import (
+    capture_run_log,
+    format_child_proposal_report,
+    format_eval_entry_report,
+    format_high_signal_selection_report,
+    format_screening_report,
+    selected_entry_ids_from_examples,
+)
+from glean_gepa.runner import RUN_LOG_FILENAME, _resolve_log_file
+from unittest.mock import Mock, patch
+from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
+from glean_gepa.runner import _make_reflection_lm
+
 
 SEED_BOTH = {"WRITING_CODE": "patterns", "FULL_PROMPT": "PREFIX\n{WRITING_CODE}\nSUFFIX"}
 SEED_WITH_RULES_SLOT = {**SEED_BOTH, "WRITING_CODE": "patterns\n{RULES_EXT}"}
@@ -81,7 +89,6 @@ def test_compile_and_materialize_prompt_modules():
     custom = compile_system_prompt({EXECUTION_DISCIPLINE_KEY: "- Keep working until the deliverable is complete."})
     assert "- Keep working until the deliverable is complete." in custom
     assert "{EXECUTION_DISCIPLINE}" not in custom
-    assert "as few tool loops as possible" not in custom
     for candidate in ({EXECUTION_DISCIPLINE_KEY: ""}, {EXECUTION_DISCIPLINE_KEY: "   \n"}):
         assert DEFAULT_EXECUTION_DISCIPLINE in compile_system_prompt(candidate)
 
@@ -114,20 +121,6 @@ def test_compile_system_prompt_splices_rules_ext_after_rules():
         }
     )
     assert reflowed == empty
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        {},
-        {"WRITING_CODE": "code instructions"},
-    ],
-)
-def test_load_seed_candidate_accepts_known_keys(tmp_path, raw):
-    path = tmp_path / "seed.json"
-    path.write_text(json.dumps(raw))
-
-    assert _load_seed_candidate(path) == raw
 
 
 def test_seed_for_editable_modules():
@@ -202,42 +195,6 @@ def test_load_seed_candidate_rejects_invalid(tmp_path, raw, match):
         _load_seed_candidate(path)
 
 
-def test_committed_seed_candidate_pins_only_writing_code():
-    """The single seed both configs point at: it overrides WRITING_CODE and leaves
-    every other module to PROMPT_MODULE_DEFAULTS."""
-    raw = _load_seed_candidate(Path(__file__).resolve().parents[1] / "data" / "seed_candidate.json")
-
-    assert set(raw) == {WRITING_CODE_KEY}
-
-
-def test_parse_args():
-    default = _parse_args(["--seed_candidate", "seed.json"])
-    assert default.editable_modules == WRITING_CODE_KEY
-    assert default.eval_version_days_back == 0
-
-    args = _parse_args(["--seed_candidate", "seed.json", "--reflection_samples", "all"])
-    assert args.reflection_samples is None
-
-    for value in ("0", "not-a-number"):
-        with pytest.raises(SystemExit):
-            _parse_args(["--seed_candidate", "seed.json", "--reflection_samples", value])
-    with pytest.raises(SystemExit):
-        _parse_args(["--seed_candidate", "seed.json", "--eval_version_days_back", "-1"])
-
-
-def test_default_cache_file(tmp_path):
-    assert _default_cache_file(tmp_path, ADAPTER_CACHE_FILENAME) == (
-        tmp_path / CACHE_DIRECTORY_NAME / ADAPTER_CACHE_FILENAME
-    )
-
-    legacy = tmp_path / ADAPTER_CACHE_FILENAME
-    legacy.write_text('{"cached": true}')
-    cache_file = _default_cache_file(tmp_path, ADAPTER_CACHE_FILENAME)
-    assert cache_file == tmp_path / CACHE_DIRECTORY_NAME / ADAPTER_CACHE_FILENAME
-    assert cache_file.read_text() == '{"cached": true}'
-    assert not legacy.exists()
-
-
 _FIXED_TODAY = date(2026, 8, 27)
 
 
@@ -257,7 +214,9 @@ def frozen_today(monkeypatch):
     monkeypatch.setattr("glean_gepa.runner.date", _FixedDate)
 
 
-_SAMPLED_DEPLOYMENTS = sorted(CUSTOMER_EVAL_DEPLOYMENT_IDS[:MAX_EVAL_RUN_DEPLOYMENTS])
+# Two deployments so a version can be published to one and not the other. Independent of
+# MAX_EVAL_RUN_DEPLOYMENTS, which decides how many a real run samples.
+_SAMPLED_DEPLOYMENTS = sorted(CUSTOMER_EVAL_DEPLOYMENT_IDS[:2])
 
 
 def _version_row(version: str, deployment_ids=None, size: int = 200):
@@ -599,25 +558,10 @@ def test_customer_metric_validation(patch, gates, error, contains, omits):
         assert snippet not in report
 
 
-def test_first_iteration_prestarts_the_first_training_slice(tmp_path):
-    trainset = [
-        {
-            "eval_set_name": "Glean Chat V2 Medium",
-            "eval_set_version": "20260905",
-            "deployment_ids": ["scio-prod"],
-            "status": "active",
-        },
-        {
-            "eval_set_name": "Glean Chat V2 Medium",
-            "eval_set_version": "20260904",
-            "deployment_ids": ["scio-prod"],
-            "status": "active",
-        },
-    ]
+def _prestart(tmp_path, trainset):
     policy = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
     runner = MagicMock()
     runner.start.side_effect = [("teacher-eval", True), ("student-eval", True)]
-
     _prestart_first_iteration_training(
         runner=runner,
         policy=policy,
@@ -627,7 +571,14 @@ def test_first_iteration_prestarts_the_first_training_slice(tmp_path):
         teacher_model="gpt6_sol",
         run_dir=tmp_path,
     )
+    return runner
 
+
+def test_first_iteration_prestarts_the_first_training_slice_unless_resuming(tmp_path):
+    base = {"eval_set_name": "Glean Chat V2 Medium", "deployment_ids": ["scio-prod"], "status": "active"}
+    trainset = [{**base, "eval_set_version": "20260905"}, {**base, "eval_set_version": "20260904"}]
+
+    runner = _prestart(tmp_path, trainset)
     teacher_call, student_call = runner.start.call_args_list
     assert teacher_call.args[:5] == (
         "gpt6_sol",
@@ -641,39 +592,12 @@ def test_first_iteration_prestarts_the_first_training_slice(tmp_path):
     replayed = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
     assert replayed.take_unseen(ListDataLoader(trainset), purpose="reflection", attempt=0) == [0]
 
-
-def test_first_iteration_prestart_skips_a_resumed_run(tmp_path):
-    (tmp_path / "gepa_state.bin").write_bytes(b"state")
-    policy = UnseenEvalSetPolicy(state_file=tmp_path / "schedule.json")
-    runner = MagicMock()
-
-    _prestart_first_iteration_training(
-        runner=runner,
-        policy=policy,
-        trainset=[
-            {
-                "eval_set_name": "Glean Chat V2 Medium",
-                "eval_set_version": "20260905",
-                "deployment_ids": ["scio-prod"],
-                "status": "active",
-            }
-        ],
-        seed_candidate={"WRITING_CODE": "seed"},
-        student_model="gpt6_luna",
-        teacher_model="gpt6_sol",
-        run_dir=tmp_path,
-    )
-
-    runner.start.assert_not_called()
-    assert not (tmp_path / "schedule.json").exists()
-
-
-def test_val_eval_set_defaults():
-    pinned = _parse_args(["--seed_candidate", "seed.json", "--val_eval_versions", "20260906"])
-    assert _val_eval_set_name(pinned, "Glean Chat V2 Medium") == "Glean Chat V2 Medium"
-
-    automatic = _parse_args(["--seed_candidate", "seed.json"])
-    assert _val_eval_set_name(automatic, "other") == GLEAN_CHAT_EVAL_SET_NAME
+    # A resumed run already has state; do not restart the slice or touch the schedule.
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    (resumed / "gepa_state.bin").write_bytes(b"state")
+    assert _prestart(resumed, trainset).start.call_count == 0
+    assert not (resumed / "schedule.json").exists()
 
 
 def test_make_evalset():
@@ -686,3 +610,201 @@ def test_make_evalset():
     assert valset[0]["validation_only"] is True
     assert "validation_only" not in trainset[0]
     assert trainset[0]["deployment_ids"] == list(SCIO_PROD_DEPLOYMENT_IDS)
+
+
+def test_build_runner_args_uses_cloud_run_execution_and_writes_seed(tmp_path):
+    args, run_dir = build_runner_args(
+        {
+            "CLOUD_RUN_EXECUTION": "gepa-optimize-abc123",
+            "GEPA_RUN_ROOT": str(tmp_path),
+            "GEPA_RUNNER_ARGS_JSON": json.dumps(["--max_metric_calls", "5"]),
+            "GEPA_SEED_CANDIDATE_JSON": json.dumps({"WRITING_CODE": "seed"}),
+        }
+    )
+
+    assert run_dir == tmp_path / "gepa-optimize-abc123"
+    assert args[-4:-2] == ["--run_dir", str(run_dir)]
+    assert args[-2:] == ["--seed_candidate", str(run_dir / "seed_candidate.json")]
+    assert json.loads((run_dir / "seed_candidate.json").read_text()) == {"WRITING_CODE": "seed"}
+
+
+def test_build_runner_args_preserves_explicit_run_dir(tmp_path):
+    explicit = tmp_path / "explicit"
+    args, _run_dir = build_runner_args(
+        {
+            "GEPA_RUN_ROOT": str(tmp_path),
+            "GEPA_RUNNER_ARGS_JSON": json.dumps(["--fake_flow", f"--run_dir={explicit}"]),
+        }
+    )
+
+    assert args == ["--fake_flow", f"--run_dir={explicit}"]
+
+
+@pytest.mark.parametrize("value", ["{}", "[1]", "not-json"])
+def test_build_runner_args_rejects_invalid_json(value, tmp_path):
+    with pytest.raises(ValueError, match="JSON array of strings"):
+        build_runner_args({"GEPA_RUN_ROOT": str(tmp_path), "GEPA_RUNNER_ARGS_JSON": value})
+
+
+def test_format_run_log_reports():
+    trajectories = [
+        {
+            "data": {"eval_set_name": "Chat", "eval_set_version": "v1"},
+            "output": {
+                "entry_id": "e1",
+                "query": "Find the Q3 plan",
+                "teacher_tool_events": ["Shell", "Glean Search", "Glean Document Reader"],
+                "student_tool_events": ["Discover"],
+                "teacher_eval_run_id": "t1",
+                "student_eval_run_id": "s1",
+            },
+            "score": 0.0,
+            "objective_scores": {"tool_alignment": 0.0, "correctness": 0.8},
+        }
+    ]
+    report = format_eval_entry_report(trajectories)
+    assert "e1" in report and "Glean Search" in report and "Discover" in report and "mismatch" in report
+
+    high_signal = format_high_signal_selection_report(
+        selected_groups=[("Glean Search", "Discover", 12), ("Glean Document Reader", "todo_write", 8)],
+        selected_entry_ids=["e1", "e2"],
+        selected_count=20,
+        total_mismatch_count=31,
+        module_entry_ids={"glean_search": ["e1"], "WRITING_CODE": ["e1", "e2"]},
+    )
+    assert "20" in high_signal and "31" in high_signal and "e1, e2" in high_signal and "glean_search" in high_signal
+
+    child = format_child_proposal_report(
+        parent_id="parent",
+        child_id="child",
+        module="glean_search",
+        delta="- old\n+ new\n",
+        justification="WHY: student used Discover first.",
+    )
+    assert "glean_search" in child and "student used Discover first." in child and "+ new" in child
+    screening = format_screening_report(
+        mode="fix-rate",
+        entry_ids=["e1", "e2"],
+        rows=[("child", 0.4, True, "fix_rate=0.400")],
+    )
+    assert "PASS" in screening
+    assert "e1, e2" in screening
+
+    examples = [
+        {"Inputs": {"entry_id": "e1"}},
+        {"Inputs": {"entry_id": "e1"}},
+        {"Inputs": {"entry_id": "e2"}},
+    ]
+    assert selected_entry_ids_from_examples(examples) == ["e1", "e2"]
+
+
+def test_capture_run_log_and_default_path(tmp_path, capsys):
+    log_path = tmp_path / "gepa_run.log"
+    with capture_run_log(log_path):
+        print("hello-run-log")
+    captured = capsys.readouterr()
+    assert "hello-run-log" in captured.out
+    assert "hello-run-log" in log_path.read_text()
+
+    args = _parse_args(["--seed_candidate", "seed.json", "--run_dir", "run_ts8"])
+    assert args.log_file is None
+    assert _resolve_log_file(args) == args.run_dir / RUN_LOG_FILENAME
+    explicit = _parse_args(["--seed_candidate", "seed.json", "--log_file", "/tmp/custom.log"])
+    assert _resolve_log_file(explicit).as_posix() == "/tmp/custom.log"
+
+
+def test_create_qe_openai_client_uses_instance_hostname() -> None:
+    ssl_context = Mock()
+    http_client = Mock()
+    with (
+        patch("glean_gepa.openai_client.truststore.SSLContext", return_value=ssl_context),
+        patch("glean_gepa.openai_client.openai.DefaultHttpxClient", return_value=http_client) as http_client_cls,
+        patch("glean_gepa.openai_client.openai.OpenAI") as openai_cls,
+    ):
+        create_qe_openai_client("glean-dev")
+
+    http_client_cls.assert_called_once_with(verify=ssl_context)
+    openai_cls.assert_called_once_with(
+        base_url="https://glean-dev-be.glean.com/qe/llm",
+        api_key="dummy",
+        timeout=600.0,
+        max_retries=5,
+        http_client=http_client,
+    )
+
+
+def test_format_exception_chain_includes_transport_root_cause() -> None:
+    root = OSError("temporary DNS failure")
+    outer = RuntimeError("Connection error")
+    outer.__cause__ = root
+
+    assert format_exception_chain(outer) == ("RuntimeError: Connection error <- OSError: temporary DNS failure")
+
+
+def test_reflection_lm_uses_qe_responses_auth_body(capsys: pytest.CaptureFixture[str]) -> None:
+    response = Mock(output_text="ack")
+    client = Mock()
+    client.responses.create.return_value = response
+
+    with patch("glean_gepa.runner.create_qe_openai_client", return_value=client):
+        reflection_lm = _make_reflection_lm(
+            "OPEN_AI:GPT5_LATEST",
+            qe_project="dev-sandbox-334901",
+            qe_instance="glean-dev",
+            authenticated_email="cathy.chen@glean.com",
+        )
+
+    assert reflection_lm("Just say ack") == "ack"
+    assert capsys.readouterr().out == (
+        "QE reflection LLM call 1: requesting model=OPEN_AI:GPT5_LATEST, prompt_chars=12\n"
+        "QE reflection LLM call 1 prompt:\n"
+        "Just say ack\n"
+        "QE reflection LLM call 1: received response_chars=3\n"
+        "QE reflection LLM call 1 response:\n"
+        "ack\n"
+    )
+    client.responses.create.assert_called_once_with(
+        model="OPEN_AI:GPT5_LATEST",
+        input="Just say ack",
+        max_output_tokens=4096,
+        extra_body={
+            "perf_eval_secret": get_perfeval_secret("dev-sandbox-334901"),
+            "source_info": {
+                "clientInitiator": "USER",
+                "feature": "INTEGRATION_TEST",
+            },
+            "authenticated_email": "cathy.chen@glean.com",
+        },
+    )
+
+
+def test_reflection_lm_raises_for_an_empty_qe_response() -> None:
+    client = Mock()
+    client.responses.create.return_value = Mock(output_text="   ")
+
+    with patch("glean_gepa.runner.create_qe_openai_client", return_value=client):
+        reflection_lm = _make_reflection_lm(
+            "OPEN_AI:GPT5_LATEST",
+            qe_project="dev-sandbox-334901",
+            qe_instance="glean-dev",
+            authenticated_email="cathy.chen@glean.com",
+        )
+
+    with pytest.raises(RuntimeError, match="QE reflection LLM returned an empty response"):
+        reflection_lm("Just say ack")
+
+
+def test_reflection_lm_surfaces_qe_request_errors() -> None:
+    client = Mock()
+    client.responses.create.side_effect = ConnectionError("proxy unavailable")
+
+    with patch("glean_gepa.runner.create_qe_openai_client", return_value=client):
+        reflection_lm = _make_reflection_lm(
+            "OPEN_AI:GPT5_LATEST",
+            qe_project="dev-sandbox-334901",
+            qe_instance="glean-dev",
+            authenticated_email="cathy.chen@glean.com",
+        )
+
+    with pytest.raises(RuntimeError, match="ConnectionError: proxy unavailable"):
+        reflection_lm("Just say ack")

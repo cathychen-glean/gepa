@@ -1,8 +1,75 @@
+"""The composite-scoring contract both Glean adapters share via GleanAdapterBase."""
+
+from __future__ import annotations
+
 import threading
 
+import pytest
+from helpers import single_model_adapter, teacher_student_adapter
+
+from glean_gepa.adapter_types import PointwiseJudge
 from glean_gepa.al_adapter import GleanAdapterBase
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.evolutionary_proposer import _select_screened_children
+from glean_gepa.evolutionary_proposer import _select_screened_children, pick_modules_to_edit
+from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
+from glean_gepa.objectives.tool_match import TOOL_ALIGNMENT_OBJECTIVE
+from glean_gepa.prompt_constants import RULES_EXT_KEY
+
+BOTH_ADAPTERS = [
+    pytest.param(teacher_student_adapter, TOOL_ALIGNMENT_OBJECTIVE, id="teacher_student"),
+    pytest.param(single_model_adapter, SHELL_SUCCESS_OBJECTIVE, id="single_model"),
+]
+
+
+@pytest.mark.parametrize(("build", "telemetry_dimension"), BOTH_ADAPTERS)
+def test_both_adapters_weight_constants_through_the_composite(build, telemetry_dimension):
+    adapter = build(
+        composite_weights={telemetry_dimension: 0.6, "fixed_signal": 0.4},
+        constant_scores={"fixed_signal": 0.5},
+    )
+
+    assert {telemetry_dimension, "fixed_signal"} <= adapter.scorable_dimensions()
+    assert adapter.composite_score({telemetry_dimension: 1.0, "fixed_signal": 0.5}) == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize(("build", "telemetry_dimension"), BOTH_ADAPTERS)
+def test_both_adapters_reject_a_composite_they_cannot_score(build, telemetry_dimension):
+    with pytest.raises(ValueError, match="cannot score: made_up_signal"):
+        build(composite_weights={telemetry_dimension: 0.5, "made_up_signal": 0.5})
+
+
+def test_only_teacher_student_can_score_a_judge_dimension():
+    """The one intentional asymmetry: single_model has no judge plumbing."""
+    judges = (PointwiseJudge("answer_quality", "CORRECTNESS", "{}"),)
+    teacher_student = teacher_student_adapter(
+        pointwise_judges=judges,
+        composite_weights={"answer_quality": 1.0},
+        constant_scores={},
+    )
+
+    assert "answer_quality" in teacher_student.scorable_dimensions()
+    with pytest.raises(ValueError, match="cannot score: answer_quality"):
+        single_model_adapter(composite_weights={"answer_quality": 1.0}, constant_scores={})
+
+
+def test_screening_score_follows_the_primary_or_the_weighted_blend():
+    """Screen on the primary by default; with screening.weights the child must clear the blend,
+    and an empty child eval can never pass."""
+    tool_match_eval = GleanEvaluationBatch(outputs=[], scores=[0.85], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0})
+    assert teacher_student_adapter().get_screening_score(tool_match_eval) == 0.5
+    assert teacher_student_adapter(primary_objective="correctness").get_screening_score(tool_match_eval) == 1.0
+
+    weighted = teacher_student_adapter(
+        primary_objective=TOOL_ALIGNMENT_OBJECTIVE,
+        screening_weights={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "agentic_preference_rate": 0.5},
+    )
+    blended = GleanEvaluationBatch(
+        outputs=[], scores=[0.4], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.8, "agentic_preference_rate": 0.4}
+    )
+    parent = GleanEvaluationBatch(outputs=[], scores=[0.2], trajectories=[{"score": 0.2}])
+    assert weighted.get_screening_score(blended) == 0.8
+    assert weighted.child_screen_score(parent, blended) == pytest.approx(0.6)
+    assert weighted.child_screen_score(tool_match_eval, GleanEvaluationBatch(outputs=[], scores=[])) == float("-inf")
 
 
 def _batch(scores: list[float]) -> GleanEvaluationBatch:
@@ -56,31 +123,6 @@ def test_high_signal_batch_skips_validation_only_eval_sets():
     assert len(focused) == 1
     assert focused[0]["deployment_ids"] == ["prod"]
     assert focused[0]["eval_entry_ids"] == ["entry-0"]
-
-
-def test_cached_eval_run_id_is_attached_to_matching_eval_set():
-    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
-    batch = [
-        {
-            "eval_set_name": "focused",
-            "eval_set_version": "v1",
-            "deployment_ids": ["prod"],
-            "status": "active",
-        }
-    ]
-
-    attached = adapter.attach_cached_eval_run_ids(
-        batch,
-        [
-            {
-                "eval_set_name": "focused",
-                "eval_set_version": "v1",
-                "student_eval_run_id": "run-cached",
-            }
-        ],
-    )
-
-    assert attached[0]["cached_student_eval_run_id"] == "run-cached"
 
 
 def test_high_signal_fix_rate():

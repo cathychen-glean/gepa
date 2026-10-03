@@ -28,15 +28,11 @@ SOURCE = {
 }
 FOCUSED = FocusedEvalSet("gepa-high-signal-example", "v1_hs_abc", 1)
 
-def test_focused_eval_set_version_is_stable_for_the_same_entries():
-    assert focused_eval_set_version("v1", ["b", "a"]) == focused_eval_set_version("v1", ["a", "b"])
-
-
-def test_focused_eval_set_version_changes_with_bucket_type():
+def test_focused_eval_set_version_is_order_independent_and_bucket_specific():
     ids = ["a", "b"]
-    session = focused_eval_set_version("v1", ids, bucket_type=SESSION_BUCKET_TYPE)
-    query = focused_eval_set_version("v1", ids, bucket_type=QUERY_CANONICAL_BUCKET_TYPE)
-    assert session != query
+    session = focused_eval_set_version("v1", ["b", "a"], bucket_type=SESSION_BUCKET_TYPE)
+    assert session == focused_eval_set_version("v1", ids, bucket_type=SESSION_BUCKET_TYPE)
+    assert session != focused_eval_set_version("v1", ids, bucket_type=QUERY_CANONICAL_BUCKET_TYPE)
     digest = md5(f"{HIGH_SIGNAL_EVAL_SET_SOURCE_SCHEMA}:{','.join(sorted(ids))}".encode()).hexdigest()[:12]
     assert session == f"v1_hs_{digest}"
 
@@ -373,9 +369,12 @@ def test_prepare_high_signal_eval_batch_attaches_focused_set_or_fails():
 def test_resolve_eval_run_target(data, ensure_return, expected, ensure_called):
     with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=ensure_return) as ensure:
         assert resolve_eval_run_target(MagicMock(), data) == expected
-    assert ensure.called is ensure_called
-    if ensure_called:
-        assert ensure.call_args.kwargs["bucket_type"] == QUERY_CANONICAL_BUCKET_TYPE
+        assert ensure.called is ensure_called
+        if ensure_called:
+            assert ensure.call_args.kwargs["bucket_type"] == QUERY_CANONICAL_BUCKET_TYPE
+            # A fresh copy: a successful resolve pins the focused set onto ``data``.
+            resolve_eval_run_target(MagicMock(), {**SOURCE, "eval_entry_ids": ["keep"]}, bucket_type=SESSION_BUCKET_TYPE)
+            assert ensure.call_args.kwargs["bucket_type"] == SESSION_BUCKET_TYPE
 
 
 def test_validation_only_eval_sets_never_build_a_focused_set():
@@ -392,12 +391,6 @@ def test_validation_only_eval_sets_never_build_a_focused_set():
     assert prepared == [validation_data]
     ensure.assert_not_called()
     evalcli.list_eval_set_entries.assert_not_called()
-
-
-def test_resolve_eval_run_target_forwards_session_bucket():
-    with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=FOCUSED) as ensure:
-        resolve_eval_run_target(MagicMock(), {**SOURCE, "eval_entry_ids": ["keep"]}, bucket_type=SESSION_BUCKET_TYPE)
-    assert ensure.call_args.kwargs["bucket_type"] == SESSION_BUCKET_TYPE
 
 
 def test_ensure_focused_eval_set_retries_when_existing_version_has_no_entries():

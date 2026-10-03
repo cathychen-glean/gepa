@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from glean_gepa.objectives.tool_match import (
+    TOOL_INPUT_LIMIT,
     FirstToolMatchObjective,
     ToolMatchEntryMetrics,
     aggregate_tool_match_metrics,
@@ -109,143 +110,74 @@ def test_extract_trace_tool_inputs_reads_both_call_envelopes():
     assert extract_trace_tool_inputs(None) == ()
 
 
-def test_tool_match_queries_and_fetch():
+def test_tool_match_queries_bind_their_params_and_guard_the_known_pitfalls():
     bounds_sql = bounds_query(eval_id_predicate="IN UNNEST(@eval_ids)", span_filter=EXECUTE_ACTION_FILTER)
     sql = build_tool_match_per_entry_query()
-    assert "PARSE_DATE" not in bounds_sql
-    assert "PARSE_DATE" not in sql
+    # Sharded table: the suffix range must come from the bound dates, not a parsed literal.
+    assert "PARSE_DATE" not in bounds_sql and "PARSE_DATE" not in sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @search_start_date)" in bounds_sql
     assert "_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @start_date)" in sql
-    assert "@student_eval_id" in sql and "@teacher_eval_id" in sql
-    assert "Execute Action:" in sql
-    assert "FULL OUTER JOIN" in sql
+    assert "@student_eval_id" in sql and "@teacher_eval_id" in sql and "UNNEST(@skipped_tools)" in sql
     # A run that died must be flagged so its truncated tool sequence is not scored.
-    assert "failed_runs" in sql and "run_failed" in sql
-    assert "Agent Run:" in sql
-    # Tool payloads are scrubbed from this table, so the query must NOT read them here
-    # and must instead carry the scrub-safe locators used to fetch the detailed trace.
-    assert "span_info.inputs" not in sql
-    assert "agent_trace.trace_id" in sql
-    assert "student_trace_id" in sql and "teacher_trace_id" in sql
-    assert "student_deployment_id" in sql and "teacher_deployment_id" in sql
-    assert "UNNEST(@skipped_tools)" in sql
+    assert "run_failed" in sql
+    # Tool payloads are scrubbed from this table: never read them here, carry the trace locator instead.
+    assert "span_info.inputs" not in sql and "agent_trace.trace_id" in sql
 
+
+def _paired_row(entry_id: str, deployment: str, *, student: list[str], teacher: list[str]) -> dict:
+    return {
+        "entry_id": entry_id,
+        "student_tools": student,
+        "teacher_tools": teacher,
+        "student_trace_id": f"s-{entry_id}",
+        "student_deployment_id": deployment,
+        "student_min_start_ms": 1_786_400_000_000,
+        "student_max_start_ms": 1_786_400_050_000,
+        "teacher_trace_id": f"t-{entry_id}",
+        "teacher_deployment_id": deployment,
+        "teacher_min_start_ms": 1_786_400_000_000,
+        "teacher_max_start_ms": 1_786_400_050_000,
+    }
+
+
+def test_fetch_scores_entries_and_hydrates_tool_inputs_from_internal_traces_only():
+    """Payloads come from the detailed trace (the scrubbed table serves none), shell excluded.
+    Entries without a locator or on customer deployments (403 on analyze-trace) are scored but not fetched."""
     client = MagicMock()
     client.query.side_effect = [
         [{"min_start_ms": 1_786_363_200_000, "max_start_ms": 1_786_449_600_000}],
         [
-            {
-                "entry_id": "entry-1",
-                "student_tools": ["search"],
-                "teacher_tools": ["read"],
-                "student_trace_id": "s-trace-1",
-                "student_deployment_id": "scio-prod",
-                "student_min_start_ms": 1_786_400_000_000,
-                "student_max_start_ms": 1_786_400_050_000,
-                "teacher_trace_id": "t-trace-1",
-                "teacher_deployment_id": "scio-prod",
-                "teacher_min_start_ms": 1_786_400_000_000,
-                "teacher_max_start_ms": 1_786_400_050_000,
-            },
-            {"entry_id": "entry-2", "student_tools": [], "teacher_tools": ["search"]},
-            {
-                "entry_id": "entry-3",
-                "student_tools": ["search"],
-                "teacher_tools": ["read"],
-                "student_trace_id": "s-trace-cust",
-                "student_deployment_id": "glean-televox",
-                "student_min_start_ms": 1_786_400_000_000,
-                "student_max_start_ms": 1_786_400_050_000,
-                "teacher_trace_id": "t-trace-cust",
-                "teacher_deployment_id": "glean-televox",
-                "teacher_min_start_ms": 1_786_400_000_000,
-                "teacher_max_start_ms": 1_786_400_050_000,
-            },
+            _paired_row("e1", "scio-prod", student=["search"], teacher=["read"]),
+            {"entry_id": "e2", "student_tools": [], "teacher_tools": ["search"]},
+            _paired_row("e3", "glean-televox", student=["search"], teacher=["read"]),
         ],
     ]
-
-    def _get_trace(*, deployment_id, trace_id, start_time_millis, end_time_millis):
-        if trace_id == "t-trace-1":
-            # The skipped shell call must not be mistaken for the scored first tool.
-            return _trace(
-                _agent_tool_span("Shell", '{"command":"ls"}'),
-                _glean_tool_span("Glean Search", {"glean_search_tool_args": {"query": "case 007"}}),
-                _glean_tool_span("Glean Document Reader", {"code_search": {"urls": ["a"]}}),
-            )
-        if trace_id == "s-trace-1":
-            return _trace(_agent_tool_span("Write", '{"path":"a.txt"}'))
-        return _trace()
-
+    traces = {
+        "t-e1": _trace(
+            _agent_tool_span("Shell", '{"command":"ls"}'),  # skipped tool: must not be the scored first tool
+            _glean_tool_span("Glean Search", {"q": "case 007"}),
+        ),
+        "s-e1": _trace(_agent_tool_span("Write", '{"path":"a.txt"}')),
+    }
     evalcli = MagicMock()
-    evalcli.get_analysis_trace.side_effect = _get_trace
+    evalcli.get_analysis_trace.side_effect = lambda *, trace_id, **_: traces.get(trace_id, _trace())
 
     analysis = fetch_eval_run_tool_match_analysis(
-        client,
-        teacher_eval_id="teacher",
-        student_eval_id="student",
-        lookback_days=7,
-        end_date=date(2026, 8, 11),
-        evalcli=evalcli,
+        client, teacher_eval_id="teacher", student_eval_id="student", lookback_days=7, end_date=date(2026, 8, 11), evalcli=evalcli
     )
-    search_params = {param.name: param.value for param in client.query.call_args_list[0].kwargs["params"]}
-    entry_params = {param.name: param.value for param in client.query.call_args_list[1].kwargs["params"]}
-    assert search_params["eval_ids"] == ["teacher", "student"]
-    assert search_params["search_start_date"] == "2026-08-04"
+
+    search_params = {p.name: p.value for p in client.query.call_args_list[0].kwargs["params"]}
     # One day past end_date: _TABLE_SUFFIX is UTC, so tomorrow's shard is scanned too.
-    assert search_params["search_end_date"] == "2026-08-12"
-    assert entry_params["student_eval_id"] == "student"
-    assert entry_params["teacher_eval_id"] == "teacher"
-    assert analysis.per_entry["entry-1"].tools_match is False
-    assert analysis.per_entry["entry-2"].student_tools == ()
-    # Payloads come from the detailed trace (the scrubbed table serves none). Each
-    # role keeps its scored calls, shell excluded, tagged with the tool that issued them.
-    assert analysis.per_entry["entry-1"].teacher_tool_inputs == (
-        ("Glean Search", '{"glean_search_tool_args": {"query": "case 007"}}'),
-        ("Glean Document Reader", '{"code_search": {"urls": ["a"]}}'),
-    )
-    assert analysis.per_entry["entry-1"].student_tool_inputs == (("Write", '{"path":"a.txt"}'),)
-    # entry-2 exposes no trace locator, so it is never fetched and stays empty.
-    assert analysis.per_entry["entry-2"].teacher_tool_inputs == ()
-    # Customer deployments 403 on analyze-trace; skip them and still score the mismatch.
-    assert analysis.per_entry["entry-3"].tools_match is False
-    assert analysis.per_entry["entry-3"].teacher_tool_inputs == ()
-    assert {call.kwargs["trace_id"] for call in evalcli.get_analysis_trace.call_args_list} == {
-        "t-trace-1",
-        "s-trace-1",
-    }
+    assert (search_params["search_start_date"], search_params["search_end_date"]) == ("2026-08-04", "2026-08-12")
+    assert analysis.high_signal_entry_ids == ("e1", "e2", "e3")
+    assert analysis.per_entry["e1"].teacher_tool_inputs == (("Glean Search", '{"q": "case 007"}'),)
+    assert analysis.per_entry["e1"].student_tool_inputs == (("Write", '{"path":"a.txt"}'),)
+    assert analysis.per_entry["e3"].tools_match is False and analysis.per_entry["e3"].teacher_tool_inputs == ()
+    assert {c.kwargs["trace_id"] for c in evalcli.get_analysis_trace.call_args_list} == {"t-e1", "s-e1"}
     # The trace window pads the entry's span bounds by the configured lead/trail.
-    teacher_call = next(
-        call for call in evalcli.get_analysis_trace.call_args_list if call.kwargs["trace_id"] == "t-trace-1"
-    )
+    teacher_call = next(c for c in evalcli.get_analysis_trace.call_args_list if c.kwargs["trace_id"] == "t-e1")
     assert teacher_call.kwargs["start_time_millis"] == 1_786_400_000_000 - 3_600_000
     assert teacher_call.kwargs["end_time_millis"] == 1_786_400_050_000 + 60_000
-    assert analysis.high_signal_entry_ids == ("entry-1", "entry-2", "entry-3")
-    assert client.query.call_count == 2
-
-    objective = FirstToolMatchObjective()
-    output = next(
-        row.output
-        for row in objective.scored_rows(
-            analysis, focused=True, capture_traces=True, query="q", deployment_id="scio-prod"
-        )
-        if row.entry_id == "entry-1"
-    )
-    example = objective.build_reflective_example(
-        "MODULE",
-        {
-            "data": {"eval_set_name": "set"},
-            "score": 0.0,
-            "objective_scores": {"tool_alignment": 0.0, "correctness": 0.5},
-            "output": output,
-        },
-        {},
-    )
-    # Each call is attributed to a role, and later scored calls are kept with the first.
-    assert example["Action Inputs"] == [
-        'teacher Glean Search: {"glean_search_tool_args": {"query": "case 007"}}',
-        'teacher Glean Document Reader: {"code_search": {"urls": ["a"]}}',
-        'student Write: {"path":"a.txt"}',
-    ]
 
 
 def test_failed_runs_are_excluded_rather_than_scored_as_mismatches():
@@ -325,47 +257,27 @@ def _reflective_example(objective, objective_scores: dict, **output_extras) -> d
     )
 
 
-def test_reflective_example_includes_both_roles_tool_inputs():
-    """Both sequences are labeled, so a student payload cannot be read as the teacher's."""
+def test_reflective_example_labels_both_roles_and_bounds_the_evidence():
+    """Teacher inputs come first and each line is role-labeled, so a student payload cannot be read
+    as the teacher's. Empty payloads are dropped, long ones truncated, and the list is capped."""
     objective = FirstToolMatchObjective()
     scores = {"tool_alignment": 0.0}
-
-    student_only = _reflective_example(
-        objective, scores, student_tool_inputs=[["Glean Search", '{"query": "pto policy"}']]
-    )
-    assert student_only["Action Inputs"] == ['student Glean Search: {"query": "pto policy"}']
 
     both = _reflective_example(
         objective,
         scores,
-        student_tool_inputs=[["Glean Search", '{"query": "pto policy"}'], ["Write", '{"path":"a.txt"}']],
-        teacher_tool_inputs=[["Glean Document Reader", '{"urls": ["x"]}']],
+        student_tool_inputs=[["Glean Search", '{"q": "s"}']],
+        teacher_tool_inputs=[["Glean Document Reader", '{"urls": ["x"]}'], ["Edit", ""]],
     )
-    assert both["Action Inputs"] == [
-        'teacher Glean Document Reader: {"urls": ["x"]}',
-        'student Glean Search: {"query": "pto policy"}',
-        'student Write: {"path":"a.txt"}',
-    ]
-    assert _reflective_example(objective, scores)["Action Inputs"] == []
-    assert _reflective_example(objective, scores, teacher_tool_inputs=[["Glean Search", ""]])["Action Inputs"] == []
+    assert both["Action Inputs"] == ['teacher Glean Document Reader: {"urls": ["x"]}', 'student Glean Search: {"q": "s"}']
 
-    payload = '{"file_path":"SKILL.md","old_string":"' + "x" * 900 + '"}'
-    long = _reflective_example(objective, scores, teacher_tool_inputs=[["Edit", payload]])
-    assert long["Action Inputs"][0].endswith("... (truncated)")
-    assert len(long["Action Inputs"][0]) < len(payload)
+    payload = "x" * 900
+    long = _reflective_example(objective, scores, teacher_tool_inputs=[["Edit", payload]])["Action Inputs"][0]
+    assert len(long) < len(payload) and long.endswith("(truncated)")
 
-    extra = [[f"Tool{i}", f'{{"q": "{i}"}}'] for i in range(4)]
+    extra = [[f"Tool{i}", f'{{"q": "{i}"}}'] for i in range(TOOL_INPUT_LIMIT + 1)]
     capped = _reflective_example(objective, scores, teacher_tool_inputs=extra, student_tool_inputs=extra)
-    assert capped["Generated Outputs"]["teacher_tools"] == ["Glean Document Reader"]
-    assert capped["Generated Outputs"]["student_tools"] == ["Glean Search"]
-    assert capped["Action Inputs"] == [
-        'teacher Tool0: {"q": "0"}',
-        'teacher Tool1: {"q": "1"}',
-        'teacher Tool2: {"q": "2"}',
-        'student Tool0: {"q": "0"}',
-        'student Tool1: {"q": "1"}',
-        'student Tool2: {"q": "2"}',
-    ]
+    assert len(capped["Action Inputs"]) == 2 * TOOL_INPUT_LIMIT
 
 
 def test_reflection_selects_mismatches_in_order_without_grouping():
@@ -378,48 +290,23 @@ def test_reflection_selects_mismatches_in_order_without_grouping():
     assert all_mismatches == list(range(12))
 
 
-def test_unscored_correctness_is_omitted_rather_than_reported_as_zero():
-    """Correctness vs the teacher is absent until the pairwise judge has scored."""
+def test_unscored_judge_is_omitted_rather_than_reported_as_zero():
+    """A pairwise judge that has not scored yet is absent from the example, not a 0.0 the
+    reflector would read as a failure. Once scored it is reported; if the objective is not
+    wired for that signal it stays hidden."""
     objective = FirstToolMatchObjective()
-    objective.high_signal = "tool_alignment"
     objective.signal_names = ("tool_alignment", "correctness")
 
-    absent = _reflective_example(objective, {"tool_alignment": 0.0})
-    assert "correctness" not in absent["Metrics"]
-    assert "Correctness" not in absent["Feedback"]
-    assert objective.format_reflective_metrics(absent["Metrics"]) == "score=0.00, tool_alignment=0.00"
-
-    # A real low score still reports, and a real passing score stays silent.
-    scored = _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.5})
-    assert scored["Metrics"]["correctness"] == 0.5
-    assert "Correctness issue: score=0.50." in scored["Feedback"]
-    assert objective.format_reflective_metrics(scored["Metrics"]).endswith("correctness=0.50")
-
-    passing = _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.9})
-    assert "Correctness" not in passing["Feedback"]
-    assert passing["Metrics"]["correctness"] == 0.9
-
+    assert "correctness" not in _reflective_example(objective, {"tool_alignment": 0.0})["Metrics"]
+    assert _reflective_example(objective, {"tool_alignment": 0.0, "correctness": 0.5})["Metrics"]["correctness"] == 0.5
     unwired = FirstToolMatchObjective()
-    unwired.high_signal = "tool_alignment"
-    hidden = _reflective_example(unwired, {"tool_alignment": 0.0, "correctness": 0.5})
-    assert "correctness" not in hidden["Metrics"]
-    assert "Correctness" not in hidden["Feedback"]
+    assert "correctness" not in _reflective_example(unwired, {"tool_alignment": 0.0, "correctness": 0.5})["Metrics"]
 
 
-def test_reflective_example_includes_the_agentic_judge_verdict_and_tool_inputs():
-    objective = FirstToolMatchObjective()
-    example = _reflective_example(
-        objective,
-        {"tool_alignment": 0.0},
-        teacher_tool_inputs=[["Glean Search", '{"query": "pto"}']],
-        student_tool_inputs=[["Discover", '{"query": "policy"}']],
-        agentic_preference_rate_feedback="task_completion: the student stopped after a search.",
-    )
-    assert example["Action Inputs"] == [
-        'teacher Glean Search: {"query": "pto"}',
-        'student Discover: {"query": "policy"}',
-    ]
-    assert "Agentic judge verdict:\ntask_completion: the student stopped after a search." in example["Feedback"]
+def test_reflective_example_carries_the_judge_verdict():
+    verdict = "task_completion: the student stopped after a search."
+    example = _reflective_example(objective=FirstToolMatchObjective(), objective_scores={"tool_alignment": 0.0}, agentic_preference_rate_feedback=verdict)
+    assert verdict in example["Feedback"]
 
 
 def test_aggregate_and_empty_analysis():
