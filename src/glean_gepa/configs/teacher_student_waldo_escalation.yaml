@@ -1,0 +1,118 @@
+# Waldo escalation experiment (teacher-student).
+#
+# Goal: tune the Waldo routing core (WALDO_ROUTING: First-Action Decision through the
+# Routing section) so the lightweight router escalates to the full agent on the same
+# requests a stronger model would, without regressing agentic-judge correctness. Sibling
+# of teacher_student_waldo.yaml, which scores first-tool match and tunes the Tool Usage
+# Guidelines instead; harness and models are identical.
+#
+# Base rate: in the 2026-10-01 reference pair (Luna teacher vs Qwen student) the teacher
+# escalated on 88.5% of both-ran entries, so an always-escalate student would have scored
+# ~0.885. If this teacher is similar, only the correctness floor below guards against
+# over-escalation; watch the logged student escalation rate.
+#
+# Run:  uv run python -m glean_gepa.runner --config teacher_student_waldo_escalation
+
+schema_version: 1
+mode: teacher_student
+
+run:
+  dir: run_ts_waldo_escalation
+  max_metric_calls: 10
+  # Post-search seed-vs-best eval on the val set, gated by objective.validation. With
+  # val pinned below it runs on scio-prod, not a sampled customer deployment.
+  customer_eval: true
+  eval_run_timeout_sec: 21600
+  # Seed is the LIVE production Waldo prompt (from a Waldo eval's
+  # llmo.per_prompt_overrides.waldo_system), split into WALDO_SYSTEM (template with
+  # {WALDO_ROUTING} and {WALDO_TOOL_USAGE} slots), WALDO_ROUTING (everything before
+  # "### Available Tools"), and WALDO_TOOL_USAGE (the "Glean Search Argument
+  # Construction" rules + search-tool conditionals). It compiles to exactly the prompt
+  # in data/waldo_seed_candidate.json. Only WALDO_ROUTING is edited: most of
+  # WALDO_TOOL_USAGE builds search arguments and does not move the escalation decision.
+  seed_candidate: data/waldo_routing_seed_candidate.json
+  editable_modules: [WALDO_ROUTING]
+
+models:
+  # `waldo[:PROVIDER:MODEL[:effort]]` turns on the Waldo router
+  # (co.lo.icpo.should_run_waldo_qe) and sets co.lo.icpo.waldo_model. Bare `waldo`
+  # is scio's default BASETEN:WALDO. The sample Waldo eval ran OPEN_AI:GPT6_LUNA:none.
+  # TODO(gap-1): confirm with the team which deployment they are tuning for.
+  student: waldo:OPEN_AI:GPT6_LUNA:none
+  teacher: waldo:OPEN_AI:GPT6_1_SOL:high
+  reflection: CUSTOM:GPT5_6_LUNA
+
+eval:
+  # EvalCLI --runner-type. Waldo evals run on the standard Glean Chat runner.
+  # Harness scParams are WALDO_HARNESS_SC_PARAMS; the runner appends the Waldo
+  # enable flag, model, and compiled waldo_system override.
+  runner_type: GLEAN_CHAT
+
+data:
+  # TODO(gap-2): replace with the Waldo team's routing / tool query set once it is
+  # registered in EvalCLI with per-entry labels (expected_route, expected_tool).
+  eval_set_name: Glean Chat V2 Medium
+  # Full Glean Chat V2 for validation: 1000 entries on scio-prod at 20260909, vs 200
+  # for the Medium set used in training.
+  val_eval_set_name: Glean Chat V2
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 1
+  # Pinned so validation is scored on scio-prod, not a sampled customer deployment.
+  # Train and val are disjoint; two train versions so a childless generation does not
+  # exhaust the schedule.
+  train_eval_versions: [20261001, 20260908]
+  val_eval_versions: [20260909]
+
+signals:
+  - name: escalation_match
+    source: escalation_match
+    lookback_days: 7
+  # judge_pairwise_agentic_correctness: pairwise, randomized_single_0_10, correctness
+  # dimension only. Per-entry 0-4 = teacher more correct, 5 = tie, 6-10 = student more
+  # correct; aggregate is the tie-split preference rate, so 0.50 = parity with the
+  # teacher. Cortex type is AGENTIC_JUDGE; the adapter keys it separately so it does
+  # not collide with the multi-dimension agentic judge.
+  - name: agentic_correctness_rate
+    source: cortex_judge
+    type: AGENTIC_CORRECTNESS_JUDGE
+    kind: pairwise
+
+objective:
+  primary: escalation_match
+  frontier_type: hybrid
+  composite:
+    escalation_match: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  # Read from agentspan: the `Waldo` span's ic_preloop.termination, and the
+  # `Agent Run: WaldoAgent` message for skips (`skipped:<reason>`), on each entry's
+  # latest trace. With skip_waldo_escalation_discovery=true a discover call ends Waldo
+  # with SAW_INSUFFICIENT_TOOLS and no Execute Action span, which is why this reads
+  # the termination rather than tool spans.
+  validation:
+    # Correctness floor: 4.8 on the judge's 0-10 pairwise scale (5 = parity with the
+    # teacher), i.e. 0.48 as the normalized tie-split rate the gate reads.
+    - metric: agentic_correctness_rate
+      min: 0.48
+
+screening:
+  # Focused (high-signal) screen: child must fix >= 25% of the parent's escalation
+  # mismatches. No judge runs on the slice; correctness is gated at validation only.
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: escalation_match
+
+reflection:
+  editable_modules: [WALDO_ROUTING]
+  # No `modules:` override: the objective's WALDO_ROUTING responsibility carries the
+  # score model and analysis guide, and a YAML entry would replace it wholesale.
+
+search:
+  offspring_count: 5
+  reflection_samples: 25
+  reflection_hamming_distance_k: null
+  # WALDO_SYSTEM remainder (~2.1k tok) + WALDO_ROUTING budget (6144) + frozen
+  # WALDO_TOOL_USAGE (~2.0k). Must exceed their sum so the per-module budget binds, not
+  # this cap.
+  global_token_cap: 10752

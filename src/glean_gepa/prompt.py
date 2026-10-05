@@ -21,9 +21,9 @@ from glean_gepa.prompt_constants import (
     WRITING_CODE_KEY,
 )
 from glean_gepa.waldo_prompt_constants import (
+    WALDO_SLOT_MODULES,
     WALDO_SYSTEM_KEY,
     WALDO_SYSTEM_OVERRIDE_PARAM,
-    WALDO_TOOL_USAGE_KEY,
     compile_waldo_system_prompt,
 )
 
@@ -90,11 +90,11 @@ def compile_encoded_prompt(candidate: dict[str, str]) -> str:
 def compile_waldo_system_override(candidate: Mapping[str, str]) -> str:
     """Encode the compiled Waldo prompt as ``llmo.per_prompt_overrides.waldo_system=<b64>``.
 
-    Empty string when the candidate edits neither ``WALDO_SYSTEM`` nor
-    ``WALDO_TOOL_USAGE``, so evals keep the stock template. Scio renders the
+    Empty string when the candidate carries no Waldo module (``WALDO_SYSTEM`` or a
+    ``WALDO_SLOT_MODULES`` key), so evals keep the stock template. Scio renders the
     ``[[...]]`` and ``<<<[[...]]>>>`` markers in the override at request time.
     """
-    if not (candidate.get(WALDO_SYSTEM_KEY) or candidate.get(WALDO_TOOL_USAGE_KEY)):
+    if not any(candidate.get(key) for key in (WALDO_SYSTEM_KEY, *WALDO_SLOT_MODULES)):
         return ""
     text = compile_waldo_system_prompt(candidate)
     encoded = urlsafe_b64encode(text.encode("utf-8")).decode("ascii")

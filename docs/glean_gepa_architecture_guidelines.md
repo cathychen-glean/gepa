@@ -15,7 +15,8 @@ GEPA engine wiring (`api.py`)
         |
         +--> TeacherStudentAdapter
         |      evaluates student vs. teacher through EvalCLI + Judge
-        |      objectives (objectives/registry.py): tool_match, citation_match, agentic_preference
+        |      objectives (objectives/registry.py): tool_match, citation_match, agentic_preference,
+        |      escalation_match
         |
         +--> SingleModelAdapter
                evaluates one student through EvalCLI + BigQuery
@@ -147,7 +148,7 @@ Sections:
 
 - `signals` -- every metric the run scores or reports. `source` is a telemetry
   source registered for the mode in `objectives/registry.py` (`tool_match`,
-  `citation_match`, `agentic_preference`; `shell_telemetry`, `loop_telemetry`),
+  `citation_match`, `agentic_preference`, `escalation_match`; `shell_telemetry`, `loop_telemetry`),
   `cortex_judge` (with `type` and `kind`), or `constant`. Names must be unique.
   A telemetry source not registered for the file's `mode` fails the load.
 - `objective` -- `primary` (parent selection; must be scorable), `composite`

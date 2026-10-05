@@ -71,9 +71,8 @@ from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 from glean_gepa.waldo_prompt_constants import (
     DEFAULT_WALDO_SYSTEM,
+    WALDO_SLOT_MODULES,
     WALDO_SYSTEM_KEY,
-    WALDO_TOOL_USAGE_KEY,
-    WALDO_TOOL_USAGE_SLOT,
 )
 
 CACHE_DIRECTORY_NAME = "cache"
@@ -187,20 +186,27 @@ def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str])
     seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
     if WRITING_CODE_KEY not in editable_modules:
         seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
-    if WALDO_TOOL_USAGE_KEY in editable_modules:
-        # Pin the Waldo template so the slot is filled at compile time; a seed may override it.
+    editable_waldo_slots = [key for key in editable_modules if key in WALDO_SLOT_MODULES]
+    if editable_waldo_slots:
+        # Pin the Waldo template so its slots are filled at compile time; a seed may override it.
         seed.setdefault(WALDO_SYSTEM_KEY, raw.get(WALDO_SYSTEM_KEY, DEFAULT_WALDO_SYSTEM))
-        if WALDO_TOOL_USAGE_SLOT not in seed[WALDO_SYSTEM_KEY]:
-            raise SystemExit(
-                f"{WALDO_TOOL_USAGE_KEY} is editable but the seed {WALDO_SYSTEM_KEY} has no "
-                f"{WALDO_TOOL_USAGE_SLOT} slot. Add the slot to {WALDO_SYSTEM_KEY} in the seed file, "
-                f"or drop {WALDO_TOOL_USAGE_KEY} from editable_modules."
-            )
-        if not conditional_counts(seed[WALDO_TOOL_USAGE_KEY]):
-            raise SystemExit(
-                f"seed {WALDO_TOOL_USAGE_KEY} has no <<<[[has_search_tools]]>>> / <<<[[no_search_tools]]>>> "
-                "conditionals. Scio needs both to pick the right branch per request."
-            )
+        template = seed[WALDO_SYSTEM_KEY]
+        for key, (slot, _default) in WALDO_SLOT_MODULES.items():
+            if slot in template:
+                # Frozen sibling modules must come from the seed too, or compile falls back to stock text.
+                seed.setdefault(key, raw.get(key, PROMPT_MODULE_DEFAULTS[key]))
+        for key in editable_waldo_slots:
+            slot = WALDO_SLOT_MODULES[key][0]
+            if slot not in template:
+                raise SystemExit(
+                    f"{key} is editable but the seed {WALDO_SYSTEM_KEY} has no {slot} slot. "
+                    f"Add the slot to {WALDO_SYSTEM_KEY} in the seed file, or drop {key} from editable_modules."
+                )
+            if not conditional_counts(seed[key]):
+                raise SystemExit(
+                    f"seed {key} has no <<<[[has_search_tools]]>>> / <<<[[no_search_tools]]>>> "
+                    "conditionals. Scio needs both to pick the right branch per request."
+                )
     if RULES_EXT_KEY in editable_modules and "{RULES_EXT}" not in seed.get(
         WRITING_CODE_KEY, seed.get(FULL_PROMPT_KEY, "")
     ):

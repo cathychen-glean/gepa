@@ -129,6 +129,12 @@ class TeacherStudentALRolloutOutput(BaseALRolloutOutput):
     student_max_start_ms: NotRequired[int]
     teacher_min_start_ms: NotRequired[int]
     teacher_max_start_ms: NotRequired[int]
+    student_waldo_termination: NotRequired[str]
+    teacher_waldo_termination: NotRequired[str]
+    student_waldo_summary: NotRequired[str]
+    teacher_waldo_summary: NotRequired[str]
+    student_first_sentence_refusal: NotRequired[bool]
+    teacher_first_sentence_refusal: NotRequired[bool]
     agentic_preference_rate: NotRequired[float]
     agentic_preference_rate_feedback: NotRequired[str]
 

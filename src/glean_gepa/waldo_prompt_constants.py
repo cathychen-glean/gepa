@@ -11,36 +11,47 @@ time, so candidates must preserve them.
 
 Production Waldo evals do not run the stock text: they pass a longer, hand-tuned prompt
 through the ``llmo.per_prompt_overrides.waldo_system`` scParam. ``data/waldo_seed_candidate.json``
-carries that live prompt split into the two modules below; seed from it, not from these
-defaults, when tuning for the Waldo team.
+carries that live prompt split into ``WALDO_SYSTEM`` and ``WALDO_TOOL_USAGE``;
+``data/waldo_routing_seed_candidate.json`` also splits out ``WALDO_ROUTING``. Seed from
+one of them, not from these defaults, when tuning for the Waldo team.
 
 Modules:
 
-- ``WALDO_SYSTEM`` is the full prompt and render template, with a ``{WALDO_TOOL_USAGE}``
-  slot that ``compile_waldo_system_prompt`` fills.
-- ``WALDO_TOOL_USAGE`` is the body under "### Tool Usage Guidelines". It carries the
-  ``<<<[[has_search_tools]]>>>`` / ``<<<[[no_search_tools]]>>>`` conditionals; a rewrite
-  must keep both, and ``reflection_prompts.drops_conditional`` rejects one that does not.
+- ``WALDO_SYSTEM`` is the full prompt and render template, with ``{WALDO_ROUTING}`` and
+  ``{WALDO_TOOL_USAGE}`` slots that ``compile_waldo_system_prompt`` fills. A template
+  without a slot keeps that text inline.
+- ``WALDO_ROUTING`` is the routing core at the top of the prompt: everything that decides
+  whether Waldo searches or calls discover, up to "### Available Tools".
+- ``WALDO_TOOL_USAGE`` is the body under "### Tool Usage Guidelines".
+
+Both slot modules carry ``<<<[[has_search_tools]]>>>`` / ``<<<[[no_search_tools]]>>>``
+conditionals; a rewrite must keep both, and ``reflection_prompts.drops_conditional``
+rejects one that does not.
 """
 
 from collections.abc import Mapping
 
 # --- Candidate keys ---
 WALDO_SYSTEM_KEY = "WALDO_SYSTEM"
+WALDO_ROUTING_KEY = "WALDO_ROUTING"
+WALDO_ROUTING_SLOT = "{WALDO_ROUTING}"
 WALDO_TOOL_USAGE_KEY = "WALDO_TOOL_USAGE"
 WALDO_TOOL_USAGE_SLOT = "{WALDO_TOOL_USAGE}"
 
 # --- Token budgets ---
-# Sized to the live prompt (6.3k full, 1.7k for the tool-usage body) with headroom,
-# not to the stock text. A budget below the seed would reject the seed itself.
+# Sized to the live prompt (6.3k full, 3.8k for the routing core, 1.7k for the tool-usage
+# body) with headroom, not to the stock text. A budget below the seed would reject the
+# seed itself.
 WALDO_SYSTEM_TOKEN_BUDGET = 8192
+WALDO_ROUTING_TOKEN_BUDGET = 6144
 WALDO_TOOL_USAGE_TOKEN_BUDGET = 2560
 
 # --- Eval wiring ---
 WALDO_SYSTEM_OVERRIDE_PARAM = "llmo.per_prompt_overrides.waldo_system"
 
 # --- Stock module text ---
-DEFAULT_WALDO_SYSTEM = """## Core Agent Behavior
+# Routing core: the template text that precedes "### Available Tools".
+DEFAULT_WALDO_ROUTING = """## Core Agent Behavior
 ### Role & Capabilities
 You are a versatile AI assistant named "Glean", capable of finding information through multi-step reasoning and strategic tool usage. You can analyze situations, plan approaches, execute actions through tools, and adapt based on results. Your goal is to answer easy information-seeking, navigation, and simple factual lookups with the attached tools. For everything else, call [[waldo_discover_tool_name]] so a more capable agent can finish the task.
 
@@ -62,7 +73,9 @@ You are a versatile AI assistant named "Glean", capable of finding information t
 <<<[[has_search_tools]]Never answer those from memory. Always call a search tool first, even if you think you already know.
 >>>
 <<<[[no_search_tools]]Never answer those from memory. No search tools are attached, so call `[[waldo_discover_tool_name]]`.
->>>
+>>>"""
+
+DEFAULT_WALDO_SYSTEM = """{WALDO_ROUTING}
 
 ### Available Tools
 You have function-calling tools attached to this request. Call them through the function-calling API. Do not write tool calls as text. When you have enough information, write the final user-facing answer. If you cannot complete the task with the available tools, call [[waldo_discover_tool_name]].
@@ -123,18 +136,25 @@ You may run 1–2 searches first only if you need a name, doc, or bit of context
 If an easy lookup requires filters supported by available tool parameters (owner, app, date, etc.), use those parameters. Call `[[waldo_discover_tool_name]]` for unsupported filters or tools.
 When you have collected enough information for an easy lookup, write the final user-facing answer."""
 
-# Conditionals that must survive every edit of WALDO_TOOL_USAGE.
+# Conditionals that must survive every edit of WALDO_ROUTING and WALDO_TOOL_USAGE.
 WALDO_TOOL_USAGE_CONDITIONALS = ("has_search_tools", "no_search_tools")
+
+# Modules spliced into WALDO_SYSTEM, with their slot and stock text.
+WALDO_SLOT_MODULES: Mapping[str, tuple[str, str]] = {
+    WALDO_ROUTING_KEY: (WALDO_ROUTING_SLOT, DEFAULT_WALDO_ROUTING),
+    WALDO_TOOL_USAGE_KEY: (WALDO_TOOL_USAGE_SLOT, DEFAULT_WALDO_TOOL_USAGE),
+}
 
 
 def compile_waldo_system_prompt(candidate: Mapping[str, str]) -> str:
-    """Fill ``{WALDO_TOOL_USAGE}`` in the Waldo template from ``candidate``.
+    """Fill the ``WALDO_SLOT_MODULES`` slots in the Waldo template from ``candidate``.
 
     Use replace, not ``str.format``: the template is full of ``[[...]]`` and braces
-    that ``format`` would choke on.
+    that ``format`` would choke on. Module text is stripped, so separators around a
+    slot belong in the template.
     """
     template = candidate.get(WALDO_SYSTEM_KEY, DEFAULT_WALDO_SYSTEM)
-    if WALDO_TOOL_USAGE_SLOT in template:
-        tool_usage = candidate.get(WALDO_TOOL_USAGE_KEY, "").strip() or DEFAULT_WALDO_TOOL_USAGE
-        template = template.replace(WALDO_TOOL_USAGE_SLOT, tool_usage)
+    for key, (slot, default) in WALDO_SLOT_MODULES.items():
+        if slot in template:
+            template = template.replace(slot, candidate.get(key, "").strip() or default)
     return template
