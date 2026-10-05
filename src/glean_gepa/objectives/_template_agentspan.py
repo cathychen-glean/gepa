@@ -14,27 +14,20 @@ Which template?
     field you would score is in an entry's ``metadata`` or a judge's ``outputs``,
     it is evalcli.
 
-Copy to ``objectives/<signal>.py`` and fill every ``TODO``. The file is
-importable and pyright-clean as-is. Nothing here is registered; add an
-``ObjectiveSpec`` to ``objectives/registry.py`` and a signal to an experiment YAML when ready.
+Copy to ``objectives/<signal>.py`` and fill every ``TODO``. Nothing here is
+registered; add an ``ObjectiveSpec`` to ``objectives/registry.py`` and a signal to
+an experiment YAML when ready.
 
 Four decisions, top to bottom:
 
-1. **One entry.** What fields does one row give you, and what is ``passed`` /
-   ``score`` for that entry? (``ExampleEntryMetrics``)
-2. **The aggregate.** What does the whole run score, and which field is 0 while
-   telemetry is still landing? (``ExampleMetrics``, ``pending_count``)
-3. **The rows.** One SQL query returning one row per entry plus the four
-   locator columns if you want tool payloads for reflection.
-   (``build_example_per_entry_query``)
-4. **The feedback.** One sentence telling the reflector what the prompt should
-   do differently for a failing entry. (inline in ``build_reflective_example``)
+1. **One entry.** What one row gives you; ``passed`` / ``score``.
+2. **The aggregate.** The run score, and which field is 0 while telemetry lands.
+3. **The rows.** One SQL query, one row per entry, plus the locator columns if
+   you want tool payloads for reflection.
+4. **The feedback.** One sentence for the reflector.
 
-Everything else (shard window, bounds query, high-signal selection, trace
-enrichment, cache, console log, reflective-example frame) is inherited or
-called from ``objectives/utils``. For a teacher/student pair, see
-``objectives/tool_match.py``: same shape, ``TeacherStudentObjective``,
-``PairedRunAnalysis``, and ``agentspan.paired_role_query`` around the CTE.
+Everything else is inherited from ``objectives/utils``. For a teacher/student
+pair, see ``objectives/tool_match.py``.
 """
 
 from __future__ import annotations

@@ -1,34 +1,20 @@
 """Template: a single-model objective whose signal comes from EvalCLI, not BigQuery.
 
-Which template?
+Use this when the eval run's analysis view already has your number (a judge score,
+a count, a yes/no per entry). See ``_template_agentspan.py`` for the SQL variant
+and the full "which template?" guide.
 
-    Does the eval run's analysis view already have your number?
-
-      yes -> _template_evalcli.py    a judge score, a count, or a yes/no the run
-                                     already recorded per entry. No SQL.
-      no  -> _template_agentspan.py  the signal is in span telemetry: which tools
-                                     ran, how many loops, errors, citations. One
-                                     SQL query.
-
-    Not sure? Call ``evalcli.get_analysis_view(eval_id)`` on a recent run. If the
-    field you would score is in an entry's ``metadata`` or a judge's ``outputs``,
-    it is evalcli.
-
-Copy to ``objectives/<signal>.py`` and fill every ``TODO``. There is no SQL,
-no shard window, and no trace hydration. The file is importable and
-pyright-clean as-is. Nothing here is registered; add an ``ObjectiveSpec`` to
-``objectives/registry.py`` and a signal to an experiment YAML when ready.
+Copy to ``objectives/<signal>.py`` and fill every ``TODO``. Nothing here is
+registered; add an ``ObjectiveSpec`` to ``objectives/registry.py`` and a signal to
+an experiment YAML when ready.
 
 Three decisions, top to bottom:
 
-1. **One entry.** What does the analysis view give you per entry, and what is
-   ``passed`` / ``score``? (``ExampleEntryMetrics``)
-2. **The aggregate.** What does the run score, and which field is 0 while the
-   eval is still running? (``ExampleMetrics``, ``pending_count``)
-3. **The feedback.** One sentence for the reflector. (inline in ``build_reflective_example``)
+1. **One entry.** What the view gives you per entry; ``passed`` / ``score``.
+2. **The aggregate.** The run score, and which field is 0 while the eval runs.
+3. **The feedback.** One sentence for the reflector.
 
-For a teacher/student pair backed by EvalCLI, see
-``objectives/agentic_preference.py``.
+For a teacher/student pair backed by EvalCLI, see ``objectives/agentic_preference.py``.
 """
 
 from __future__ import annotations

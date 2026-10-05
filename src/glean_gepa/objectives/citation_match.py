@@ -1,10 +1,4 @@
-"""Citation-match objective: does the student cite the same document set the teacher did?
-
-Layout, top to bottom: the entry and aggregate types, row parsing, the
-``citation_spans`` SQL, the paired fetch, then the objective class that maps
-the analysis onto the contract in :mod:`glean_gepa.objectives.protocol`. Shared
-plumbing (bounds query, shard window, paired FULL OUTER JOIN scaffold, trace
-enrichment, frame) comes from ``objectives/utils``."""
+"""Citation-match objective: does the student cite the same document set the teacher did?"""
 
 from __future__ import annotations
 

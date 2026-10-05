@@ -9,7 +9,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from helpers import THRESHOLDS, single_model_adapter
+from helpers import single_model_adapter
 
 from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, extract_shell_action_inputs
 from glean_gepa.batch import GleanEvaluationBatch
@@ -213,7 +213,6 @@ def test_proposals_that_drop_a_render_slot_are_rejected():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -241,7 +240,6 @@ def test_empty_module_variants_are_bounded_by_the_patches_not_the_token_budget()
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -284,7 +282,6 @@ def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     candidate = Candidate(
         model="fast",
@@ -321,7 +318,6 @@ def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     passing_entry = MagicMock(
         shell_executions=1,
@@ -373,7 +369,6 @@ def test_prepare_high_signal_batch_resolves_upload_entries_from_trace_tables():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     source_entries = [
         {
@@ -422,7 +417,6 @@ def test_high_signal_batch_retains_the_parent_eval_run_id():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     parent_eval = GleanEvaluationBatch(
         outputs=[],
@@ -456,7 +450,6 @@ def test_high_signal_evaluation_reuses_child_cached_eval_id():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     passing_entry = MagicMock(
         shell_executions=1,
@@ -509,7 +502,6 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     # Telemetry for a focused run is keyed by the requested entry ids. The failing
     # entry has 100 calls with 1 error: per-entry pass/fail must score it 0.0, not
@@ -635,7 +627,6 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         runner=first_runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with (
@@ -656,7 +647,6 @@ def test_capture_traces_reuses_persisted_minimal_error_evidence(tmp_path):
         runner=second_runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with (
@@ -718,7 +708,6 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -734,7 +723,6 @@ def test_shell_error_analysis_cache_round_trip(tmp_path):
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
     with patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis") as fetch:
@@ -766,7 +754,6 @@ def test_provisional_zero_shell_analysis_is_refetched_instead_of_cached(tmp_path
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -799,7 +786,6 @@ def test_evaluate_refuses_to_score_provisional_zero_shell_analysis():
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     batch = [
         {
@@ -856,7 +842,6 @@ def test_full_validation_skips_per_entry_query_and_evalcli_trace_hydration():
         runner=ALRunner(evalcli=evalcli),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
 
     with (
@@ -933,7 +918,6 @@ def test_persisted_zero_shell_analysis_is_refetched(tmp_path):
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -986,7 +970,6 @@ def test_legacy_shell_error_analysis_cache_is_refetched(tmp_path):
         runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
         cache_file=str(cache_file),
     )
 
@@ -1004,7 +987,6 @@ def test_launched_student_eval_is_resumed_from_in_flight_after_timeout():
         runner=runner,
         bigquery_client=MagicMock(),
         student_model="fast",
-        thresholds=THRESHOLDS,
     )
     eval_kwargs = {
         "eval_set_name": "set",
@@ -1180,7 +1162,6 @@ def test_deduplicate_reflective_examples_keeps_entries_without_errors():
 def test_single_model_adapter_all_mode_deduplicates_errors_before_prompting():
     adapter = SingleModelAdapter(
         runner=MagicMock(),
-        thresholds=THRESHOLDS,
         student_model="fast",
         bigquery_client=MagicMock(),
     )

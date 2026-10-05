@@ -1,18 +1,10 @@
 """Shell-success objective: reward a single model for shell commands that do not error.
 
-Layout, top to bottom: the error-example / entry / aggregate types, the
-shell-span SQL (two queries: per-entry rows, and a separate aggregate that
-keeps spans with no eval-entry attribution), row parsing, the fetch, the
-action-run-keyed trace enrichment, then the objective class that maps the
-analysis onto the contract in :mod:`glean_gepa.objectives.protocol`.
-
-Shell differs from the other agentspan objectives in two ways, and both are
-deliberate. The aggregate comes from its own query rather than from
-``per_entry`` because per-entry rows require entry attribution and would drop
-unattributed spans. Trace enrichment keys on ``action_run_id`` inside each
-error example rather than on ``entry_id``, so it does not use
-``utils.traces.enrich_action_inputs``. Shared plumbing (bounds query, shard
-window, high-signal selection, frame) comes from ``objectives/utils``."""
+Shell differs from the other agentspan objectives in two deliberate ways. The
+aggregate comes from its own query, not from ``per_entry``: per-entry rows need
+entry attribution and would drop unattributed spans. Trace enrichment keys on
+``action_run_id`` inside each error example rather than on ``entry_id``, so it
+does not use ``utils.traces.enrich_action_inputs``."""
 
 from __future__ import annotations
 

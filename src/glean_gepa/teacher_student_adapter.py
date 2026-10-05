@@ -21,7 +21,6 @@ from glean_gepa.al_adapter import (
     ALRunner,
     GleanAdapterBase,
     ReflectiveExample,
-    Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import (
@@ -54,10 +53,9 @@ _ANALYSIS_FIELDS = frozenset({"aggregate", "per_entry", "judge_run_id"})
 
 
 def _payloads_by_base(payload: Any) -> dict[str, Any]:
-    """Normalize cached judge payloads keyed by baseline eval id.
+    """Normalize a cached judge payload to ``{base_eval_id: payload}``.
 
-    Older caches stored a run id or analysis dict directly under the judge type.
-    Pairwise results are nested ``{base_eval_id: payload}``; pointwise uses ``""``.
+    Pointwise results use ``""``; a bare run id or dict (legacy shape) is treated as pointwise.
     """
     if isinstance(payload, str):
         return {"": payload}
@@ -163,7 +161,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self,
         runner: ALRunner,
         teacher_model: str,
-        thresholds: Thresholds,
         student_model: str,
         *,
         bigquery_client: Any | None = None,
@@ -201,7 +198,6 @@ class TeacherStudentAdapter(GleanAdapterBase):
         self._entry_query_cache: dict[tuple[str, str], dict[str, str]] = {}
         super().__init__(
             runner=runner,
-            thresholds=thresholds,
             student_model=student_model,
             evaluate_fn=self._evaluate_teacher_student,
             failure_pattern_fn=self.objective.failure_pattern,

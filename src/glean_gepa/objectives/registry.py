@@ -252,13 +252,6 @@ def describe() -> str:
     return "\n".join(lines)
 
 
-def _reset_for_tests() -> None:
-    """Clear the registry and the builtin-loaded flag. Tests only."""
-    global _BUILTINS_LOADED
-    _REGISTRY.clear()
-    _BUILTINS_LOADED = False
-
-
 __all__ = [
     "BUILTIN_OBJECTIVES",
     "VALID_MODES",

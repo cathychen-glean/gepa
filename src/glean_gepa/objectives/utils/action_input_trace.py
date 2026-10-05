@@ -1,15 +1,11 @@
 """Fetch per-entry tool-call payloads from detailed eval traces.
 
-The ``scrubbed_agentspan`` table drops ``span_info.inputs`` before logging, so the
-tool-call payload (the search string or shell command the agent issued) is *not*
-queryable from BigQuery — a query against that field always comes back empty. The
-detailed trace served by ``evalcli analyze trace`` still carries it under each
-``Execute Action`` span's ``attributes.input``, which is the same surviving source
-the Shell objective already uses.
-
-This module locates traces from scrub-safe identifiers (trace id, deployment,
-span timestamps) that survive scrubbing, fetches them for a bounded set of
-entries, and extracts each span's tool payload from whichever envelope it used.
+The ``scrubbed_agentspan`` table drops ``span_info.inputs``, so tool-call payloads
+(the search string or shell command) are not queryable from BigQuery. The detailed
+trace from ``evalcli analyze trace`` still carries them under each ``Execute Action``
+span's ``attributes.input``. This module locates traces from scrub-safe identifiers
+(trace id, deployment, span timestamps), fetches them for a bounded set of entries,
+and extracts each span's payload.
 """
 
 from __future__ import annotations

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from glean_gepa.adapter_types import PairwiseJudge
-from glean_gepa.al_adapter import ALRunner, Thresholds
+from glean_gepa.al_adapter import ALRunner
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import AGENTIC_JUDGE_TYPE
 from glean_gepa.evolutionary_proposer import _select_screened_children

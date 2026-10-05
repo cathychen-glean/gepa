@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -23,9 +22,6 @@ from glean_gepa.adapter_types import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalcli_client import (
-    CORRECTNESS_INPUT_MAPPINGS,
-    CORRECTNESS_JUDGE_TYPE,
-    CORRECTNESS_RUN_PARAMS,
     EvalCliClient,
     EvalCliError,
     classify_eval_run_status,
@@ -138,13 +134,8 @@ CODING_HARNESS_SC_PARAMS = (
 
 # Models that use the Coding Harness default (no oai_model_for_agentic_loop override).
 DEFAULT_AGENTIC_LOOP_MODELS = frozenset({"gpt", "fast"})
-# CLI aliases -> co.lo.oai_model_for_agentic_loop ChatModel enum.
-#
-# coding_agent_loop_system is only applied when the request stays on
-# coding_agent_loop and the model is allowed on the harness. QE redlists
-# CLAUDE_4_SONNET_20250514 and CLAUDE_4_5_SONNET_20250929 back to
-# o3_agentic_loop (gpt5_agentic_loop_system) even if the coding route is
-# requested. Claude 4.6+ Sonnet and Claude 5 Sonnet stay on the harness.
+# CLI aliases -> co.lo.oai_model_for_agentic_loop ChatModel enum. Older Claude Sonnet
+# enums are redlisted off the Coding Harness by QE; only 4.6+ stays on it.
 AGENTIC_LOOP_MODEL_OVERRIDES = {
     "claude_sonnet": "CLAUDE_4_6_SONNET_20260217",
     "claude_opus": "CLAUDE_5_OPUS",
@@ -153,26 +144,16 @@ AGENTIC_LOOP_MODEL_OVERRIDES = {
     # GPT-6.1 Sol. "high" is the reasoning effort, pinned below, not a separate enum.
     "gpt6_1_sol_high": "GPT6_1_SOL",
 }
-# Alias -> reasoning effort. Harness evals run as ADVANCED. Auto routing reads the
-# model-router driver effort; otherwise the advanced-mode override wins over the
-# medium default. GPT6_LUNA is already high in the deployment default; GPT6_SOL is not.
+# Alias -> reasoning effort override. GPT6_LUNA is already high by default; GPT6_SOL is not.
 AGENTIC_LOOP_REASONING_EFFORT = {
     "gpt6_1_sol_high": "high",
 }
 
 # --- Waldo ---
-# Waldo is the lightweight router that runs before the agentic loop. It is off by
-# default in eval runs; scio gates it on `co.lo.icpo.should_run_waldo_qe`
-# (ic_preloop_context.is_waldo_enabled). Its model comes from
-# `co.lo.icpo.waldo_model` as `PROVIDER:MODEL[:effort]` (waldo_agent.resolve_waldo_model),
-# defaulting to BASETEN:WALDO. The model alias `waldo` turns it on with the default
-# model; `waldo:PROVIDER:MODEL[:effort]` turns it on with that model.
-#
-# Waldo evals use their own harness preset (WALDO_HARNESS_SC_PARAMS), not the Coding
-# Harness one: a different inner-loop config (`agentic_loop_sc_params_exp`, stripped
-# prompts, a 4-tool core set) plus the icpo Waldo knobs (max_loops, timeout, service
-# tier, handoff rules). Teacher and student share that preset and differ only in
-# `waldo_model` and the prompt override.
+# Waldo is the lightweight router in front of the agentic loop. It is off in eval runs
+# unless the model alias is `waldo` (default model) or `waldo:PROVIDER:MODEL[:effort]`.
+# Waldo evals use WALDO_HARNESS_SC_PARAMS, not the Coding Harness preset; teacher and
+# student differ only in `waldo_model` and the prompt override.
 WALDO_MODEL_ALIAS = "waldo"
 WALDO_DEFAULT_MODEL = "BASETEN:WALDO"
 WALDO_ENABLE_SC_PARAM = "co.lo.icpo.should_run_waldo_qe=true"
@@ -197,7 +178,7 @@ def parse_waldo_alias(model: str) -> str | None:
 
 
 # ---------------------------
-# 1) Prompt modules + candidate
+# Prompt modules + candidate
 # ---------------------------
 
 MODULES = [
@@ -214,19 +195,17 @@ class ModuleSpec:
 
 @dataclass
 class Candidate:
-    model: str  # "gpt" | "fast" | "claude_sonnet" | "claude_opus" | "gpt6_luna" | "gpt6_sol" | "gpt6_1_sol_high"
-    prompt_modules: dict[str, str]  # Editable keys, e.g. {"WRITING_CODE": "..."}
+    model: str  # a MODEL_ALIASES key
+    prompt_modules: dict[str, str]
     module_specs: dict[str, ModuleSpec]
-    global_token_cap: int  # relative to baseline prompt for that model
-    baseline_prompt_hash: str  # used to define "relative cap"
+    global_token_cap: int
+    baseline_prompt_hash: str
 
-    # bookkeeping for GEPA loop
     parent_id: str | None = None
     candidate_id: str = field(default_factory=lambda: hashlib.md5(str(random.random()).encode()).hexdigest()[:10])
 
 
 def approx_token_len(text: str) -> int:
-    # Replace with your tokenizer (tiktoken/cl100k, etc). Keep fast for screening.
     return max(1, len(text) // 4)
 
 
@@ -254,48 +233,6 @@ def within_prompt_budget(candidate: Candidate) -> bool:
         for mid in candidate.module_specs
         if mid in candidate.prompt_modules
     )
-
-
-class TraceInfo(TypedDict):
-    """Trace information for a single evaluation run.
-
-    Fields:
-        eval_id: Evaluation run ID
-        trace_id: Trace ID for retrieving detailed trace
-        finish_time_millis: Timestamp when the run finished (in milliseconds)
-        deployment_id: Deployment ID
-        correctness_score: Correctness score for this run
-        spans: Detailed trace spans (optional, fetched separately)
-
-        # Execution details (parsed from metadata)
-        query: str
-        answer: str
-        tool_events: List[Dict[str, Any]]  # Serialized ToolEvent objects
-        num_loops: int
-        num_tool_calls: int
-        num_tool_errors: int
-        input_tokens: int
-        output_tokens: int
-        latency_ms: NotRequired[int]
-    """
-
-    eval_id: str
-    trace_id: str
-    finish_time_millis: int
-    deployment_id: str
-    correctness_score: float
-    spans: NotRequired[list[dict[str, Any]]]
-
-    # Execution details
-    query: str
-    answer: str
-    tool_events: list[dict[str, Any]]
-    num_loops: int
-    num_tool_calls: int
-    num_tool_errors: int
-    input_tokens: int
-    output_tokens: int
-    latency_ms: NotRequired[int]
 
 
 class ReflectiveExampleInputs(TypedDict):
@@ -353,16 +290,8 @@ ReflectionPromptFn = Callable[[str], str]
 ReflectiveMetricsFn = Callable[[ReflectiveExampleMetrics], str | None]
 
 
-@dataclass
-class JudgeResult:
-    correctness: float  # 0..1
-    tool_alignment: float
-    rationale: str
-    traces: dict[str, list[TraceInfo]] | None = None  # Maps entry_id -> list of trace_info dicts
-
-
 # ---------------------------
-# 3) Teacher cache + runner interfaces
+# Eval cache + runner
 # ---------------------------
 
 # (model, prompt_hash, eval_set_name, eval_set_version, run_label, deployment_signature)
@@ -376,15 +305,10 @@ def deployment_signature(deployment_ids: Sequence[str]) -> str:
 
 
 class ALRunner:
-    """
-    Triggers eval runs and manages eval run IDs for the judge.
+    """Create eval runs through evalcli and cache their ids.
 
-    Uses evalcli to create eval runs and poll until completion.
-    `start` submits a run without waiting so teacher and student can overlap;
-    `wait` polls until that run finishes. `run` is start-then-wait for callers
-    that need a completed eval before continuing.
-    All execution data (answers, tool events, tokens, etc.) is retrieved later by the Judge
-    via evalcli analyze commands.
+    `start` submits without waiting so teacher and student can overlap; `wait`
+    polls until done; `run` is start-then-wait.
     """
 
     def __init__(
@@ -405,16 +329,14 @@ class ALRunner:
         self.eval_run_grace_period_sec = eval_run_grace_period_sec
         self._cache_lock = threading.RLock()
 
-        # Track eval run IDs: cache_key -> eval_run_id
         self._eval_run_ids: dict[EvalCacheKey, str] = {}
-        # Started-but-not-yet-complete runs: eval_run_id -> cache_key
+        # Started but not yet complete: eval_run_id -> cache_key
         self._in_flight: dict[str, EvalCacheKey] = {}
-        # Judge runs: (eval_run_id, base_eval_run_id, judge_type) -> judge_run_id
+        # (eval_run_id, base_eval_run_id, judge_type) -> judge_run_id
         self._judge_run_ids: dict[tuple[str, str, str], str] = {}
         # Eval IDs created or verified in this process; disk-loaded IDs are probed.
         self._verified_eval_ids: set[str] = set()
 
-        # Load cached eval run IDs if cache file exists
         if self.cache_file:
             self._load_cache()
 
@@ -654,9 +576,7 @@ class ALRunner:
             for tier in ("economical", "balanced", "frontier"):
                 base_params.append(f"co.lo.mro.{tier}.driver_reasoning_effort={effort}")
 
-        # Add system prompt override if provided (and not the placeholder)
         if system_prompt and system_prompt != "<<TEACHER_PROD_PROMPT>>":
-            # system_prompt should already be the compiled sc parameter from compile_system_prompt
             base_params.append(system_prompt)
 
         return ",".join(base_params)
@@ -807,19 +727,9 @@ class ALRunner:
         deployment_ids: list[str],
         run_label: str = "gepa",
     ) -> str:
-        """
-        Trigger an eval run, wait for completion, and return the eval_run_id.
+        """Start an eval run, wait for it, and return its id.
 
-        Args:
-            model: "gpt", "fast", "claude_sonnet", "claude_opus", "gpt6_luna", "gpt6_sol", or "gpt6_1_sol_high"
-            system_prompt: Compiled system prompt (sc parameter string from compile_system_prompt)
-            eval_set_name: Name of the eval set
-            eval_set_version: Version of the eval set
-            deployment_ids: List of deployment IDs to use
-            run_label: Prefix for eval run id / cache key (e.g. gepa vs verify_<hash>)
-
-        Returns:
-            eval_run_id string
+        ``run_label`` prefixes the eval run id and cache key (e.g. ``gepa`` vs ``verify_<hash>``).
         """
         eval_id, wait_required = self.start(
             model,
@@ -832,348 +742,6 @@ class ALRunner:
         if wait_required:
             self.wait(eval_id)
         return eval_id
-
-
-class Judge:
-    """
-    LLM judge that compares teacher vs student using evalcli.
-
-    Flow:
-        1. Create judge run via evalcli judge create
-        2. Poll until judge run SUCCEEDED
-        3. Fetch analysis view/details/trace via evalcli analyze
-    """
-
-    def __init__(self, evalcli: EvalCliClient):
-        self.evalcli = evalcli
-        # Cache judge results: (teacher_eval_id, student_eval_id) -> JudgeResult
-        self._judge_cache: dict[tuple[str, str], JudgeResult] = {}
-
-    def judge(
-        self,
-        teacher_eval_id: str,
-        student_eval_id: str,
-        skip_trigger: bool = False,
-    ) -> JudgeResult:
-        """
-        Run LLM judge comparison between teacher and student.
-
-        Args:
-            teacher_eval_id: Teacher eval run ID
-            student_eval_id: Student eval run ID
-            skip_trigger: If True, skip triggering the judge and go straight to fetching results
-        """
-        cache_key = (teacher_eval_id, student_eval_id)
-        if cache_key in self._judge_cache:
-            print(f"Using cached judge result for {teacher_eval_id} vs {student_eval_id}")
-            return self._judge_cache[cache_key]
-
-        if not skip_trigger:
-            judge_run_id = self.evalcli.find_judge_run_id(
-                student_eval_id,
-                judge_type=CORRECTNESS_JUDGE_TYPE,
-                base_eval_run_id=teacher_eval_id,
-            )
-            if judge_run_id:
-                print(f"Reusing judge run {judge_run_id} for {teacher_eval_id} vs {student_eval_id}")
-            else:
-                print(f"Triggering judge run for {teacher_eval_id} vs {student_eval_id}...")
-                judge_run_id = self.evalcli.create_judge_run(
-                    eval_run_id=student_eval_id,
-                    judge_type=CORRECTNESS_JUDGE_TYPE,
-                    run_params=CORRECTNESS_RUN_PARAMS,
-                    base_eval_run_id=teacher_eval_id,
-                    input_mappings=CORRECTNESS_INPUT_MAPPINGS,
-                )
-            self.evalcli.wait_for_judge_run(judge_run_id, eval_run_id=student_eval_id)
-        else:
-            print(
-                f"Skipping judge trigger (already triggered), fetching results for {teacher_eval_id} vs {student_eval_id}."
-            )
-
-        judge_result = self._get_full_judge_results(student_eval_id, teacher_eval_id)
-
-        self._judge_cache[cache_key] = judge_result
-        return judge_result
-
-    def _get_full_judge_results(self, student_eval_id: str, teacher_eval_id: str) -> JudgeResult:
-        result_data = self.evalcli.get_analysis_view(student_eval_id, teacher_eval_id)
-
-        entries = result_data.get("entries", [])
-
-        deployments = []
-        entry_details = []
-        durations_map = {}
-        loop_counts_map = {}
-        input_tokens_map = {}
-        output_tokens_map = {}
-        tools_invocations_map = {}
-        for entry in entries:
-            has_error = False
-            for eval_run_entry in entry.get("evalRunEntries", []):
-                if eval_run_entry.get("errorMessage"):
-                    has_error = True
-                    break
-            if has_error:
-                continue
-            entry_id = entry.get("entryId")
-            deployment_id = entry.get("deploymentId")
-            deployments.append(deployment_id)
-            entry_details.append(
-                {"deploymentId": deployment_id, "entryId": entry_id, "evalRunIds": [student_eval_id, teacher_eval_id]}
-            )
-            for eval_run_entry in entry.get("evalRunEntries", []):
-                eval_run_id = eval_run_entry.get("evalRunId")
-                durations_map[(entry_id, eval_run_id)] = eval_run_entry.get("duration", 0)
-                loop_counts_map[(entry_id, eval_run_id)] = eval_run_entry.get("metadata", {}).get("loopCount", 0)
-                input_tokens_map[(entry_id, eval_run_id)] = eval_run_entry.get("metadata", {}).get(
-                    "uncachedInputTokens", 0
-                )
-                output_tokens_map[(entry_id, eval_run_id)] = eval_run_entry.get("metadata", {}).get("outputTokens", 0)
-                tools_invocations_map[(entry_id, eval_run_id)] = eval_run_entry.get("metadata", {}).get(
-                    "toolsInvoked", []
-                )
-
-        # Get detailed run information including traces, grouped by deployment
-        trace_map: defaultdict[str, list[TraceInfo]] = defaultdict(list)
-        details_by_deployment: dict[str, list[str]] = defaultdict(list)
-        for entry_detail in entry_details:
-            details_by_deployment[entry_detail["deploymentId"]].append(entry_detail["entryId"])
-
-        details_data: list[dict[str, Any]] = []
-        for deployment_id, entry_ids in details_by_deployment.items():
-            details_data.extend(
-                self.evalcli.get_analysis_details(
-                    entry_ids=entry_ids,
-                    eval_run_ids=[student_eval_id, teacher_eval_id],
-                    deployment_id=deployment_id,
-                )
-            )
-
-        # Extract trace information for each (entryId, evalId) pair
-        for item in details_data:
-            if item.get("error"):
-                print(f"Error in details data: {item.get('error')}")
-                continue
-            entry_id = item.get("evalSetEntry", {}).get("id")
-            deployment_id = item.get("evalSetEntry", {}).get("deploymentId")
-            run_responses = _normalize_run_responses(item.get("runResponses"))
-            trace_infos: list[TraceInfo] = []
-
-            correctness_scores = {}
-            for judge_entry in item.get("judgeRunEntries") or []:
-                if judge_entry.get("errorMessage"):
-                    print(f"Error in judge entry: {judge_entry.get('errorMessage')}")
-                    continue
-                outputs = judge_entry.get("outputs", [])
-                eval_id = judge_entry.get("evalRunId")
-                if outputs is None:
-                    continue
-                for output in outputs:
-                    if output.get("name") == "CORRECTNESS":
-                        correctness_scores[(entry_id, eval_id)] = output.get("score", 0)
-            for run_response in run_responses:
-                if not run_response.get("output"):
-                    print(f"Error in run response: {run_response.get('errorMessage')}")
-                    continue
-                eval_id = run_response.get("runId")
-                trace_id = run_response.get("outputTrace", {}).get("id", "")
-                metadata = run_response.get("metadata", {})
-                finish_time_ms = metadata.get("finishTimeMillis", "")
-                answer = run_response.get("output").get("chatResponseInfo", {}).get("actResponse", "")
-                query = item.get("evalSetEntry", {}).get("input", {}).get("query")
-                print(f"Got query: {query}")
-
-                if entry_id and eval_id and trace_id and finish_time_ms:
-                    trace_info: TraceInfo = {
-                        "eval_id": eval_id,
-                        "trace_id": trace_id,
-                        "finish_time_millis": finish_time_ms,
-                        "deployment_id": deployment_id,
-                        # Execution details
-                        "query": query,
-                        "answer": answer,
-                        "tool_events": tools_invocations_map.get((entry_id, eval_id), []),
-                        "num_loops": loop_counts_map.get((entry_id, eval_id), 0),
-                        "num_tool_calls": len(tools_invocations_map.get((entry_id, eval_id), [])),
-                        "num_tool_errors": 0,  # Not provided in metadata
-                        "input_tokens": input_tokens_map.get((entry_id, eval_id), 0),
-                        "output_tokens": output_tokens_map.get((entry_id, eval_id), 0),
-                    }
-                    duration = durations_map.get((entry_id, eval_id), 0)
-                    if duration > 0:
-                        trace_info["latency_ms"] = duration
-                    if eval_id == student_eval_id and correctness_scores.get((entry_id, eval_id)) is not None:
-                        trace_info["correctness_score"] = correctness_scores.get((entry_id, eval_id))
-                        trace_infos.append(trace_info)
-                    elif eval_id == teacher_eval_id:
-                        trace_infos.append(trace_info)
-
-            trace_map[entry_id] = trace_infos
-
-        # Fetch detailed trace for each trace ID
-        for _entry_id, trace_infos in trace_map.items():
-            for trace_info in trace_infos:
-                eval_id = trace_info.get("eval_id")
-                trace_id = trace_info.get("trace_id")
-                finish_time_ms = trace_info.get("finish_time_millis")
-                deployment_id = trace_info.get("deployment_id")
-
-                if trace_id and finish_time_ms and deployment_id:
-                    start_time_ms = finish_time_ms - 3600000
-                    end_time_ms = finish_time_ms
-
-                    detailed_trace = self.evalcli.get_analysis_trace(
-                        deployment_id=deployment_id,
-                        trace_id=trace_id,
-                        start_time_millis=start_time_ms,
-                        end_time_millis=end_time_ms,
-                    )
-
-                    trace_info["spans"] = detailed_trace.get("trace", {}).get("spans")
-
-        # Average correctness across all entries
-        correctness_score_list = []
-        for _entry_id, trace_infos in trace_map.items():
-            for trace_info in trace_infos:
-                if trace_info.get("eval_id") == student_eval_id:
-                    curr_score = 0
-                    if trace_info.get("correctness_score"):
-                        curr_score = trace_info.get("correctness_score")
-                    else:
-                        print(f"Get a none correctness score for trace {trace_info.get('eval_id')}")
-                    correctness_score_list.append(curr_score)
-        correctness = sum(correctness_score_list) / len(correctness_score_list) if correctness_score_list else 0.0
-        tool_alignment = get_tool_alignment(trace_map, student_eval_id, teacher_eval_id)
-
-        rationale = f"Correctness: {correctness:.2f} (avg of {len(correctness_score_list)} entries)"
-
-        return JudgeResult(
-            correctness=correctness,
-            tool_alignment=tool_alignment,
-            rationale=rationale,
-            traces=dict(trace_map),
-        )
-
-
-def _normalize_run_responses(run_responses: Any) -> list[dict[str, Any]]:
-    if isinstance(run_responses, dict):
-        return [response for response in run_responses.values() if isinstance(response, dict)]
-    if isinstance(run_responses, list):
-        return [response for response in run_responses if isinstance(response, dict)]
-    return []
-
-
-def get_tool_alignment(trace_map: dict[str, list[TraceInfo]], student_eval_id: str, teacher_eval_id: str) -> float:
-    tool_alignment_scores = []
-    for _entry_id, trace_infos in trace_map.items():
-        student_run = None
-        teacher_run = None
-        for trace_info in trace_infos:
-            eval_id = trace_info.get("eval_id")
-            if eval_id == student_eval_id:
-                student_run = trace_info["spans"]
-            elif eval_id == teacher_eval_id:
-                teacher_run = trace_info["spans"]
-        if not student_run or not teacher_run:
-            return 0
-        tool_alignment_scores.append(get_tool_alignment_from_traces(student_run, teacher_run))
-    return sum(tool_alignment_scores) / len(tool_alignment_scores) if tool_alignment_scores else 0.0
-
-
-# TODO(Cathy) Get cleaner traces than what the api current returns
-def get_tool_alignment_from_traces(
-    student_trace_spans: list[dict[str, Any]], teacher_trace_spans: list[dict[str, Any]]
-) -> float:
-    student_tool_usages = []
-    teacher_tool_usages = []
-    for span in student_trace_spans:
-        if "Execute Action" in span["name"]:
-            tool_usage = parse_tool_usage(span)
-            if not tool_usage:
-                continue
-            student_tool_usages.append(tool_usage)
-    for span in teacher_trace_spans:
-        if "Execute Action" in span["name"]:
-            tool_usage = parse_tool_usage(span)
-            if not tool_usage:
-                continue
-            teacher_tool_usages.append(tool_usage)
-    # print(f"Student tool usages: {student_tool_usages}")
-    # print(f"Teacher tool usages: {teacher_tool_usages}")
-    final_tool_alignment_score = 0
-    for i in range(len(student_tool_usages)):
-        if i >= len(teacher_tool_usages):
-            final_tool_alignment_score -= 0.1 * (len(student_tool_usages) - len(teacher_tool_usages))
-            break
-        if student_tool_usages[i][0] == teacher_tool_usages[i][0]:
-            final_tool_alignment_score += 0.2
-        else:
-            final_tool_alignment_score -= 0.1
-    return final_tool_alignment_score
-
-
-def process_raw_typed_value(raw: str | dict):
-    # Parse the outer Python-literal string
-    if isinstance(raw, dict):
-        outer = raw
-    else:
-        outer = ast.literal_eval(raw)
-
-    # Handle non-string typed values
-    if outer.get("intValue") is not None:
-        return outer["intValue"]
-    if outer.get("boolValue") is not None:
-        return outer["boolValue"]
-
-    str_value = outer.get("strValue")
-    if str_value is None:
-        print("No strValue")
-        return None
-
-    # Try parsing strValue directly as JSON
-    parsed = json.loads(str_value)
-
-    # If parsed["input"] is itself a JSON string, parse it too
-    if isinstance(parsed, dict) and isinstance(parsed.get("input"), str):
-        try:
-            parsed_input = json.loads(parsed["input"])
-            return parsed_input
-        except (TypeError, ValueError, json.JSONDecodeError):
-            print(f"Could not parse input: {parsed['input']}")
-            return parsed
-
-    return parsed
-
-
-def extract_tool_names_from_spans(spans: list[dict[str, Any]] | None) -> list[str]:
-    """Extract tool names from trace spans."""
-    if not spans:
-        return []
-    names = []
-    for span in spans:
-        if "Execute Action" in span.get("name", ""):
-            parts = span["name"].split(": ")
-            if len(parts) >= 2 and parts[1] != "Personal Knowledge Vault Retrieve":
-                names.append(parts[1])
-    return names
-
-
-def parse_tool_usage(span: dict) -> tuple[str, dict] | None:
-    parts = span["name"].split(": ")
-    if len(parts) < 2:
-        print(f"Invalid span name: {span['name']}")
-        return None
-    tool_name = span["name"].split(": ")[1]
-    tool_inputs = span["attributes"]["input"]
-    if tool_name == "Personal Knowledge Vault Retrieve":
-        return None
-    try:
-        tool_inputs = process_raw_typed_value(tool_inputs)
-        del tool_inputs["id"]
-        return (tool_name, tool_inputs)
-    except (KeyError, TypeError, ValueError, SyntaxError, json.JSONDecodeError):
-        return None
 
 
 def _typed_str_value(value: Any) -> str | None:
@@ -1210,15 +778,8 @@ def extract_shell_action_inputs(detailed_trace: dict[str, Any]) -> dict[str, str
 
 
 # ---------------------------
-# 4) Shared adapter internals
+# Shared adapter internals
 # ---------------------------
-
-
-@dataclass
-class Thresholds:
-    quality_min: float
-    tools_min: float
-    max_student_tokens: int
 
 
 class GleanAdapterBase:
@@ -1234,7 +795,6 @@ class GleanAdapterBase:
     def __init__(
         self,
         runner: ALRunner,
-        thresholds: Thresholds,
         student_model: str,
         *,
         evaluate_fn: EvaluateFn,
@@ -1252,7 +812,6 @@ class GleanAdapterBase:
         cache_file: str | None = None,
     ):
         self.runner = runner
-        self.thresholds = thresholds
         self.student_model = student_model
         self.primary_objective = primary_objective
         self.screening_weights = {}
@@ -1271,19 +830,6 @@ class GleanAdapterBase:
         self._reflective_metrics_fn = reflective_metrics_fn
         self._failure_label = failure_label
 
-        # module freezing memory: module -> count of "not relevant" in consecutive generations
-        self._module_irrelevant_streak: dict[tuple[str, str], int] = defaultdict(
-            int
-        )  # (candidate_family, module) -> streak
-
-        # good options pool per module (to avoid losing good parts)
-        # TODO(Cathy) populate the good_module_options
-        self.good_module_options: dict[str, list[str]] = defaultdict(list)
-
-        # Judge triggered cache: (teacher_eval_id, student_eval_id) -> triggered
-        self._judge_triggered: set[tuple[str, str]] = set()
-
-        # Load cache if file exists
         if self.cache_file:
             self._load_cache()
 
@@ -1334,16 +880,10 @@ class GleanAdapterBase:
                     return
                 with open(self.cache_file) as f:
                     data = json.load(f)
-
-                judge_triggered_data = data.get("judge_triggered", [])
-                self._judge_triggered = {tuple(item) for item in judge_triggered_data}
                 self._load_extra_cache(data)
-                print(
-                    f"[GleanAdapter] Loaded {len(self._judge_triggered)} judge triggers from cache: {self.cache_file}"
-                )
+                print(f"[GleanAdapter] Loaded cache: {self.cache_file}")
         except Exception as e:
             print(f"[GleanAdapter] Failed to load cache from {self.cache_file}: {e}")
-            self._judge_triggered = set()
             self._load_extra_cache({})
 
     def _save_cache(self) -> None:
@@ -1353,12 +893,9 @@ class GleanAdapterBase:
 
         try:
             with self._cache_lock:
-                data = {
-                    "judge_triggered": [list(pair) for pair in self._judge_triggered],
-                }
-                data.update(self._extra_cache_payload())
+                data = self._extra_cache_payload()
                 _write_json_atomically(self.cache_file, data)
-                print(f"[GleanAdapter] Saved {len(self._judge_triggered)} judge triggers to cache: {self.cache_file}")
+                print(f"[GleanAdapter] Saved cache: {self.cache_file}")
         except Exception as e:
             print(f"[GleanAdapter] Failed to save cache to {self.cache_file}: {e}")
 
@@ -1522,7 +1059,7 @@ class GleanAdapterBase:
         )
 
     # ---------------------------
-    # 5) High-signal reflective dataset selection (per module)
+    # Reflective dataset selection (per module)
     # ---------------------------
 
     def make_reflective_dataset(
@@ -1530,51 +1067,34 @@ class GleanAdapterBase:
         candidate: dict[str, str],
         eval_batch: EvaluationBatch[ALTrajectory, ALRolloutOutput],
         components_to_update: list[str],
-        k: int | None,  # max return; None includes all examples
+        k: int | None,
         error_hamming_distance_k: int | None = None,
     ) -> dict[str, list[ReflectiveExample]]:
-        """
-        Build reflective dataset from evaluation results, selecting examples with lowest scores.
-
-        Args:
-            candidate: Current candidate prompt modules
-            eval_batch: Results from evaluate() with trajectories
-            components_to_update: List of component names to generate datasets for
-
-        Returns:
-            Dict mapping component_name -> list of reflective examples
-        """
+        """Pick up to ``k`` (``None`` = all) worst-scoring, pattern-diverse examples per module."""
         if not eval_batch.trajectories:
             return {comp: [] for comp in components_to_update}
 
         result: dict[str, list[ReflectiveExample]] = {}
 
         for component_name in components_to_update:
-            # Compute module-specific relevance scores for each example
             scored_trajectories = []
 
             for idx, trajectory in enumerate(eval_batch.trajectories):
                 relevance = self._compute_module_relevance(component_name, trajectory, eval_batch.scores[idx])
                 scored_trajectories.append((relevance, idx, trajectory))
 
-            # Sort by relevance (higher = more relevant for improvement)
-            # Then by score (lower = worse performance, needs more attention)
             scored_trajectories.sort(key=lambda x: (-x[0], x[2]["score"]))
 
-            # Select diverse examples with poor performance
             reflective_examples = []
             seen_patterns = set()
 
             for _relevance, _idx, trajectory in scored_trajectories:
-                # Create a pattern signature for diversity
                 pattern = self._failure_pattern_fn(component_name, trajectory)
 
-                # Allow some duplicates near the end to fill quota
-                # TODO(Cathy) check with claude why it was < k-2
+                # Repeated patterns are allowed only in the last few slots, to fill the quota.
                 if k is not None and pattern in seen_patterns and len(reflective_examples) > k - 3:
                     continue
 
-                # Build reflective example in standard format
                 example = self._reflective_example_fn(component_name, trajectory, candidate)
 
                 reflective_examples.append(example)
@@ -1623,18 +1143,17 @@ class GleanAdapterBase:
         )
         return result
 
-    # TODO(Cathy): Implement this
     def _compute_module_relevance(self, module_name: str, trajectory: ALTrajectory, score: float) -> float:
-        """Compute how relevant this example is for improving the given module."""
+        """Relevance of this example to ``module_name``. Constant today; subclasses may rank."""
         return 1.0
 
     # ---------------------------
-    # 7) propose_new_texts: merge + patch deltas
+    # propose_new_texts: diagnose, then consolidate patches
     # ---------------------------
 
     def propose_new_texts(
         self,
-        reflection_llm: Callable[[str], str],  # plug your LLM call
+        reflection_llm: Callable[[str], str],
         candidate: Candidate,
         components_to_update: list[str],
         reflective_examples: list[ReflectiveExample],

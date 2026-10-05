@@ -3,8 +3,7 @@
 Which entries of an eval set are high-signal, and how each entry's UUID maps to
 the eval runs that exercised it. Used by ``single_model_adapter`` to build a
 focused replay set and by ``focused_evalset`` to track entries across
-versions. Not tied to any one objective; it lived in ``shell_tool_error_util``
-only because shell was the first single-model objective.
+versions. Not tied to any one objective.
 """
 
 from __future__ import annotations

@@ -29,10 +29,7 @@ AGENT_RUN_FAILURE_FILTER = (
 )
 # Cortex entry UUID, falling back to the numeric entry id on older spans.
 EVAL_ENTRY_ID_EXPR = "COALESCE(jsonPayload.context.eval.entry_uuid, CAST(jsonPayload.context.eval.entry_id AS STRING))"
-# Note: the scrubber strips ``span_info.inputs`` from this table, so tool-call
-# payloads are not queryable here. Objectives instead carry the scrub-safe
-# ``trace_id``/``project_id``/timestamps out of BigQuery and resolve the payloads
-# from the detailed trace (see ``action_input_trace``).
+# ``span_info.inputs`` is scrubbed from this table; see ``action_input_trace`` for payloads.
 
 
 def action_input_tuple(values: Sequence[Any] | None, *, limit: int | None = None) -> tuple[str, ...]:

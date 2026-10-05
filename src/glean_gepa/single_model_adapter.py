@@ -13,7 +13,6 @@ from glean_gepa.adapter_types import (
 from glean_gepa.al_adapter import (
     ALRunner,
     GleanAdapterBase,
-    Thresholds,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
@@ -109,7 +108,6 @@ class SingleModelAdapter(GleanAdapterBase):
     def __init__(
         self,
         runner: ALRunner,
-        thresholds: Thresholds,
         student_model: str,
         *,
         bigquery_client: Any | None = None,
@@ -133,7 +131,6 @@ class SingleModelAdapter(GleanAdapterBase):
         self.telemetry_dimensions = self.objective.telemetry_dimensions
         super().__init__(
             runner=runner,
-            thresholds=thresholds,
             student_model=student_model,
             evaluate_fn=self._evaluate_single_model,
             failure_pattern_fn=self.objective.failure_pattern,

@@ -8,7 +8,6 @@ from base64 import urlsafe_b64encode
 from collections.abc import Mapping, Sequence
 
 from glean_gepa.prompt_constants import (
-    CORE_TOOL_DESCRIPTIONS,
     CORE_TOOL_KEYS,
     CORE_TOOLS,
     DEFAULT_EXECUTION_DISCIPLINE,
@@ -125,14 +124,6 @@ def tool_description_override_key(span_name: str) -> str:
 def is_core_tool_span(span_name: str) -> bool:
     """True when an Execute Action span maps to an editable core-tool description."""
     return bool(span_name) and tool_description_override_key(span_name) in CORE_TOOL_KEYS
-
-
-def with_core_tool_defaults(prompt_modules: Mapping[str, str]) -> dict[str, str]:
-    """Copy ``prompt_modules`` and fill any missing core-tool descriptions from stock text."""
-    merged = dict(prompt_modules)
-    for key, text in CORE_TOOL_DESCRIPTIONS.items():
-        merged.setdefault(key, text)
-    return merged
 
 
 def compile_tool_description_overrides(candidate: Mapping[str, str]) -> str:

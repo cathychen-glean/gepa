@@ -3,7 +3,7 @@
 from __future__ import annotations
 from base64 import urlsafe_b64decode
 from urllib.parse import unquote_plus
-from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, approx_token_len, total_prompt_tokens
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, approx_token_len, total_prompt_tokens
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evolutionary_proposer import (
@@ -47,7 +47,7 @@ from glean_gepa.reflection_prompts import (
 )
 from base64 import urlsafe_b64decode
 from urllib.parse import unquote_plus
-from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds, approx_token_len, total_prompt_tokens
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, approx_token_len, total_prompt_tokens
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evolutionary_proposer import (

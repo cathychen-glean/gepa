@@ -6,22 +6,8 @@ fetch and score an eval, but both adapters wire the same set of members into
 once, so a new objective author can read one file to learn what to implement,
 and the registry can reject an incomplete class before a run starts.
 
-Layout:
-
-- :class:`ObjectiveAnalysis` — the shape of whatever ``analyze()`` returns.
-- :class:`ObjectiveProtocol` — members both modes share; checked at registration.
-- :class:`CacheableObjective` — optional persistence hooks (single-model today).
-- :func:`check_objective_contract` — lists the members a class is missing.
-
-``scored_rows`` is implemented once per mode in :mod:`glean_gepa.objectives.base`;
-objectives supply ``entry_row(entry_id, metrics, analysis, ctx)`` and
-``aggregate_row(analysis, ctx)`` and the base decides which to call. Other
-mode-specific members (pending telemetry handling, paired-cache helpers) also
-stay on the two ABCs.
-``analyze`` differs only in positional eval ids: one for single-model, two
-(teacher, student) for teacher/student. Both take ``request: AnalysisRequest``
-as the sole keyword; objectives read fetch options from it and are never
-mutated between calls.
+Mode-specific members (``scored_rows``, ``analyze`` arity, pending-telemetry and
+cache hooks) stay on the two ABCs in :mod:`glean_gepa.objectives.base`.
 """
 
 from __future__ import annotations

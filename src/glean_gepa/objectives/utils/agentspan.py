@@ -23,7 +23,6 @@ from typing import Any
 from glean_gepa.objectives.utils.agentspan_query import (
     DEFAULT_AGENTS_SPAN_TABLE,
     DEFAULT_LOOKBACK_DAYS,
-    EVAL_ENTRY_ID_EXPR,
     QueryParameter,
     run_windowed_per_entry_query,
     wildcard_shard_filter,
@@ -117,11 +116,6 @@ FULL OUTER JOIN teacher
   ON student.entry_id = teacher.entry_id
 ORDER BY entry_id
 """.strip()
-
-
-def entry_id_select() -> str:
-    """The ``entry_id`` projection every span CTE starts with."""
-    return f"{EVAL_ENTRY_ID_EXPR} AS entry_id"
 
 
 # ---------------------------------------------------------------------------

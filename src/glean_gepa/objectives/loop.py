@@ -2,13 +2,8 @@
 
 Score per entry is ``1 / (1 + loop_count)``. Zero loops scores 1.0, and every
 additional loop strictly lowers the score. There is no target cap. The
-run-level score is the mean over entries.
-
-Layout, top to bottom: the entry and aggregate types, row parsing, the
-``eval_spans`` SQL, the fetch (with the EvalCLI overlay that prefers the eval's
-own ``loopCount``), then the objective class that maps the analysis onto the
-contract in :mod:`glean_gepa.objectives.protocol`. Shared plumbing (bounds
-query, shard window, trace enrichment, frame) comes from ``objectives/utils``.
+run-level score is the mean over entries. The eval's own ``metadata.loopCount``
+from EvalCLI is preferred over the span count when available.
 """
 
 from __future__ import annotations
@@ -465,8 +460,7 @@ class LoopEfficiencyObjective(SingleModelObjective[EvalRunLoopCountAnalysis]):
                     continue
                 key = str(eval_id)
                 self._eval_analysis_cache[key] = self._rebuild(str(raw.get("eval_id") or eval_id), raw, per_entry)
-                # Absent flag (pre-fix payload) is treated as unhydrated so the next
-                # trace fetch refreshes rather than trusting an unknown state.
+                # A missing flag counts as unhydrated so the next trace fetch refreshes it.
                 if not raw.get("action_inputs_hydrated", False):
                     self._unhydrated_eval_ids.add(key)
             except (KeyError, TypeError, ValueError):

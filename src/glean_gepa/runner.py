@@ -20,7 +20,6 @@ from glean_gepa.adapter_types import ALDataInst, JudgingMode
 from glean_gepa.al_adapter import (
     ALRunner,
     ModuleSpec,
-    Thresholds,
 )
 from glean_gepa.api import optimize
 from glean_gepa.bigquery_client import BigQueryClient
@@ -559,8 +558,8 @@ def _resolve_eval_version_split(
     customer_deployments: list[str],
 ) -> tuple[list[str], list[str]]:
     eval_set_name, deployment_ids = evalset_identity(args.experiment)
-    # TEMP: pinned val versions are scored on data.deployment_ids. This skips the
-    # customer publication check. Delete this branch to restore customer validation.
+    # Pinned val versions run on data.deployment_ids and skip the customer
+    # publication check; omitting --val_eval_versions selects customer validation.
     if args.val_eval_versions:
         val_versions = _parse_eval_versions(args.val_eval_versions, argument_name="--val_eval_versions")
         if args.train_eval_versions:
@@ -833,17 +832,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--student_model", default="gpt", help=model_help)
     parser.add_argument("--teacher_model", default="gpt", help=model_help)
-    # glean-dev runs on LKS_CUSTOMER_KEY with a LiteLLM custom provider (customV2) since
-    # 2026-09-30; OPEN_AI:* models are not enabled there. CUSTOM:GPT5_6_LUNA is aliased to
-    # gpt-5.1 on that proxy and is the enabled-in-agents model that resolves. Pass
-    # --reflection_lm_model OPEN_AI:GPT5_LATEST when pointing at a Glean-key instance.
+    # glean-dev only enables CUSTOM:* models; use OPEN_AI:GPT5_LATEST on a Glean-key instance.
     parser.add_argument("--reflection_lm_model", default="CUSTOM:GPT5_6_LUNA")
-    # Reflection calls the instance's /qe/llm endpoint with a perf-eval secret derived from
-    # qe_project. scio-prod's Cloud Armor policy denies every non-public /qe/ path, including
-    # /qe/llm, for clients outside the IP green list, so a laptop gets an HTML 403 before QE
-    # runs. glean-dev still serves that path; its GCP project is dev-sandbox-334901, and the
-    # secret is the hash of that project id, not the instance name. Evals stay on scio-prod
-    # via data.deployment_ids; these flags are only the reflection client.
+    # Reflection client only; evals stay on data.deployment_ids. scio-prod blocks /qe/llm
+    # off-VPN, so point this at glean-dev. The secret derives from the GCP project id.
     parser.add_argument("--qe_project", default="dev-sandbox-334901")
     parser.add_argument("--qe_instance", default="glean-dev")
     parser.add_argument("--qe_authenticated_email", default="cathy.chen@glean.com")
@@ -1125,8 +1117,8 @@ def _run_from_args(args: argparse.Namespace) -> None:
     train_versions, val_versions = _resolve_eval_version_split(args, evalcli, customer_deployments)
     eval_set_name, deployment_ids = evalset_identity(experiment)
     trainset = _make_evalset(train_versions, eval_set_name=eval_set_name, deployment_ids=deployment_ids)
-    # TEMP: a pinned val set uses data.deployment_ids. The val eval set defaults to
-    # the training set and can be overridden with data.val_eval_set_name.
+    # Pinned val versions run on data.deployment_ids against the training eval set
+    # (or data.val_eval_set_name); otherwise validation is the customer eval set.
     if args.val_eval_versions:
         val_set_name = _val_eval_set_name(args, eval_set_name)
         val_deployment_ids = deployment_ids
@@ -1154,7 +1146,6 @@ def _run_from_args(args: argparse.Namespace) -> None:
     )
     adapter_kwargs = {
         "runner": al_runner,
-        "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
         "student_model": args.student_model,
         "cache_file": str(cache_file) if cache_file else None,
         "bigquery_client": bigquery_client,

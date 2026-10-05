@@ -7,7 +7,7 @@ import pytest
 from gepa.core.engine import GEPAEngine
 from gepa.core.state import ValsetEvaluation
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
-from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, Thresholds
+from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
@@ -734,7 +734,6 @@ def test_pick_modules_to_edit_offers_every_listed_core_tool():
         "runner": runner,
         "teacher_model": "gpt",
         "student_model": "fast",
-        "thresholds": Thresholds(quality_min=0.7, tools_min=0.7, max_student_tokens=100000),
     }
     eval_batch = GleanEvaluationBatch(
         outputs=[],
