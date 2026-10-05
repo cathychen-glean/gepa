@@ -6,13 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from glean_gepa.objectives import registry
 from glean_gepa.objectives.escalation_match import (
     ABSENT,
     ANSWERED,
     ESCALATED,
     INCOMPLETE,
     OTHER,
+    WALDO_ROUTING_FRAME,
     EscalationMatchObjective,
     aggregate_escalation_match_metrics,
     build_escalation_match_per_entry_query,
@@ -60,12 +60,12 @@ def _entries(*rows: dict[str, Any]):
     return [m for m in parsed if m is not None]
 
 
-def test_classification_follows_the_handoff_rules():
+def test_classification_follows_the_escalation_rules():
     assert classify_waldo_decision(RAN, "SAW_INSUFFICIENT_TOOLS").outcome == ESCALATED
     assert classify_waldo_decision(RAN, "SAW_READY").outcome == ANSWERED
-    # Fallback terminations hand off to the inner loop but are not escalation decisions.
+    # Fallback terminations are not escalation decisions.
     no_sample = classify_waldo_decision(RAN, "NO_SAMPLE")
-    assert no_sample.outcome == OTHER and no_sample.handed_off and not no_sample.escalated
+    assert no_sample.outcome == OTHER and not no_sample.escalated
     # A WaldoAgent skip wins over a termination left on the same trace by an earlier turn.
     skipped = classify_waldo_decision("skipped:user_turn_limit", "SAW_READY")
     assert skipped.outcome == "skip:user_turn_limit" and skipped.skip_reason == "user_turn_limit"
@@ -74,7 +74,7 @@ def test_classification_follows_the_handoff_rules():
     assert classify_waldo_decision(None, None, present=False).outcome == ABSENT
 
 
-def test_aggregate_reports_strict_and_effective_confusion_over_both_ran_entries():
+def test_aggregate_reports_strict_confusion_over_both_ran_entries():
     entries = _entries(
         _row("both", (RAN, "SAW_INSUFFICIENT_TOOLS"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
         _row("teacher-only", (RAN, "SAW_INSUFFICIENT_TOOLS"), (RAN, "SAW_READY")),
@@ -90,10 +90,6 @@ def test_aggregate_reports_strict_and_effective_confusion_over_both_ran_entries(
     assert strict.student_rate == pytest.approx(2 / 5)
     assert metrics.escalation_match == pytest.approx(2 / 5)
     assert strict.overlap == pytest.approx(1 / 4)
-    # Effective handoff counts the student's loop exhaustion as a hand-off.
-    effective = metrics.effective
-    assert (effective.both, effective.teacher_only, effective.student_only, effective.neither) == (2, 1, 1, 1)
-    assert metrics.handoff_match == pytest.approx(3 / 5)
     assert aggregate_escalation_match_metrics({}).escalation_match == 0.0
 
 
@@ -172,11 +168,9 @@ def test_fetch_scores_only_entries_where_waldo_ran_in_both_runs(capsys):
     assert "WARNING: 1 common entries skipped Waldo in one run only" in out
     assert "teacher=50.0% student=0.0%" in out
 
-
-def test_zero_compared_entries_is_rejected_with_the_skip_breakdown():
-    analysis = _fetch(_client(_row("e1", ("skipped:file_upload", None), ("skipped:file_upload", None))))
+    skipped = _fetch(_client(_row("e1", ("skipped:file_upload", None), ("skipped:file_upload", None))))
     with pytest.raises(NoComparedEntriesError, match="file_upload"):
-        EscalationMatchObjective().require_compared_entries(analysis)
+        EscalationMatchObjective().require_compared_entries(skipped)
 
 
 def test_rows_emit_only_the_strict_score_and_focused_rate_divides_by_request():
@@ -193,7 +187,6 @@ def test_rows_emit_only_the_strict_score_and_focused_rate_divides_by_request():
             analysis, focused=False, capture_traces=True, query="set:1", deployment_id="scio-prod"
         )
     }
-    # Effective handoff would match here (NO_SAMPLE hands off), but it must not become a frontier key.
     assert objective.telemetry_dimensions == ("escalation_match",)
     assert rows["e1"].dimension_scores == {"escalation_match": 0.0}
     assert rows["e1"].output["teacher_waldo_termination"] == "SAW_INSUFFICIENT_TOOLS"
@@ -205,7 +198,6 @@ def test_rows_emit_only_the_strict_score_and_focused_rate_divides_by_request():
     )
     assert aggregate.entry_id is None
     assert aggregate.dimension_scores == {"escalation_match": 0.5}
-    assert analysis.aggregate.handoff_match == pytest.approx(1.0)
     # A requested entry with no telemetry counts as a miss.
     assert objective.focused_pass_rate(analysis, ["e1", "e2", "missing"]) == pytest.approx(1 / 3)
 
@@ -222,7 +214,7 @@ def _trajectory(output: dict[str, Any], score: float) -> dict[str, Any]:
 def test_reflective_feedback_names_the_direction_and_each_sides_waldo_summary():
     objective = EscalationMatchObjective()
     under = objective.build_reflective_example(
-        "WALDO_TOOL_USAGE",
+        "WALDO_ROUTING",
         _trajectory(
             {
                 "teacher_waldo_termination": "SAW_INSUFFICIENT_TOOLS",
@@ -242,20 +234,50 @@ def test_reflective_feedback_names_the_direction_and_each_sides_waldo_summary():
     assert "first-sentence refusal" in feedback
 
     over = objective.build_reflective_example(
-        "WALDO_TOOL_USAGE",
+        "WALDO_ROUTING",
         _trajectory(
             {"teacher_waldo_termination": "SAW_READY", "student_waldo_termination": "SAW_INSUFFICIENT_TOOLS"}, 0.0
         ),
         {},
     )
     assert over["Feedback"].startswith("Over-escalation: the teacher answered with its attached tools (SAW_READY)")
-    assert "discover" in objective.reflection_prompt("WALDO_TOOL_USAGE")
+    prompt = objective.reflection_prompt("WALDO_ROUTING")
+    assert WALDO_ROUTING_FRAME in prompt
+    assert "SAW_INSUFFICIENT_TOOLS" in prompt
+    assert "discover" in prompt
+
+
+def test_teacher_loop_exhaustion_stays_a_score_miss_and_leaves_the_reflection_set():
+    analysis = _fetch(
+        _client(
+            _row("loops", (RAN, "MAX_LOOPS_EXHAUSTED"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
+            _row("answered", (RAN, "SAW_READY"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
+        )
+    )
+    objective = EscalationMatchObjective()
+    rows = {
+        row.entry_id: row
+        for row in objective.scored_rows(
+            analysis, focused=False, capture_traces=True, query="set:1", deployment_id="scio-prod"
+        )
+    }
+    assert rows["loops"].dimension_scores == {"escalation_match": 0.0}
+    assert analysis.high_signal_entry_ids == ("answered",)
+    assert not objective.is_high_signal(rows["loops"].output)
+    assert objective.is_high_signal(rows["answered"].output)
 
 
 def test_mismatch_pair_and_reflection_selection_keep_the_rare_direction():
     assert escalation_mismatch_pair("SAW_READY", "NO_SAMPLE") is None
     assert escalation_mismatch_pair("SAW_INSUFFICIENT_TOOLS", "SAW_READY") == ("SAW_INSUFFICIENT_TOOLS", "SAW_READY")
     assert escalation_mismatch_pair("", "") is None
+    # A teacher fallback is not a reflection example. A student fallback still is.
+    assert escalation_mismatch_pair("MAX_LOOPS_EXHAUSTED", "SAW_INSUFFICIENT_TOOLS") is None
+    assert escalation_mismatch_pair("NO_SAMPLE", "SAW_INSUFFICIENT_TOOLS") == ("NO_SAMPLE", "SAW_INSUFFICIENT_TOOLS")
+    assert escalation_mismatch_pair("SAW_INSUFFICIENT_TOOLS", "MAX_LOOPS_EXHAUSTED") == (
+        "SAW_INSUFFICIENT_TOOLS",
+        "MAX_LOOPS_EXHAUSTED",
+    )
 
     under = ("SAW_INSUFFICIENT_TOOLS", "SAW_READY")
     over = ("SAW_READY", "SAW_INSUFFICIENT_TOOLS")
@@ -265,11 +287,3 @@ def test_mismatch_pair_and_reflection_selection_keep_the_rare_direction():
     assert groups == [(*under, 4), (*over, 1)]
     everything, _ = interleave_mismatch_groups(keys, max_entries=None)
     assert len(everything) == 31
-
-
-def test_registered_for_teacher_student_mode():
-    assert registry.resolve("teacher_student", "escalation_match") is EscalationMatchObjective
-    assert (
-        registry.validate_objective_class(EscalationMatchObjective, mode="teacher_student", source="escalation_match")
-        == []
-    )

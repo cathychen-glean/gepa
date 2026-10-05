@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from datetime import date, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 from gepa.core.data_loader import ListDataLoader
@@ -12,7 +13,8 @@ from glean_gepa.evalcli_client import (
 )
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
-from glean_gepa.prompt import compile_system_prompt, materialize_system_prompt
+from glean_gepa.experiment_config import load_experiment_config, runner_arg_defaults
+from glean_gepa.prompt import compile_system_prompt, compile_waldo_system_override, materialize_system_prompt
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
@@ -21,9 +23,19 @@ from glean_gepa.prompt_constants import (
     DEFAULT_WRITING_CODE,
     EXECUTION_DISCIPLINE_KEY,
     FULL_PROMPT_KEY,
+    MODULE_TOKEN_BUDGETS,
     PROMPT_MODULE_DEFAULTS,
     RULES_EXT_KEY,
     WRITING_CODE_KEY,
+)
+from glean_gepa.waldo_prompt_constants import (
+    DEFAULT_WALDO_ROUTING,
+    WALDO_ROUTING_KEY,
+    WALDO_ROUTING_SLOT,
+    WALDO_ROUTING_TOKEN_BUDGET,
+    WALDO_SYSTEM_KEY,
+    WALDO_TOOL_USAGE_KEY,
+    compile_waldo_system_prompt,
 )
 from glean_gepa.runner import (
     CUSTOMER_DEPLOYMENTS_FILENAME,
@@ -173,10 +185,65 @@ def test_parse_editable_modules():
     assert _parse_editable_modules(f"{WRITING_CODE_KEY},{RULES_EXT_KEY}") == [WRITING_CODE_KEY, RULES_EXT_KEY]
     assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},{RULES_EXT_KEY}") == [*CORE_TOOLS, RULES_EXT_KEY]
     assert _parse_editable_modules(f"{CORE_TOOLS_GROUP},glean_search") == list(CORE_TOOLS)
+    assert _parse_editable_modules(WALDO_ROUTING_KEY) == [WALDO_ROUTING_KEY]
     with pytest.raises(SystemExit, match="unknown editable_modules"):
         _parse_editable_modules("GLOBAL_ROLE")
     with pytest.raises(SystemExit, match=rf"{FULL_PROMPT_KEY} is not editable.*{EXECUTION_DISCIPLINE_KEY}"):
         _parse_editable_modules(FULL_PROMPT_KEY)
+
+
+def _waldo_seed(name: str) -> dict[str, str]:
+    return json.loads((Path(__file__).resolve().parents[1] / "data" / name).read_text())
+
+
+def test_routing_seed_compiles_to_the_live_prompt():
+    legacy = _waldo_seed("waldo_seed_candidate.json")
+    routing = _waldo_seed("waldo_routing_seed_candidate.json")
+
+    assert routing[WALDO_SYSTEM_KEY].startswith(WALDO_ROUTING_SLOT + "\n\n### Available Tools")
+    assert routing[WALDO_ROUTING_KEY].startswith("## First-Action Decision")
+    assert routing[WALDO_TOOL_USAGE_KEY] == legacy[WALDO_TOOL_USAGE_KEY]
+    assert compile_waldo_system_prompt(routing) == compile_waldo_system_prompt(legacy)
+
+    compiled = compile_waldo_system_prompt({})
+    assert WALDO_ROUTING_SLOT not in compiled
+    assert compiled.startswith(DEFAULT_WALDO_ROUTING + "\n\n### Available Tools")
+
+    rewritten = {**routing, WALDO_ROUTING_KEY: "## First-Action Decision\nCall discover.  \n"}
+    assert "Call discover.\n\n### Available Tools" in compile_waldo_system_prompt(rewritten)
+
+
+def test_waldo_seed_pins_frozen_siblings_and_rejects_a_template_without_the_slot():
+    raw = _waldo_seed("waldo_routing_seed_candidate.json")
+    seed = _seed_for_editable_modules(raw, [WALDO_ROUTING_KEY])
+    assert seed[WALDO_SYSTEM_KEY] == raw[WALDO_SYSTEM_KEY]
+    assert seed[WALDO_ROUTING_KEY] == raw[WALDO_ROUTING_KEY]
+    assert seed[WALDO_TOOL_USAGE_KEY] == raw[WALDO_TOOL_USAGE_KEY]
+
+    legacy = _waldo_seed("waldo_seed_candidate.json")
+    tool_usage_seed = _seed_for_editable_modules(legacy, [WALDO_TOOL_USAGE_KEY])
+    assert WALDO_ROUTING_KEY not in tool_usage_seed
+    assert compile_waldo_system_prompt(tool_usage_seed) == compile_waldo_system_prompt(legacy)
+    with pytest.raises(
+        SystemExit, match=r"WALDO_ROUTING is editable but the seed WALDO_SYSTEM has no \{WALDO_ROUTING\}"
+    ):
+        _seed_for_editable_modules(legacy, [WALDO_ROUTING_KEY])
+
+
+def test_routing_module_fits_its_budget_and_triggers_the_waldo_override():
+    routing = _waldo_seed("waldo_routing_seed_candidate.json")
+    assert MODULE_TOKEN_BUDGETS[WALDO_ROUTING_KEY] == WALDO_ROUTING_TOKEN_BUDGET
+    assert len(routing[WALDO_ROUTING_KEY]) // 4 < WALDO_ROUTING_TOKEN_BUDGET
+    assert compile_waldo_system_override({WALDO_ROUTING_KEY: "route"}).startswith(
+        "llmo.per_prompt_overrides.waldo_system="
+    )
+
+    defaults = runner_arg_defaults(load_experiment_config("teacher_student_waldo_escalation"))
+    assert Path(defaults["seed_candidate"]) == Path("data/waldo_routing_seed_candidate.json")
+    assert defaults["editable_modules"] == WALDO_ROUTING_KEY
+    seed = _seed_for_editable_modules(routing, [WALDO_ROUTING_KEY])
+    frozen = sum(len(seed[key]) // 4 for key in (WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY))
+    assert frozen + WALDO_ROUTING_TOKEN_BUDGET < defaults["global_token_cap"]
 
 
 @pytest.mark.parametrize(

@@ -6,11 +6,9 @@ Waldo is the pre-loop router. On each request it either answers with its attache
 ``NO_TOOL_CALLS``) also reaches the full agent, but as a fallback, not a decision.
 
 The score is strict escalation agreement: both runs end ``SAW_INSUFFICIENT_TOOLS`` or neither
-does, with fallback terminations counted as not escalating. ``handoff_match`` (agreement on
-"anything but ``SAW_READY``") is logged on the aggregate only. It is not emitted as a score
-dimension, so it never becomes a Pareto frontier key. Only entries where Waldo ran in both runs
-are scored. Skips are input-driven, so they are counted and checked for teacher/student parity
-but not scored.
+does, with fallback terminations counted as not escalating. Only entries where Waldo ran in both
+runs are scored. Skips are input-driven, so they are counted and checked for teacher/student
+parity but not scored.
 
 Do not read ``auto_mode_escalated``: that is Auto Mode fast-to-thinking, not Waldo. The inner
 loop's own IC Preloop span is excluded by span name.
@@ -40,7 +38,7 @@ from glean_gepa.objectives.utils.agentspan_query import (
 from glean_gepa.objectives.utils.core import NoComparedEntriesError, PairedRunAnalysis, log_analysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
 from glean_gepa.reflection_prompts import GENERALITY_RULES, compose_responsibility
-from glean_gepa.waldo_prompt_constants import WALDO_ROUTING_KEY, WALDO_TOOL_USAGE_KEY
+from glean_gepa.waldo_prompt_constants import WALDO_ROUTING_KEY
 
 ESCALATION_MATCH_OBJECTIVE = "escalation_match"
 
@@ -51,6 +49,7 @@ WALDO_SPAN_FILTER = f"jsonPayload.span_info.span_name IN ('{WALDO_AGENT_SPAN}', 
 
 SAW_INSUFFICIENT_TOOLS = "SAW_INSUFFICIENT_TOOLS"
 SAW_READY = "SAW_READY"
+MAX_LOOPS_EXHAUSTED = "MAX_LOOPS_EXHAUSTED"
 SKIPPED_MESSAGE_PREFIX = "skipped:"
 
 # Per-run Waldo outcomes. Skips are ``skip:<reason>``.
@@ -93,10 +92,6 @@ class WaldoDecision:
     @property
     def escalated(self) -> bool:
         return self.outcome == ESCALATED
-
-    @property
-    def handed_off(self) -> bool:
-        return self.outcome in (ESCALATED, OTHER)
 
     @property
     def skip_reason(self) -> str:
@@ -147,10 +142,6 @@ class EscalationMatchEntryMetrics:
     @property
     def escalation_match(self) -> bool:
         return self.teacher.escalated == self.student.escalated
-
-    @property
-    def handoff_match(self) -> bool:
-        return self.teacher.handed_off == self.student.handed_off
 
     @property
     def passed(self) -> bool:
@@ -222,9 +213,7 @@ class WaldoCoverage:
 class EscalationMatchMetrics:
     compared_entries: int
     escalation_match: float
-    handoff_match: float
     strict: EscalationConfusion = field(default_factory=EscalationConfusion)
-    effective: EscalationConfusion = field(default_factory=EscalationConfusion)
     coverage: WaldoCoverage = field(default_factory=WaldoCoverage)
 
 
@@ -294,21 +283,24 @@ def aggregate_escalation_match_metrics(
     per_entry: Mapping[str, EscalationMatchEntryMetrics], *, coverage: WaldoCoverage | None = None
 ) -> EscalationMatchMetrics:
     strict = escalation_confusion(per_entry.values(), lambda d: d.escalated)
-    effective = escalation_confusion(per_entry.values(), lambda d: d.handed_off)
     return EscalationMatchMetrics(
         compared_entries=len(per_entry),
         escalation_match=strict.agreement,
-        handoff_match=effective.agreement,
         strict=strict,
-        effective=effective,
         coverage=coverage or WaldoCoverage(),
     )
 
 
 def escalation_mismatch_pair(teacher_termination: Any, student_termination: Any) -> tuple[str, str] | None:
-    """``(teacher, student)`` terminations when exactly one run escalated, else ``None``."""
+    """``(teacher, student)`` terminations when exactly one run escalated, else ``None``.
+
+    Teacher ``MAX_LOOPS_EXHAUSTED`` is not a decision to answer. The entry still scores as a
+    mismatch when the student escalated, but it is not a reflection example.
+    """
     teacher = str(teacher_termination or "")
     student = str(student_termination or "")
+    if teacher == MAX_LOOPS_EXHAUSTED:
+        return None
     if (teacher == SAW_INSUFFICIENT_TOOLS) == (student == SAW_INSUFFICIENT_TOOLS):
         return None
     return teacher, student
@@ -440,7 +432,7 @@ def fetch_eval_run_escalation_match_analysis(
         per_entry_sql=build_escalation_match_per_entry_query(agentspan_table=agentspan_table),
         parse_row=parse_escalation_match_row,
         aggregate=aggregate,
-        is_high_signal=lambda m: not m.escalation_match,
+        is_high_signal=lambda m: escalation_mismatch_pair(m.teacher.termination, m.student.termination) is not None,
         filter_rows=keep_both_ran,
         lookback_days=lookback_days,
         end_date=end_date,
@@ -493,12 +485,6 @@ def interleave_mismatch_groups(
 # Objective
 # ---------------------------------------------------------------------------
 
-WALDO_TOOL_USAGE_FRAME = (
-    "You are rewriting the 'Tool Usage Guidelines' section of the Waldo router prompt. It has two "
-    "conditional branches, <<<[[has_search_tools]] ... >>> and <<<[[no_search_tools]] ... >>>; scio "
-    "renders exactly one per request. Keep both branches and every [[...]] placeholder."
-)
-
 SCORE_MODEL_NOTE = (
     "HOW THE SCORE IS DECIDED. Waldo either answers with its attached tools or escalates to the full "
     "agent by calling discover, which ends it with SAW_INSUFFICIENT_TOOLS. An entry scores 1 when the "
@@ -540,13 +526,6 @@ ESCALATION_TASK = (
     "of request the teacher escalates on, and answers the kinds it answers. State rules in terms of "
     "request type, never specific documents, people, or customers from the examples. Keep the text "
     "operational and concise."
-)
-
-WALDO_TOOL_USAGE_RESPONSIBILITY = compose_responsibility(
-    WALDO_TOOL_USAGE_FRAME,
-    ESCALATION_TASK,
-    guide=ESCALATION_MATCH_GAP_ANALYSIS_GUIDE,
-    closing=GENERALITY_RULES,
 )
 
 WALDO_ROUTING_FRAME = (
@@ -641,11 +620,11 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
     reflection_selection_justification: ClassVar[str] = (
         "Justification: escalation mismatches interleaved across (teacher, student) termination "
         "groups, most frequent first, up to the reflection cap, so over-escalation examples are "
-        "not crowded out by the usually larger under-escalation group."
+        "not crowded out by the usually larger under-escalation group. Teacher MAX_LOOPS_EXHAUSTED "
+        "is omitted: running out of loops is not a decision to answer."
     )
     module_responsibilities: ClassVar[Mapping[str, str]] = {
         WALDO_ROUTING_KEY: WALDO_ROUTING_RESPONSIBILITY,
-        WALDO_TOOL_USAGE_KEY: WALDO_TOOL_USAGE_RESPONSIBILITY,
     }
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
@@ -705,7 +684,6 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
                 f"[Escalation Match] {coverage.skip_reason_mismatches} entries were skipped by both runs "
                 "for different reasons; they are not scored either way."
             )
-        print(f"[Escalation Match] Effective handoff: {aggregate.effective.describe()}")
         log_analysis(
             analysis,
             label="Escalation Match",
