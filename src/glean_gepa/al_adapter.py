@@ -158,6 +158,9 @@ WALDO_MODEL_ALIAS = "waldo"
 WALDO_DEFAULT_MODEL = "BASETEN:WALDO"
 WALDO_ENABLE_SC_PARAM = "co.lo.icpo.should_run_waldo_qe=true"
 WALDO_MODEL_SC_PARAM = "co.lo.icpo.waldo_model"
+# scio's _waldo_skip_reason skips Waldo for the ADVANCED (thinking) agent. AUTO is what
+# production Glean Chat and the Coding Harness preset send.
+WALDO_GLEANCHAT_AGENT = "AUTO"
 
 
 def parse_waldo_alias(model: str) -> str | None:
@@ -175,6 +178,13 @@ def parse_waldo_alias(model: str) -> str | None:
             raise ValueError(f"Waldo model must be PROVIDER:MODEL[:effort], got {spec!r} in {model!r}")
         return spec
     return None
+
+
+def gleanchat_agent(model: str) -> str:
+    """EvalCLI ``gleanchat_agent`` mode for a model alias."""
+    if parse_waldo_alias(model) is not None:
+        return WALDO_GLEANCHAT_AGENT
+    return "FAST" if model == "fast" else "ADVANCED"
 
 
 # ---------------------------
@@ -598,9 +608,15 @@ class ALRunner:
             (eval_run_id, wait_required). wait_required is False when a completed
             run was already cached.
         """
+        agent = gleanchat_agent(model)
+        prompt_key = system_prompt
+        if parse_waldo_alias(model) is not None:
+            # Waldo runs created under ADVANCED skipped Waldo on every entry; keying on the
+            # agent mode keeps them from being reused.
+            prompt_key += f"|gleanchat_agent={agent}"
         cache_key: EvalCacheKey = (
             model,
-            hashlib.md5(system_prompt.encode()).hexdigest()[:16],
+            hashlib.md5(prompt_key.encode()).hexdigest()[:16],
             eval_set_name,
             eval_set_version,
             run_label,
@@ -615,13 +631,7 @@ class ALRunner:
         model_label = re.sub(r"[^A-Za-z0-9_]+", "_", model).strip("_")
         eval_id = f"{run_label}_{model_label}_{id_token}_{int(time.time())}"
         sc_params = self._build_sc_params(model, system_prompt)
-        eval_params = "experimental_queue=eval-experimental-2"
-        if model == "fast":
-            eval_params += ",gleanchat_agent=FAST"
-        else:
-            # Waldo aliases run ADVANCED too: is_waldo_enabled requires the
-            # internal-coding route, which only the advanced agent takes.
-            eval_params += ",gleanchat_agent=ADVANCED"
+        eval_params = f"experimental_queue=eval-experimental-2,gleanchat_agent={agent}"
 
         print(f"Creating eval run {eval_id} for {eval_set_name}:{eval_set_version}...")
         created_id = self.evalcli.create_eval_run(

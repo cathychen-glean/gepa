@@ -385,3 +385,22 @@ def test_runner_passes_harness_to_evalcli_or_keeps_defaults():
     assert "runner_type" not in kwargs  # evalcli's own default applies
     assert kwargs["sc_params"].startswith(CODING_HARNESS_SC_PARAMS)
     assert kwargs["eval_params"].endswith("gleanchat_agent=FAST")
+
+
+def test_waldo_runs_use_auto_agent_and_skip_pre_auto_cache():
+    """scio skips Waldo under the ADVANCED agent, so Waldo aliases must run AUTO and
+    must not reuse eval ids cached from ADVANCED-era runs."""
+    evalcli = MagicMock()
+    evalcli.create_eval_run.return_value = "ev-new"
+    runner = ALRunner(evalcli=evalcli)
+    model, prompt = "waldo:OPEN_AI:GPT6_LUNA:none", "llmo.per_prompt_overrides.waldo_system=abc"
+    legacy_key = (model, hashlib.md5(prompt.encode()).hexdigest()[:16], "set", "v1", "gepa", "scio-prod")
+    runner._eval_run_ids[legacy_key] = "ev-advanced"
+    runner._verified_eval_ids.add("ev-advanced")
+
+    eval_id, _ = runner.start(model, prompt, "set", "v1", ["scio-prod"])
+
+    assert eval_id == "ev-new"
+    assert evalcli.create_eval_run.call_args.kwargs["eval_params"].endswith("gleanchat_agent=AUTO")
+    assert runner.start(model, prompt, "set", "v1", ["scio-prod"]) == ("ev-new", True)
+    evalcli.create_eval_run.assert_called_once()

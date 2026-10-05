@@ -91,6 +91,12 @@ BUILTIN_OBJECTIVES: tuple[ObjectiveSpec, ...] = (
         summary="Pairwise AGENTIC_JUDGE prefers the student over the teacher.",
     ),
     ObjectiveSpec(
+        mode="teacher_student",
+        source="escalation_match",
+        class_path="glean_gepa.objectives.escalation_match:EscalationMatchObjective",
+        summary="Student's Waldo router escalates (SAW_INSUFFICIENT_TOOLS) on the same entries as the teacher's.",
+    ),
+    ObjectiveSpec(
         mode="single_model",
         source="shell_telemetry",
         class_path="glean_gepa.objectives.shell:ShellSuccessObjective",
