@@ -148,7 +148,9 @@ Confirm the editable modules' text actually decides the behavior the signal meas
 Read the seed prompt and locate the rules that drive it. If they sit outside the editable
 modules, tell the user and propose splitting them into a new slot module (reference.md,
 "Splitting a prompt module"). Do the split only with the user's approval. The new seed
-must compile byte-identical to the old one.
+must compile byte-identical to the old one. If the rules live in a scio prompt that is not
+yet a target under `src/glean_gepa/prompts/`, wire it with the new-prompt-target skill
+(`.cursor/skills/new-prompt-target/`) first.
 
 ### 8. Tests
 

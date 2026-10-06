@@ -392,7 +392,7 @@ def test_runner_passes_harness_to_evalcli_or_keeps_defaults():
 
 
 def test_render_sc_params_edit_the_preset_and_key_the_cache():
-    """A prompt that needs extra scParams to render (memory) gets them on every eval, and
+    """A prompt that needs extra scParams to render gets them on every eval, and
     its evals never reuse runs created without them."""
     evalcli = MagicMock()
     evalcli.create_eval_run.return_value = "ev-render"

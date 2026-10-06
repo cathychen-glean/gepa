@@ -142,6 +142,10 @@ prompt to optimize" in `docs/glean_gepa_architecture_guidelines.md`. The worked 
    at the new key. Raise `search.global_token_cap` above the editable target's modules plus
    the new budget.
 
+To audit the split, run `uv run python .cursor/skills/new-prompt-target/scripts/prompt_target_check.py
+check <name> --source <scio file> --seed <new seed> --editable <KEY>`. It checks byte
+identity, budgets, frames, and placeholders.
+
 The seed builder pins the seed's template and every frozen section it renders, and refuses
 an editable section with no slot. Slots, `<<<[[...]]>>>` conditionals, and declared
 required markup are protected during reflection: `drops_render_slot`, `drops_conditional`,

@@ -143,8 +143,6 @@ Shipped experiments:
 | `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match. Weighted screen. |
 | `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
 | `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
-| `teacher_student_memory.yaml` | teacher_student | `agentic_preference_rate` | Memory + personalization prompt seeded from askscio/scio#299585. Example wiring, not yet run. |
-
 Sections:
 
 - `signals` -- every metric the run scores or reports. `source` is a telemetry
@@ -201,21 +199,22 @@ needs a code change.
        # fill: verbatim         # default strips the text and falls back to stock when empty
        # drop_empty_line: true  # an empty fill removes the slot's line
    render:                      # scParams every eval in the run needs to render this prompt
-     sc_params: [co.lo.cao.use_stripped_prompts=1]
+     sc_params: [co.some.flag=1]
      drop_sc_params: []         # preset entries to remove
    ```
 
 3. Seed: a JSON object of keys, or a `.prompt` file marked like `template.prompt` (copy a
-   scio PR's version of the file and add markers, as in
-   `data/memory_personalization_seed.prompt`). Without a seed, stock text is the seed.
+   scio PR's version of the file and add the same markers). Without a seed, stock text is
+   the seed.
 4. Point a config's `reflection.editable_modules` at the section keys. An objective's
    `module_responsibilities` or `reflection.modules.<KEY>` overrides the YAML frame.
 
 The runner refuses a section with no slot in the seed, a seed missing required markup, and
 a model whose harness never renders the prompt. Reflection rejects a variant that drops a
 slot, a conditional, or required markup. `coding_agent_loop_system` (Coding Harness),
-`core_tool_descriptions` (tool `schema.description` overrides), `waldo_system`, and
-`stripped_engram_memory_instructions` are the worked examples.
+`core_tool_descriptions` (tool `schema.description` overrides), and `waldo_system` are the
+worked examples. The `new-prompt-target` skill (`.cursor/skills/new-prompt-target/`) walks
+through the whole wiring.
 
 ## Implementation rules
 
