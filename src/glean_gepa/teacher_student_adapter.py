@@ -30,7 +30,7 @@ from glean_gepa.evalcli_client import (
     CORRECTNESS_JUDGE_TYPE,
     CORRECTNESS_RUN_PARAMS,
 )
-from glean_gepa.focused_evalset import resolve_eval_run_target
+from glean_gepa.focused_evalset import focused_entry_id, resolve_eval_run_target
 from glean_gepa.judge_metrics_util import (
     JudgeAnalysis,
     wait_for_all_judge_metrics,
@@ -309,20 +309,24 @@ class TeacherStudentAdapter(GleanAdapterBase):
             eval_set_version = target.eval_set_version
             deployment_ids = al_data_inst.get("deployment_ids", [])
             run_label = target.run_label
-            teacher_eval_id = al_data_inst.get("cached_teacher_eval_run_id")
+            teacher_eval_id = ""
             wait_teacher = False
-            if teacher_eval_id:
-                print(f"[Child cache HIT] Using cached teacher eval_id: {teacher_eval_id}")
+            if al_data_inst.get("screen_references"):
+                print("[Focused screen] Scoring the student against the parent teacher; not rerunning the teacher")
             else:
-                teacher_eval_id, wait_teacher = self._get_or_start_eval(
-                    model=self.teacher_model,
-                    system_prompt="<<TEACHER_PROD_PROMPT>>",
-                    eval_set_name=eval_set_name,
-                    eval_set_version=eval_set_version,
-                    deployment_ids=deployment_ids,
-                    role="teacher",
-                    run_label=run_label,
-                )
+                teacher_eval_id = al_data_inst.get("cached_teacher_eval_run_id") or ""
+                if teacher_eval_id:
+                    print(f"[Child cache HIT] Using cached teacher eval_id: {teacher_eval_id}")
+                else:
+                    teacher_eval_id, wait_teacher = self._get_or_start_eval(
+                        model=self.teacher_model,
+                        system_prompt="<<TEACHER_PROD_PROMPT>>",
+                        eval_set_name=eval_set_name,
+                        eval_set_version=eval_set_version,
+                        deployment_ids=deployment_ids,
+                        role="teacher",
+                        run_label=run_label,
+                    )
             student_eval_id = al_data_inst.get("cached_student_eval_run_id")
             wait_student = False
             if student_eval_id:
@@ -363,7 +367,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             for started in started_groups
             for pair in started
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id)
-            if eval_id not in pending_waits
+            if eval_id and eval_id not in pending_waits
         }
         pending: list[tuple[str, str, str, str | None]] = []
         seen: set[tuple[str, str, str]] = set()
@@ -523,7 +527,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
             pair_ready = ready_eval_ids is None or (
                 pair.teacher_eval_id in ready_eval_ids and pair.student_eval_id in ready_eval_ids
             )
-            if pair_ready:
+            if pair_ready and pair.teacher_eval_id:
                 for judge in self._pairwise_judges_for_pair(pair):
                     cache_key = self._judge_key(pair.student_eval_id, judge.judge_type, pair.teacher_eval_id)
                     if cache_key in seen_keys or cache_key in self._judge_cache:
@@ -540,7 +544,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
                     )
                     pending.append((pair.student_eval_id, judge.judge_type, judge_run_id, pair.teacher_eval_id))
             for eval_id in (pair.teacher_eval_id, pair.student_eval_id):
-                if ready_eval_ids is not None and eval_id not in ready_eval_ids:
+                if not eval_id or (ready_eval_ids is not None and eval_id not in ready_eval_ids):
                     continue
                 for judge in self.pointwise_judges:
                     cache_key = self._judge_key(eval_id, judge.judge_type)
@@ -608,6 +612,7 @@ class TeacherStudentAdapter(GleanAdapterBase):
     def high_signal_batch(self, eval_batch: GleanEvaluationBatch) -> list[ALDataInst]:
         """Keep every parent entry the objective marks as high-signal."""
         grouped: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+        references: dict[str, str] = {}
         seen: set[str] = set()
         for trajectory in eval_batch.trajectories or []:
             data = trajectory["data"]
@@ -620,19 +625,25 @@ class TeacherStudentAdapter(GleanAdapterBase):
             seen.add(entry_id)
             key = (data["eval_set_name"], data["eval_set_version"], tuple(data["deployment_ids"]))
             grouped.setdefault(key, []).append(entry_id)
+            reference = self.objective.screen_reference(output)
+            if reference is not None:
+                references[entry_id] = reference
         if grouped:
             count = sum(len(ids) for ids in grouped.values())
             print(f"[High-signal] Selected {count} entries for screening")
-        return [
-            {
+        batch: list[ALDataInst] = []
+        for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items():
+            inst: TeacherStudentALDataInst = {
                 "eval_set_name": eval_set_name,
                 "eval_set_version": eval_set_version,
                 "deployment_ids": list(deployment_ids),
                 "status": "active",
                 "eval_entry_ids": entry_ids,
             }
-            for (eval_set_name, eval_set_version, deployment_ids), entry_ids in grouped.items()
-        ]
+            if group_references := {e: references[e] for e in entry_ids if e in references}:
+                inst["screen_references"] = group_references
+            batch.append(inst)
+        return batch
 
     def make_reflective_dataset(
         self,
@@ -671,29 +682,39 @@ class TeacherStudentAdapter(GleanAdapterBase):
 
         for pair in started:
             al_data_inst = pair.al_data_inst
-            all_eval_run_ids.append(
-                {
-                    "eval_set_name": str(al_data_inst.get("eval_set_name", "")),
-                    "eval_set_version": str(al_data_inst.get("eval_set_version", "")),
-                    "student_eval_run_id": pair.student_eval_id,
-                    "teacher_eval_run_id": pair.teacher_eval_id,
-                }
-            )
+            eval_run_ids: EvalRunIds = {
+                "eval_set_name": str(al_data_inst.get("eval_set_name", "")),
+                "eval_set_version": str(al_data_inst.get("eval_set_version", "")),
+                "student_eval_run_id": pair.student_eval_id,
+            }
+            if pair.teacher_eval_id:
+                eval_run_ids["teacher_eval_run_id"] = pair.teacher_eval_id
+            all_eval_run_ids.append(eval_run_ids)
             analysis = self._get_or_fetch_analysis(
                 pair.teacher_eval_id,
                 pair.student_eval_id,
                 include_action_inputs=not bool(al_data_inst.get("validation_only")),
             )
-            requested_entry_ids = al_data_inst.get("eval_entry_ids") or []
+            # Focused runs key telemetry by the ids the upload minted, not the parent's ids.
+            requested_entry_ids = [
+                focused_entry_id(al_data_inst, entry_id) for entry_id in al_data_inst.get("eval_entry_ids") or []
+            ]
+            references = {
+                focused_entry_id(al_data_inst, entry_id): reference
+                for entry_id, reference in (al_data_inst.get("screen_references") or {}).items()
+            }
             is_focused_eval = bool(requested_entry_ids)
             primary_from_pairwise_judge = any(judge.name == self.objective.name for judge in self.pairwise_judges)
-            self.objective.require_compared_entries(analysis)
+            screens_against_parent = is_focused_eval and bool(references)
+            if not screens_against_parent:
+                self.objective.require_compared_entries(analysis)
             if is_focused_eval:
-                # Pairwise-judge primaries (agentic preference) already land in
-                # summary via the judge overlay. Overwriting with focused_pass_rate
-                # would zero that screen. Trace-based primaries still need it.
                 if self.screening_kind != "correctness_floor" and not primary_from_pairwise_judge:
-                    focused_alignment_rates.append(self.objective.focused_pass_rate(analysis, requested_entry_ids))
+                    focused_alignment_rates.append(
+                        self.objective.focused_reference_pass_rate(analysis, requested_entry_ids, references)
+                        if screens_against_parent
+                        else self.objective.focused_pass_rate(analysis, requested_entry_ids)
+                    )
             else:
                 self.objective.validate_full_eval(analysis)
             deployment_id = (al_data_inst.get("deployment_ids") or [""])[0]
@@ -729,6 +750,8 @@ class TeacherStudentAdapter(GleanAdapterBase):
                 },
             }
             for judge in self.pointwise_judges:
+                if not pair.teacher_eval_id:
+                    continue
                 teacher_analysis = self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type)
                 print(
                     f"[{judge.judge_type}] student {pair.student_eval_id}="
@@ -806,9 +829,12 @@ class TeacherStudentAdapter(GleanAdapterBase):
         if summary is not None and started:
             for judge in self.pointwise_judges:
                 teacher_scores = [
-                    self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type).aggregate for pair in started
+                    self._judge_for(pair.teacher_eval_id, judge_type=judge.judge_type).aggregate
+                    for pair in started
+                    if pair.teacher_eval_id
                 ]
-                summary[f"teacher_{judge.name}"] = sum(teacher_scores) / len(teacher_scores)
+                if teacher_scores:
+                    summary[f"teacher_{judge.name}"] = sum(teacher_scores) / len(teacher_scores)
 
         return GleanEvaluationBatch(
             outputs=all_outputs,

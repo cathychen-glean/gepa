@@ -15,7 +15,9 @@ from glean_gepa.focused_evalset import (
     build_upload_entry,
     build_upload_eval_set_request,
     ensure_focused_eval_set,
+    focused_entry_id,
     focused_eval_set_version,
+    map_focused_entry_ids,
     prepare_high_signal_eval_batch,
     resolve_eval_run_target,
 )
@@ -26,7 +28,7 @@ SOURCE = {
     "deployment_ids": ["prod"],
     "status": "active",
 }
-FOCUSED = FocusedEvalSet("gepa-high-signal-example", "v1_hs_abc", 1)
+FOCUSED = FocusedEvalSet("gepa-high-signal-example", "v1_hs_abc", 1, {"keep": "focused-keep"})
 
 def test_focused_eval_set_version_is_order_independent_and_bucket_specific():
     ids = ["a", "b"]
@@ -60,7 +62,7 @@ def test_ensure_focused_eval_set_uploads_only_requested_entries():
         {"id": "keep", "deploymentId": "prod", "user": "spark", "input": {"query": "hello"}, "stt": "session-1"},
         {"id": "drop", "deploymentId": "prod", "user": "spark", "input": {"query": "other"}, "stt": "session-2"},
     ]
-    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry"}]
+    evalcli.wait_for_eval_set_entries.return_value = [{"id": "new-entry", "input": {"query": " hello "}}]
 
     focused = ensure_focused_eval_set(
         evalcli,
@@ -75,6 +77,16 @@ def test_ensure_focused_eval_set_uploads_only_requested_entries():
     assert request["bucketType"] == QUERY_CANONICAL_BUCKET_TYPE
     assert request["entries"] == [{"deploymentId": "prod", "user": "spark", "query": "hello"}]
     assert focused.entry_count == 1
+    assert focused.entry_id_map == {"keep": "new-entry"}
+
+
+def test_map_focused_entry_ids_pairs_repeated_queries_in_order_and_skips_unmatched():
+    sources = [{"id": "a", "query": "q"}, {"id": "b", "query": "q"}, {"id": "c", "query": "gone"}]
+    focused = [{"id": "x", "query": "q"}, {"id": "y", "query": "q"}]
+    assert map_focused_entry_ids(sources, focused) == {"a": "x", "b": "y"}
+    data = {"focused_entry_ids": {"a": "x"}}
+    assert focused_entry_id(data, "a") == "x"
+    assert focused_entry_id(data, "c") == "c"
 
 
 def test_build_upload_entry_session_keeps_source_identity_fields():
@@ -311,7 +323,8 @@ def test_ensure_focused_eval_set_reuses_a_nonempty_retry_version():
     evalcli.list_eval_set_versions.return_value = [{"version": retry_version}]
     evalcli.list_eval_set_entries.side_effect = [
         [],
-        [{"id": "ingested-1"}, {"id": "ingested-2"}],
+        [{"id": "ingested-1", "query": "other"}, {"id": "ingested-2", "query": "hello"}],
+        [{"id": "keep", "input": {"query": "hello"}}, {"id": "drop", "input": {"query": "other"}}],
     ]
 
     focused = ensure_focused_eval_set(
@@ -325,6 +338,7 @@ def test_ensure_focused_eval_set_reuses_a_nonempty_retry_version():
     assert focused is not None
     assert focused.version == retry_version
     assert focused.entry_count == 2
+    assert focused.entry_id_map == {"keep": "ingested-2"}
     evalcli.upload_eval_set.assert_not_called()
 
 
@@ -342,6 +356,7 @@ def test_prepare_high_signal_eval_batch_attaches_focused_set_or_fails():
     assert prepared[0]["focused_eval_set_name"] == focused.name
     assert prepared[0]["focused_eval_set_version"] == focused.version
     assert prepared[0]["eval_entry_ids"] == ["keep"]
+    assert prepared[0]["focused_entry_ids"] == {"keep": "focused-keep"}
 
     with patch("glean_gepa.focused_evalset.ensure_focused_eval_set", return_value=None):
         assert prepare_high_signal_eval_batch(MagicMock(), batch) is None

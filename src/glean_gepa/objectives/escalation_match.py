@@ -5,10 +5,12 @@ Waldo is the pre-loop router. On each request it either answers with its attache
 ``SAW_INSUFFICIENT_TOOLS``. Every other termination (``NO_SAMPLE``, ``MAX_LOOPS_EXHAUSTED``,
 ``NO_TOOL_CALLS``) also reaches the full agent, but as a fallback, not a decision.
 
-The score is strict escalation agreement: both runs end ``SAW_INSUFFICIENT_TOOLS`` or neither
-does, with fallback terminations counted as not escalating. Only entries where Waldo ran in both
-runs are scored. Skips are input-driven, so they are counted and checked for teacher/student
-parity but not scored.
+An entry agrees when the student makes the teacher's decision: it escalates
+(``SAW_INSUFFICIENT_TOOLS``) where the teacher escalated, and answers (``SAW_READY``) where the
+teacher did not. A student fallback is neither, so it never agrees. Only entries where Waldo ran
+in both runs are scored. A teacher ``MAX_LOOPS_EXHAUSTED`` (out of loops) or ``NO_SAMPLE``
+(timed out) is not a choice to answer or hand off, so that entry is left out of the match. Skips
+are input-driven, so they are counted and checked for teacher/student parity but not scored.
 
 Do not read ``auto_mode_escalated``: that is Auto Mode fast-to-thinking, not Waldo. The inner
 loop's own IC Preloop span is excluded by span name.
@@ -38,7 +40,7 @@ from glean_gepa.objectives.utils.agentspan_query import (
 from glean_gepa.objectives.utils.core import NoComparedEntriesError, PairedRunAnalysis, log_analysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
 from glean_gepa.reflection_prompts import GENERALITY_RULES, compose_responsibility
-from glean_gepa.waldo_prompt_constants import WALDO_ROUTING_KEY
+from glean_gepa.waldo_prompt_constants import WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY
 
 ESCALATION_MATCH_OBJECTIVE = "escalation_match"
 
@@ -50,6 +52,9 @@ WALDO_SPAN_FILTER = f"jsonPayload.span_info.span_name IN ('{WALDO_AGENT_SPAN}', 
 SAW_INSUFFICIENT_TOOLS = "SAW_INSUFFICIENT_TOOLS"
 SAW_READY = "SAW_READY"
 MAX_LOOPS_EXHAUSTED = "MAX_LOOPS_EXHAUSTED"
+NO_SAMPLE = "NO_SAMPLE"
+# Teacher terminations that are not a decision to answer or hand off. Their entries are unscored.
+UNSCORED_TEACHER_TERMINATIONS = frozenset({MAX_LOOPS_EXHAUSTED, NO_SAMPLE})
 SKIPPED_MESSAGE_PREFIX = "skipped:"
 
 # Per-run Waldo outcomes. Skips are ``skip:<reason>``.
@@ -129,6 +134,19 @@ def classify_waldo_decision(
     )
 
 
+def student_fixed(reference_termination: str, student: WaldoDecision | None) -> bool:
+    """Whether the student makes the decision the reference teacher made.
+
+    Where the teacher escalated, the student has to escalate. Where it did not, the student
+    has to answer: a fallback such as ``NO_SAMPLE`` or ``MAX_LOOPS_EXHAUSTED`` is not a fix.
+    """
+    if student is None:
+        return False
+    if reference_termination == SAW_INSUFFICIENT_TOOLS:
+        return student.escalated
+    return student.outcome == ANSWERED
+
+
 @dataclass(frozen=True)
 class EscalationMatchEntryMetrics:
     entry_id: str
@@ -140,8 +158,17 @@ class EscalationMatchEntryMetrics:
         return self.teacher.ran and self.student.ran
 
     @property
+    def in_match(self) -> bool:
+        """Both runs ran, and the teacher made an escalate-or-answer decision.
+
+        A teacher that ran out of loops or timed out did not make that decision, so the entry is
+        unscored whichever way the student ended.
+        """
+        return self.both_ran and self.teacher.termination not in UNSCORED_TEACHER_TERMINATIONS
+
+    @property
     def escalation_match(self) -> bool:
-        return self.teacher.escalated == self.student.escalated
+        return self.in_match and student_fixed(self.teacher.termination, self.student)
 
     @property
     def passed(self) -> bool:
@@ -160,6 +187,8 @@ class EscalationConfusion:
     teacher_only: int = 0
     student_only: int = 0
     neither: int = 0
+    # ``neither`` entries where the student fell back instead of answering. They do not agree.
+    neither_student_fallback: int = 0
 
     @property
     def total(self) -> int:
@@ -175,7 +204,8 @@ class EscalationConfusion:
 
     @property
     def agreement(self) -> float:
-        return (self.both + self.neither) / self.total if self.total else 0.0
+        agreed = self.both + self.neither - self.neither_student_fallback
+        return agreed / self.total if self.total else 0.0
 
     @property
     def overlap(self) -> float:
@@ -186,7 +216,8 @@ class EscalationConfusion:
     def describe(self) -> str:
         return (
             f"teacher={self.teacher_rate:.1%} student={self.student_rate:.1%}; both={self.both} "
-            f"teacher-only={self.teacher_only} student-only={self.student_only} neither={self.neither}; "
+            f"teacher-only={self.teacher_only} student-only={self.student_only} neither={self.neither} "
+            f"({self.neither_student_fallback} student fallbacks); "
             f"agreement={self.agreement:.1%} overlap={self.overlap:.1%}"
         )
 
@@ -205,6 +236,9 @@ class WaldoCoverage:
     skip_status_mismatches: int = 0
     # Common entries both runs skipped, for different reasons.
     skip_reason_mismatches: int = 0
+    # Both runs ran, but the teacher ended MAX_LOOPS_EXHAUSTED or NO_SAMPLE. Left out of the match.
+    teacher_loop_exhaustion: int = 0
+    teacher_timeouts: int = 0
     teacher_skip_reasons: Mapping[str, int] = field(default_factory=dict)
     student_skip_reasons: Mapping[str, int] = field(default_factory=dict)
 
@@ -215,6 +249,9 @@ class EscalationMatchMetrics:
     escalation_match: float
     strict: EscalationConfusion = field(default_factory=EscalationConfusion)
     coverage: WaldoCoverage = field(default_factory=WaldoCoverage)
+    # The student's decision on every entry it has Waldo spans for, scored or not. A focused
+    # screen reads these against the parent teacher's decision, ignoring the teacher rerun.
+    student_decisions: Mapping[str, WaldoDecision] = field(default_factory=dict)
 
 
 class EvalRunEscalationMatchAnalysis(PairedRunAnalysis[EscalationMatchMetrics, EscalationMatchEntryMetrics]):
@@ -253,12 +290,16 @@ def parse_escalation_match_row(row: Mapping[str, Any]) -> EscalationMatchEntryMe
 def escalation_confusion(
     entries: Iterable[EscalationMatchEntryMetrics], decided: Callable[[WaldoDecision], bool]
 ) -> EscalationConfusion:
+    entries = list(entries)
     counts = Counter((decided(m.teacher), decided(m.student)) for m in entries)
     return EscalationConfusion(
         both=counts[(True, True)],
         teacher_only=counts[(True, False)],
         student_only=counts[(False, True)],
         neither=counts[(False, False)],
+        neither_student_fallback=sum(
+            1 for m in entries if not decided(m.teacher) and not decided(m.student) and m.student.outcome != ANSWERED
+        ),
     )
 
 
@@ -274,36 +315,44 @@ def summarize_coverage(entries: Sequence[EscalationMatchEntryMetrics]) -> WaldoC
             for m in common
             if m.teacher.skip_reason and m.student.skip_reason and m.teacher.skip_reason != m.student.skip_reason
         ),
+        teacher_loop_exhaustion=sum(1 for m in common if m.both_ran and m.teacher.termination == MAX_LOOPS_EXHAUSTED),
+        teacher_timeouts=sum(1 for m in common if m.both_ran and m.teacher.termination == NO_SAMPLE),
         teacher_skip_reasons=dict(Counter(m.teacher.skip_reason for m in common if m.teacher.skip_reason)),
         student_skip_reasons=dict(Counter(m.student.skip_reason for m in common if m.student.skip_reason)),
     )
 
 
 def aggregate_escalation_match_metrics(
-    per_entry: Mapping[str, EscalationMatchEntryMetrics], *, coverage: WaldoCoverage | None = None
+    per_entry: Mapping[str, EscalationMatchEntryMetrics],
+    *,
+    coverage: WaldoCoverage | None = None,
+    student_decisions: Mapping[str, WaldoDecision] | None = None,
 ) -> EscalationMatchMetrics:
-    strict = escalation_confusion(per_entry.values(), lambda d: d.escalated)
+    scored = [m for m in per_entry.values() if m.in_match]
+    strict = escalation_confusion(scored, lambda d: d.escalated)
     return EscalationMatchMetrics(
-        compared_entries=len(per_entry),
-        escalation_match=strict.agreement,
+        compared_entries=len(scored),
+        escalation_match=sum(m.escalation_match for m in scored) / len(scored) if scored else 0.0,
         strict=strict,
         coverage=coverage or WaldoCoverage(),
+        student_decisions=dict(student_decisions or {}),
     )
 
 
 def escalation_mismatch_pair(teacher_termination: Any, student_termination: Any) -> tuple[str, str] | None:
-    """``(teacher, student)`` terminations when exactly one run escalated, else ``None``.
+    """``(teacher, student)`` terminations when the student did not make the teacher's decision.
 
-    Teacher ``MAX_LOOPS_EXHAUSTED`` is not a decision to answer. The entry still scores as a
-    mismatch when the student escalated, but it is not a reflection example.
+    That is the student not escalating where the teacher escalated, or not answering where the
+    teacher did not: a student fallback is a mismatch either way. A teacher that ran out of loops
+    or timed out made no decision to answer or hand off, so the entry is not scored and is not a
+    reflection example.
     """
     teacher = str(teacher_termination or "")
     student = str(student_termination or "")
-    if teacher == MAX_LOOPS_EXHAUSTED:
+    if not teacher or not student or teacher in UNSCORED_TEACHER_TERMINATIONS:
         return None
-    if (teacher == SAW_INSUFFICIENT_TOOLS) == (student == SAW_INSUFFICIENT_TOOLS):
-        return None
-    return teacher, student
+    agrees = student == SAW_INSUFFICIENT_TOOLS if teacher == SAW_INSUFFICIENT_TOOLS else student == SAW_READY
+    return None if agrees else (teacher, student)
 
 
 # ---------------------------------------------------------------------------
@@ -413,15 +462,20 @@ def fetch_eval_run_escalation_match_analysis(
     # Waldo's decision and the user query are the evidence; no tool payloads are hydrated.
     del evalcli, include_action_inputs
     coverage: dict[str, WaldoCoverage] = {}
+    student_decisions: dict[str, WaldoDecision] = {}
 
     def keep_both_ran(rows: Rows) -> Rows:
         parsed = [parse_escalation_match_row(row) for row in rows]
-        coverage["value"] = summarize_coverage([m for m in parsed if m is not None])
-        return [row for row, m in zip(rows, parsed, strict=True) if m is not None and m.both_ran]
+        entries = [m for m in parsed if m is not None]
+        coverage["value"] = summarize_coverage(entries)
+        student_decisions.update({m.entry_id: m.student for m in entries if m.student.present})
+        return [row for row, m in zip(rows, parsed, strict=True) if m is not None and m.in_match]
 
     def aggregate(per_entry: Mapping[str, EscalationMatchEntryMetrics], dropped: int) -> EscalationMatchMetrics:
         del dropped
-        return aggregate_escalation_match_metrics(per_entry, coverage=coverage.get("value"))
+        return aggregate_escalation_match_metrics(
+            per_entry, coverage=coverage.get("value"), student_decisions=student_decisions
+        )
 
     analysis = fetch_agentspan_analysis(
         client,
@@ -488,17 +542,20 @@ def interleave_mismatch_groups(
 SCORE_MODEL_NOTE = (
     "HOW THE SCORE IS DECIDED. Waldo either answers with its attached tools or escalates to the full "
     "agent by calling discover, which ends it with SAW_INSUFFICIENT_TOOLS. An entry scores 1 when the "
-    "student makes the same escalation decision as the teacher: both escalate, or neither does. "
-    "Answering (SAW_READY) and ending any other way (NO_SAMPLE timeouts, MAX_LOOPS_EXHAUSTED, "
-    "NO_TOOL_CALLS) both count as not escalating, so running out of loops or time is never a correct "
-    "escalation even though the request reaches the full agent. Entries where Waldo was skipped are "
-    "not scored. Answer quality, which attached tool was used, and how many loops ran do not count; "
-    "the only lever is when this section tells Waldo to call discover."
+    "student makes the teacher's decision: it escalates where the teacher escalated, and answers "
+    "(SAW_READY) where the teacher did not. Ending any other way (NO_SAMPLE timeouts, NO_TOOL_CALLS, or "
+    "the student running out of loops) is a fallback, not a decision, so it scores 0 whichever way the "
+    "teacher went, even though the request reaches the full agent. A teacher that ran out of loops or "
+    "timed out made no decision to answer or hand off, so that entry is left out of the match. Entries "
+    "where Waldo was skipped are not scored. Answer quality and which attached tool was used do not "
+    "count. Loop count counts only through the budget: Waldo has 3 turns, so a rule that keeps it "
+    "searching past that turns an answer or an escalation into a fallback."
 )
 
 EDIT_EFFECTIVENESS_NOTE = (
-    "WHAT KIND OF EDIT WORKS. Mismatches go both ways: under-escalation (teacher escalated, student "
-    "did not) and over-escalation (student escalated, teacher did not). Tally them separately. A rule "
+    "WHAT KIND OF EDIT WORKS. Mismatches come in three kinds: under-escalation (teacher escalated, "
+    "student did not), over-escalation (student escalated, teacher did not), and missed answer (teacher "
+    "answered, student fell back without escalating). Tally them separately. A rule "
     "changes the decision only if its trigger is visible in the request before any tool runs: the kind "
     "of lookup asked for, whether it needs reasoning across several sources, whether it asks for an "
     "action, analysis, or artifact the attached tools cannot produce. State the trigger and the "
@@ -520,12 +577,22 @@ ANALYSIS_PROCEDURE_NOTE = (
 
 ESCALATION_MATCH_GAP_ANALYSIS_GUIDE = "\n\n".join([SCORE_MODEL_NOTE, EDIT_EFFECTIVENESS_NOTE, ANALYSIS_PROCEDURE_NOTE])
 
+ESCALATION_GOAL = (
+    "Rewrite it so the student escalates on the kinds of request the teacher escalates on, and answers "
+    "the kinds it answers. State rules in terms of request type, never specific documents, people, or "
+    "customers from the examples. Keep the text operational and concise."
+)
+
 ESCALATION_TASK = (
     "This section decides when Waldo calls discover (escalate to the full agent) versus using the "
-    "attached search tools and answering directly. Rewrite it so the student escalates on the kinds "
-    "of request the teacher escalates on, and answers the kinds it answers. State rules in terms of "
-    "request type, never specific documents, people, or customers from the examples. Keep the text "
-    "operational and concise."
+    f"attached search tools and answering directly. {ESCALATION_GOAL}"
+)
+
+RESTATED_ROUTING_TASK = (
+    "These lines restate the routing decision after the routing core, and Waldo obeys whichever "
+    "restatement is strictest: a line here that sends a request to discover overrides an easy-lookup "
+    "rule in the routing core. Loosen or tighten them together with what the evidence shows, rather "
+    f"than adding exceptions elsewhere. {ESCALATION_GOAL}"
 )
 
 WALDO_ROUTING_FRAME = (
@@ -534,18 +601,43 @@ WALDO_ROUTING_FRAME = (
     "the Routing section. It has conditional branches, <<<[[has_search_tools]] ... >>> and "
     "<<<[[no_search_tools]] ... >>>; scio renders exactly one per request. Keep both branches and every "
     "[[...]] placeholder. The same routing rule is restated in several subsections; when you change "
-    "one, change every restatement so the prompt does not contradict itself. Sections after this one, "
-    "which you cannot edit, refer back to 'easy lookup' and to 'First-Action Decision' by name: keep "
+    "one, change every restatement so the prompt does not contradict itself. Sections after this one "
+    "are edited separately and refer back to 'easy lookup' and to 'First-Action Decision' by name: keep "
     "that term and heading. 'Source Selection for Easy Lookups' picks internal versus web search and "
     "does not affect escalation; leave it unchanged."
 )
 
-WALDO_ROUTING_RESPONSIBILITY = compose_responsibility(
-    WALDO_ROUTING_FRAME,
-    ESCALATION_TASK,
-    guide=ESCALATION_MATCH_GAP_ANALYSIS_GUIDE,
-    closing=GENERALITY_RULES,
+WALDO_SYSTEM_FRAME = (
+    "You are rewriting the Waldo router template. The routing core and the tool-usage section are "
+    "separate modules spliced in at their slots. The escalation decision is restated here in the "
+    "'### Available Tools' paragraph and in the closing 'Final Grounding Invariant', 'Final Routing "
+    "Invariant', and 'Final First-Action Check': each defines an easy lookup narrowly and sends every "
+    "other request, and every empty or incomplete retrieval, to discover. Those are the lines that move "
+    "escalation. Keep the term 'easy lookup' and the heading name 'First-Action Decision', which the "
+    "routing core defines. Response Guidelines, Citation Deduplication, Hallucination Prevention, "
+    "Confidentiality, User Information, 'Final Citation Audit', and 'Final Search-Call Validation' shape "
+    "the answer or the search call, not the escalation decision: leave them unchanged."
 )
+
+WALDO_TOOL_USAGE_FRAME = (
+    "You are rewriting the Waldo tool-usage section, spliced into the template under '### Tool Usage "
+    "Guidelines'. 'Glean Search Argument Construction' through 'Final validation before emitting the "
+    "call' builds search arguments and does not affect escalation: leave it unchanged. The escalation "
+    "lines come after it: the <<<[[has_search_tools]] ... >>> blocks that send an empty or irrelevant "
+    "internal result to discover, 'When a request routes to `discover`, call it immediately', "
+    "'Classification never changes after a tool result', and the 'Final output gate'. It has "
+    "conditional branches, <<<[[has_search_tools]] ... >>> and <<<[[no_search_tools]] ... >>>; keep "
+    "both, every [[...]] placeholder, and the term 'easy lookup'."
+)
+
+
+def _escalation_responsibility(frame: str, task: str) -> str:
+    return compose_responsibility(frame, task, guide=ESCALATION_MATCH_GAP_ANALYSIS_GUIDE, closing=GENERALITY_RULES)
+
+
+WALDO_ROUTING_RESPONSIBILITY = _escalation_responsibility(WALDO_ROUTING_FRAME, ESCALATION_TASK)
+WALDO_SYSTEM_RESPONSIBILITY = _escalation_responsibility(WALDO_SYSTEM_FRAME, RESTATED_ROUTING_TASK)
+WALDO_TOOL_USAGE_RESPONSIBILITY = _escalation_responsibility(WALDO_TOOL_USAGE_FRAME, RESTATED_ROUTING_TASK)
 
 
 def _role_outcome_phrase(termination: str) -> str:
@@ -564,7 +656,12 @@ def escalation_feedback(output: Mapping[str, Any]) -> str:
     student = str(output.get("student_waldo_termination") or "")
     if escalation_mismatch_pair(teacher, student) is None:
         return ""
-    direction = "Under-escalation" if teacher == SAW_INSUFFICIENT_TOOLS else "Over-escalation"
+    if teacher == SAW_INSUFFICIENT_TOOLS:
+        direction = "Under-escalation"
+    elif student == SAW_INSUFFICIENT_TOOLS:
+        direction = "Over-escalation"
+    else:
+        direction = "Missed answer"
     parts = [
         f"{direction}: the teacher {_role_outcome_phrase(teacher)} and the student {_role_outcome_phrase(student)}."
     ]
@@ -621,10 +718,13 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
         "Justification: escalation mismatches interleaved across (teacher, student) termination "
         "groups, most frequent first, up to the reflection cap, so over-escalation examples are "
         "not crowded out by the usually larger under-escalation group. Teacher MAX_LOOPS_EXHAUSTED "
-        "is omitted: running out of loops is not a decision to answer."
+        "and NO_SAMPLE are omitted: running out of loops or timing out is not a decision to answer, "
+        "so the entry is not scored."
     )
     module_responsibilities: ClassVar[Mapping[str, str]] = {
         WALDO_ROUTING_KEY: WALDO_ROUTING_RESPONSIBILITY,
+        WALDO_SYSTEM_KEY: WALDO_SYSTEM_RESPONSIBILITY,
+        WALDO_TOOL_USAGE_KEY: WALDO_TOOL_USAGE_RESPONSIBILITY,
     }
 
     def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1):
@@ -647,14 +747,16 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
         )
 
     def require_compared_entries(self, analysis: EvalRunEscalationMatchAnalysis) -> None:
-        """Reject a 0/0 comparison: no entry ran Waldo in both runs."""
+        """Reject a 0/0 comparison: no entry was scored."""
         if analysis.aggregate.compared_entries > 0:
             return
         coverage = analysis.aggregate.coverage
         reason = (
-            f"none of the {coverage.common_entries} common entries ran Waldo in both runs "
+            f"none of the {coverage.common_entries} common entries were scored "
             f"(teacher skips {dict(coverage.teacher_skip_reasons)}, student skips "
-            f"{dict(coverage.student_skip_reasons)}, incomplete {coverage.incomplete_entries})"
+            f"{dict(coverage.student_skip_reasons)}, incomplete {coverage.incomplete_entries}, "
+            f"teacher MAX_LOOPS_EXHAUSTED {coverage.teacher_loop_exhaustion}, "
+            f"teacher NO_SAMPLE {coverage.teacher_timeouts})"
             if coverage.common_entries
             else "wait for agentspan ingest or check that both runs enabled the Waldo router"
         )
@@ -668,7 +770,9 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
         coverage = aggregate.coverage
         print(
             f"[Escalation Match] {coverage.common_entries} common entries, {aggregate.compared_entries} "
-            f"both-ran, {coverage.unpaired_entries} in one run only, {coverage.incomplete_entries} incomplete"
+            f"scored, {coverage.teacher_loop_exhaustion} teacher MAX_LOOPS_EXHAUSTED and "
+            f"{coverage.teacher_timeouts} teacher NO_SAMPLE excluded, "
+            f"{coverage.unpaired_entries} in one run only, {coverage.incomplete_entries} incomplete"
         )
         print(
             f"[Escalation Match] Skip reasons: teacher {dict(coverage.teacher_skip_reasons)}, "
@@ -698,6 +802,41 @@ class EscalationMatchObjective(TeacherStudentObjective[EvalRunEscalationMatchAna
             1 for entry_id in requested_entry_ids if (m := analysis.per_entry.get(entry_id)) and m.escalation_match
         )
         return matching / len(requested_entry_ids)
+
+    def screen_reference(self, output: Mapping[str, Any]) -> str | None:
+        return str(output.get("teacher_waldo_termination") or "") or None
+
+    def focused_reference_pass_rate(
+        self,
+        analysis: EvalRunEscalationMatchAnalysis,
+        requested_entry_ids: Sequence[str],
+        references: Mapping[str, str],
+    ) -> float:
+        """Share of the parent's mismatches where the student now makes the parent teacher's decision."""
+        if not requested_entry_ids:
+            return 0.0
+        decisions = analysis.aggregate.student_decisions
+        if not any(entry_id in decisions for entry_id in requested_entry_ids):
+            raise NoComparedEntriesError(
+                f"No student Waldo decisions for any of the {len(requested_entry_ids)} screened entries in "
+                f"{analysis.student_eval_id}: wait for agentspan ingest or check the focused entry-id mapping."
+            )
+        # (fixed, total) per direction of the parent mismatch.
+        under, over = [0, 0], [0, 0]
+        for entry_id in requested_entry_ids:
+            reference = references.get(entry_id)
+            if reference is None:
+                continue
+            tally = under if reference == SAW_INSUFFICIENT_TOOLS else over
+            tally[0] += student_fixed(reference, decisions.get(entry_id))
+            tally[1] += 1
+        missing = sum(1 for entry_id in requested_entry_ids if entry_id not in decisions)
+        print(
+            f"[Escalation Match] Screen vs parent teacher: student fixed {under[0]}/{under[1]} under-escalations "
+            f"and {over[0]}/{over[1]} over-escalations; {missing} of {len(requested_entry_ids)} have no student "
+            "decision"
+        )
+        return (under[0] + over[0]) / len(requested_entry_ids)
 
     def aggregate_row(self, analysis: EvalRunEscalationMatchAnalysis, ctx: ScoringContext) -> ScoredRow:
         return ScoredRow(

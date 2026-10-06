@@ -81,15 +81,21 @@ def test_aggregate_reports_strict_confusion_over_both_ran_entries():
         _row("fallback", (RAN, "SAW_INSUFFICIENT_TOOLS"), (RAN, "MAX_LOOPS_EXHAUSTED")),
         _row("student-only", (RAN, "SAW_READY"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
         _row("neither", (RAN, "SAW_READY"), (RAN, "SAW_READY")),
+        # The teacher answered and the student fell back: neither escalated, but they do not agree.
+        _row("missed-answer", (RAN, "SAW_READY"), (RAN, "MAX_LOOPS_EXHAUSTED")),
     )
-    metrics = aggregate_escalation_match_metrics({m.entry_id: m for m in entries})
+    per_entry = {m.entry_id: m for m in entries}
+    metrics = aggregate_escalation_match_metrics(per_entry)
 
     strict = metrics.strict
-    assert (strict.both, strict.teacher_only, strict.student_only, strict.neither) == (1, 2, 1, 1)
-    assert strict.teacher_rate == pytest.approx(3 / 5)
-    assert strict.student_rate == pytest.approx(2 / 5)
-    assert metrics.escalation_match == pytest.approx(2 / 5)
+    assert (strict.both, strict.teacher_only, strict.student_only, strict.neither) == (1, 2, 1, 2)
+    assert strict.neither_student_fallback == 1
+    assert strict.teacher_rate == pytest.approx(3 / 6)
+    assert strict.student_rate == pytest.approx(2 / 6)
+    assert metrics.escalation_match == pytest.approx(2 / 6)
+    assert strict.agreement == metrics.escalation_match
     assert strict.overlap == pytest.approx(1 / 4)
+    assert not per_entry["missed-answer"].escalation_match and per_entry["neither"].escalation_match
     assert aggregate_escalation_match_metrics({}).escalation_match == 0.0
 
 
@@ -202,6 +208,50 @@ def test_rows_emit_only_the_strict_score_and_focused_rate_divides_by_request():
     assert objective.focused_pass_rate(analysis, ["e1", "e2", "missing"]) == pytest.approx(1 / 3)
 
 
+def test_focused_screen_scores_the_student_against_the_parent_teacher():
+    # Rerun pair: the teacher rerun is ignored, even where it ran out of loops or is absent.
+    analysis = _fetch(
+        _client(
+            _row("over-fixed", (RAN, "MAX_LOOPS_EXHAUSTED"), (RAN, "SAW_READY")),
+            _row("over-fallback", (RAN, "SAW_READY"), (RAN, "NO_SAMPLE")),
+            _row("over-kept", (RAN, "SAW_READY"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
+            _row("under-fixed", (None, None), (RAN, "SAW_INSUFFICIENT_TOOLS")),
+        )
+    )
+    objective = EscalationMatchObjective()
+    assert objective.screen_reference({"teacher_waldo_termination": "SAW_READY"}) == "SAW_READY"
+    assert objective.screen_reference({}) is None
+    references = {
+        "over-fixed": "SAW_READY",
+        "over-fallback": "NO_SAMPLE",
+        "over-kept": "SAW_READY",
+        "under-fixed": "SAW_INSUFFICIENT_TOOLS",
+        "missing": "SAW_READY",
+    }
+    # Fixed: answering where the parent teacher answered, escalating where it escalated. A
+    # student fallback is not an answer, and a requested entry with no student run is a miss.
+    rate = objective.focused_reference_pass_rate(analysis, list(references), references)
+    assert rate == pytest.approx(2 / 5)
+
+    with pytest.raises(NoComparedEntriesError, match="entry-id mapping"):
+        objective.focused_reference_pass_rate(analysis, ["missing"], {"missing": "SAW_READY"})
+
+
+def test_restated_routing_modules_point_the_reflector_at_their_discover_lines():
+    objective = EscalationMatchObjective()
+    system = objective.reflection_prompt("WALDO_SYSTEM")
+    for heading in (
+        "### Available Tools",
+        "Final Grounding Invariant",
+        "Final Routing Invariant",
+        "Final First-Action",
+    ):
+        assert heading in system
+    tool_usage = objective.reflection_prompt("WALDO_TOOL_USAGE")
+    assert "Final output gate" in tool_usage and "Classification never changes" in tool_usage
+    assert "Glean Search Argument Construction" in tool_usage
+
+
 def _trajectory(output: dict[str, Any], score: float) -> dict[str, Any]:
     return {
         "data": {"eval_set_name": "set", "eval_set_version": "1", "deployment_ids": ["scio-prod"]},
@@ -241,16 +291,26 @@ def test_reflective_feedback_names_the_direction_and_each_sides_waldo_summary():
         {},
     )
     assert over["Feedback"].startswith("Over-escalation: the teacher answered with its attached tools (SAW_READY)")
+    missed = objective.build_reflective_example(
+        "WALDO_ROUTING",
+        _trajectory(
+            {"teacher_waldo_termination": "SAW_READY", "student_waldo_termination": "MAX_LOOPS_EXHAUSTED"}, 0.0
+        ),
+        {},
+    )
+    assert missed["Feedback"].startswith("Missed answer: the teacher answered with its attached tools (SAW_READY)")
+    assert "ended with MAX_LOOPS_EXHAUSTED" in missed["Feedback"]
     prompt = objective.reflection_prompt("WALDO_ROUTING")
     assert WALDO_ROUTING_FRAME in prompt
     assert "SAW_INSUFFICIENT_TOOLS" in prompt
     assert "discover" in prompt
 
 
-def test_teacher_loop_exhaustion_stays_a_score_miss_and_leaves_the_reflection_set():
+def test_teacher_loop_exhaustion_and_timeouts_are_left_out_of_the_match():
     analysis = _fetch(
         _client(
             _row("loops", (RAN, "MAX_LOOPS_EXHAUSTED"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
+            _row("timeout", (RAN, "NO_SAMPLE"), (RAN, "NO_SAMPLE")),
             _row("answered", (RAN, "SAW_READY"), (RAN, "SAW_INSUFFICIENT_TOOLS")),
         )
     )
@@ -261,19 +321,25 @@ def test_teacher_loop_exhaustion_stays_a_score_miss_and_leaves_the_reflection_se
             analysis, focused=False, capture_traces=True, query="set:1", deployment_id="scio-prod"
         )
     }
-    assert rows["loops"].dimension_scores == {"escalation_match": 0.0}
+    for unscored in ("loops", "timeout"):
+        assert unscored not in analysis.per_entry and unscored not in rows
+    assert analysis.aggregate.compared_entries == 1
+    assert analysis.aggregate.coverage.teacher_loop_exhaustion == 1
+    assert analysis.aggregate.coverage.teacher_timeouts == 1
+    assert analysis.aggregate.escalation_match == 0.0
     assert analysis.high_signal_entry_ids == ("answered",)
-    assert not objective.is_high_signal(rows["loops"].output)
     assert objective.is_high_signal(rows["answered"].output)
 
 
 def test_mismatch_pair_and_reflection_selection_keep_the_rare_direction():
-    assert escalation_mismatch_pair("SAW_READY", "NO_SAMPLE") is None
+    assert escalation_mismatch_pair("SAW_READY", "SAW_READY") is None
+    assert escalation_mismatch_pair("SAW_READY", "NO_SAMPLE") == ("SAW_READY", "NO_SAMPLE")
     assert escalation_mismatch_pair("SAW_INSUFFICIENT_TOOLS", "SAW_READY") == ("SAW_INSUFFICIENT_TOOLS", "SAW_READY")
     assert escalation_mismatch_pair("", "") is None
-    # A teacher fallback is not a reflection example. A student fallback still is.
+    assert escalation_mismatch_pair("SAW_READY", "") is None
+    # Teacher loop exhaustion and timeouts are not scored or reflected. A student fallback still is.
     assert escalation_mismatch_pair("MAX_LOOPS_EXHAUSTED", "SAW_INSUFFICIENT_TOOLS") is None
-    assert escalation_mismatch_pair("NO_SAMPLE", "SAW_INSUFFICIENT_TOOLS") == ("NO_SAMPLE", "SAW_INSUFFICIENT_TOOLS")
+    assert escalation_mismatch_pair("NO_SAMPLE", "SAW_INSUFFICIENT_TOOLS") is None
     assert escalation_mismatch_pair("SAW_INSUFFICIENT_TOOLS", "MAX_LOOPS_EXHAUSTED") == (
         "SAW_INSUFFICIENT_TOOLS",
         "MAX_LOOPS_EXHAUSTED",

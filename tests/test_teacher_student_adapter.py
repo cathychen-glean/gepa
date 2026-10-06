@@ -13,6 +13,12 @@ from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.evalcli_client import CORRECTNESS_JUDGE_TYPE
 from glean_gepa.experiment_config import load_experiment_config, pairwise_judges
 from glean_gepa.judge_metrics_util import JUDGE_SPECS, JudgeAnalysis
+from glean_gepa.objectives.escalation_match import (
+    EscalationMatchObjective,
+    EvalRunEscalationMatchAnalysis,
+    aggregate_escalation_match_metrics,
+    classify_waldo_decision,
+)
 from glean_gepa.objectives.utils.core import NoComparedEntriesError
 from glean_gepa.objectives.tool_match import (
     TOOL_ALIGNMENT_OBJECTIVE,
@@ -532,6 +538,46 @@ def test_high_signal_eval_runs_teacher_and_student_on_focused_set():
         assert kwargs["eval_run_id"].startswith("gepa_high_signal_")
 
 
+def test_parent_reference_screen_reruns_only_the_student():
+    events: list[str] = []
+    evalcli = evalcli_with_ordered_events(events)
+    objective = EscalationMatchObjective()
+    adapter = teacher_student_adapter(
+        evalcli, objective=objective, primary_objective="escalation_match", student_model="claude_sonnet"
+    )
+    batch = [
+        {
+            **EVAL_SET,
+            "eval_entry_ids": ["p1"],
+            "focused_eval_set_name": "gepa-high-signal-glean-chat-v2-medium",
+            "focused_eval_set_version": "20260806_hs_abc",
+            "screen_references": {"p1": "SAW_READY"},
+            "cached_teacher_eval_run_id": "stale-teacher",
+        }
+    ]
+    analysis = EvalRunEscalationMatchAnalysis(
+        eval_ids=("", "student-1"),
+        start_date=date(2026, 10, 5),
+        end_date=date(2026, 10, 5),
+        aggregate=aggregate_escalation_match_metrics(
+            {}, student_decisions={"p1": classify_waldo_decision("ok", "SAW_READY")}
+        ),
+    )
+
+    with patch.object(adapter, "_get_or_fetch_analysis", return_value=analysis) as fetch:
+        result = adapter.evaluate(batch, {"WRITING_CODE": "test prompt"}, capture_traces=False)
+
+    _assert_all_creates_before_waits(events, n_creates=1, n_waits=1)
+    [created] = [call.kwargs for call in evalcli.create_eval_run.call_args_list]
+    assert created["eval_run_id"].startswith("gepa_high_signal_claude_sonnet_")
+    assert "stale-teacher" not in "".join(events)
+    assert fetch.call_args.args[0] == ""
+    assert result.eval_run_ids is not None
+    assert "teacher_eval_run_id" not in result.eval_run_ids[0]
+    assert result.summary is not None
+    assert result.summary["escalation_match"] == pytest.approx(1.0)
+
+
 def test_finish_focused_eval_uses_requested_entry_denominator():
     adapter = _teacher_student_adapter(MagicMock())
     analysis = EvalRunToolMatchAnalysis(
@@ -575,6 +621,50 @@ def test_finish_focused_eval_uses_requested_entry_denominator():
     assert result.summary["tool_alignment"] == pytest.approx(1 / 3)
     assert "avg_tool_levenshtein" not in result.summary
     assert [score["tool_alignment"] for score in result.objective_scores] == [1.0, 0.0]
+
+
+def test_escalation_screen_maps_parent_ids_and_scores_against_the_parent_teacher():
+    objective = EscalationMatchObjective()
+    adapter = teacher_student_adapter(MagicMock(), objective=objective, primary_objective="escalation_match")
+    parent = [
+        {
+            "data": EVAL_SET,
+            "output": {
+                "entry_id": entry_id,
+                "teacher_waldo_termination": teacher,
+                "student_waldo_termination": "SAW_INSUFFICIENT_TOOLS",
+            },
+            "score": 0.0,
+            "objective_scores": {"escalation_match": 0.0},
+        }
+        for entry_id, teacher in (("p1", "SAW_READY"), ("p2", "SAW_READY"))
+    ]
+    [screen] = adapter.high_signal_batch(
+        GleanEvaluationBatch(outputs=[], scores=[], trajectories=parent, objective_scores=[])
+    )
+    assert screen["screen_references"] == {"p1": "SAW_READY", "p2": "SAW_READY"}
+
+    # The rerun knows only the ids its upload minted. Its teacher ran out of loops on every
+    # entry, so the rerun pair compares nothing; the screen still scores the student.
+    student = {"r1": classify_waldo_decision("ok", "SAW_READY"), "r2": classify_waldo_decision("ok", "SAW_INSUFFICIENT_TOOLS")}
+    adapter._analysis_cache[("teacher-1", "student-1")] = EvalRunEscalationMatchAnalysis(
+        eval_ids=("teacher-1", "student-1"),
+        start_date=date(2026, 10, 5),
+        end_date=date(2026, 10, 5),
+        aggregate=aggregate_escalation_match_metrics({}, student_decisions=student),
+    )
+    result = adapter._finish_batch_evals(
+        [
+            _StartedPair(
+                al_data_inst={**screen, "focused_entry_ids": {"p1": "r1", "p2": "r2"}},
+                teacher_eval_id="teacher-1",
+                student_eval_id="student-1",
+            )
+        ],
+        capture_traces=True,
+    )
+    assert result.summary is not None
+    assert result.summary["escalation_match"] == pytest.approx(1 / 2)
 
 
 def test_finish_focused_eval_raises_when_no_entries_were_compared():
