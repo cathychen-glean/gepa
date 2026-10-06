@@ -10,7 +10,7 @@ import hashlib
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from glean_gepa.adapter_types import ALDataInst
@@ -32,6 +32,7 @@ class FocusedEvalSet:
     name: str
     version: str
     entry_count: int
+    entry_id_map: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -81,9 +82,42 @@ def prepare_high_signal_eval_batch(
                 "eval_set_version": focused.version,
                 "focused_eval_set_name": focused.name,
                 "focused_eval_set_version": focused.version,
+                "focused_entry_ids": dict(focused.entry_id_map),
             }
         )
     return prepared
+
+
+def focused_entry_id(data: Mapping[str, Any], source_entry_id: str) -> str:
+    """The id ``source_entry_id`` carries in the focused run; itself when no mapping was resolved."""
+    return str((data.get("focused_entry_ids") or {}).get(source_entry_id, source_entry_id))
+
+
+def _entry_query(entry: Mapping[str, Any]) -> str:
+    entry_input = entry.get("input")
+    raw = entry.get("query") or (entry_input.get("query") if isinstance(entry_input, Mapping) else None)
+    return str(raw).strip() if raw else ""
+
+
+def map_focused_entry_ids(
+    source_entries: Sequence[Mapping[str, Any]], focused_entries: Sequence[Mapping[str, Any]]
+) -> dict[str, str]:
+    """Pair each source entry with the focused entry that carries the same query.
+
+    Repeated queries pair in listing order. A source entry with no match is left out.
+    """
+    focused_by_query: dict[str, list[str]] = {}
+    for entry in focused_entries:
+        query, entry_id = _entry_query(entry), str(entry.get("id") or "")
+        if query and entry_id:
+            focused_by_query.setdefault(query, []).append(entry_id)
+    mapping: dict[str, str] = {}
+    for entry in source_entries:
+        source_id = str(entry.get("id") or "")
+        candidates = focused_by_query.get(_entry_query(entry))
+        if source_id and candidates:
+            mapping[source_id] = candidates.pop(0)
+    return mapping
 
 
 def resolve_eval_run_target(
@@ -317,7 +351,7 @@ def _find_ingested_focused_version(
     version_prefix: str,
     deployment_ids: list[str],
     min_count: int,
-) -> FocusedEvalSet | None:
+) -> tuple[str, list[dict[str, Any]]] | None:
     """Reuse a retry version that already ingested enough entries for this fingerprint."""
     for row in evalcli.list_eval_set_versions(eval_set_name=name, deployment_ids=deployment_ids):
         version = str(row.get("version") or "")
@@ -328,7 +362,7 @@ def _find_ingested_focused_version(
         )
         if len(entries) >= min_count:
             print(f"[Focused eval set] Reusing {name}:{version} with {len(entries)} entries")
-            return FocusedEvalSet(name, version, len(entries))
+            return version, entries
     return None
 
 
@@ -350,6 +384,30 @@ def ensure_focused_eval_set(
     name = focused_eval_set_name(base_eval_set_name)
     version = focused_eval_set_version(base_eval_set_version, entry_ids, bucket_type=bucket_type)
     min_count = min_ingested_eval_set_entries(len(entry_ids))
+    wanted = set(entry_ids)
+
+    def requested_sources() -> list[Mapping[str, Any]]:
+        listed = source_entries
+        if listed is None:
+            listed = evalcli.list_eval_set_entries(
+                eval_set_name=base_eval_set_name,
+                eval_set_version=base_eval_set_version,
+                deployment_ids=deployment_ids,
+            )
+        return [entry for entry in listed if str(entry.get("id") or "") in wanted]
+
+    def focused_set(
+        focused_version: str,
+        focused_entries: Sequence[Mapping[str, Any]],
+        sources: Sequence[Mapping[str, Any]],
+    ) -> FocusedEvalSet:
+        entry_id_map = map_focused_entry_ids(sources, focused_entries)
+        print(
+            f"[Focused eval set] Matched {len(entry_id_map)}/{len(entry_ids)} source entries "
+            f"to {name}:{focused_version} by query"
+        )
+        return FocusedEvalSet(name, focused_version, len(focused_entries), entry_id_map)
+
     existing = evalcli.get_eval_set_version(eval_set_name=name, eval_set_version=version)
     if existing is not None:
         existing_entries = evalcli.list_eval_set_entries(
@@ -357,7 +415,7 @@ def ensure_focused_eval_set(
         )
         if len(existing_entries) >= min_count:
             print(f"[Focused eval set] Reusing {name}:{version} with {len(existing_entries)} entries")
-            return FocusedEvalSet(name, version, len(existing_entries))
+            return focused_set(version, existing_entries, requested_sources())
         reused = _find_ingested_focused_version(
             evalcli,
             name=name,
@@ -366,17 +424,10 @@ def ensure_focused_eval_set(
             min_count=min_count,
         )
         if reused is not None:
-            return reused
+            return focused_set(*reused, requested_sources())
         version = focused_eval_set_retry_version(version)
 
-    if source_entries is None:
-        source_entries = evalcli.list_eval_set_entries(
-            eval_set_name=base_eval_set_name,
-            eval_set_version=base_eval_set_version,
-            deployment_ids=deployment_ids,
-        )
-    wanted = set(entry_ids)
-    selected = [entry for entry in source_entries if str(entry.get("id") or "") in wanted]
+    selected = requested_sources()
     if bucket_type == SESSION_BUCKET_TYPE:
         selected = _enrich_source_entries_with_tracking(
             selected,
@@ -447,7 +498,7 @@ def ensure_focused_eval_set(
     except EvalCliError as exc:
         print(f"[Focused eval set] {exc}")
         return None
-    return FocusedEvalSet(name, version, len(ingested))
+    return focused_set(version, ingested, selected)
 
 
 __all__ = [
@@ -463,8 +514,10 @@ __all__ = [
     "build_upload_entry",
     "build_upload_eval_set_request",
     "ensure_focused_eval_set",
+    "focused_entry_id",
     "focused_eval_set_name",
     "focused_eval_set_version",
+    "map_focused_entry_ids",
     "prepare_high_signal_eval_batch",
     "resolve_eval_run_target",
 ]

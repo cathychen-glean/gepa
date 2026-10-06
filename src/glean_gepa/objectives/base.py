@@ -422,6 +422,23 @@ class TeacherStudentObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     @abstractmethod
     def focused_pass_rate(self, analysis: AnalysisT, requested_entry_ids: Sequence[str]) -> float: ...
 
+    def screen_reference(self, output: Mapping[str, Any]) -> str | None:
+        """Label on a parent high-signal entry that the child's focused rerun is scored against.
+
+        ``None``, the default, scores the rerun pair with ``focused_pass_rate``. A label sends
+        the screen to ``focused_reference_pass_rate`` instead, so it does not depend on the
+        teacher's rerun.
+        """
+        del output
+        return None
+
+    def focused_reference_pass_rate(
+        self, analysis: AnalysisT, requested_entry_ids: Sequence[str], references: Mapping[str, str]
+    ) -> float:
+        """Score the student's rerun of ``requested_entry_ids`` against ``references`` from the parent run."""
+        del analysis, requested_entry_ids, references
+        raise NotImplementedError(f"{type(self).__name__} returns screen references but cannot score them")
+
     def scored_rows(
         self,
         analysis: AnalysisT,

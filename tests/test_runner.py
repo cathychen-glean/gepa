@@ -240,10 +240,11 @@ def test_routing_module_fits_its_budget_and_triggers_the_waldo_override():
 
     defaults = runner_arg_defaults(load_experiment_config("teacher_student_waldo_escalation"))
     assert Path(defaults["seed_candidate"]) == Path("data/waldo_routing_seed_candidate.json")
-    assert defaults["editable_modules"] == WALDO_ROUTING_KEY
-    seed = _seed_for_editable_modules(routing, [WALDO_ROUTING_KEY])
-    frozen = sum(len(seed[key]) // 4 for key in (WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY))
-    assert frozen + WALDO_ROUTING_TOKEN_BUDGET < defaults["global_token_cap"]
+    editable = [WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY]
+    assert defaults["editable_modules"] == ",".join(editable)
+    seed = _seed_for_editable_modules(routing, editable)
+    assert seed == {**routing, FULL_PROMPT_KEY: seed[FULL_PROMPT_KEY]}
+    assert sum(len(seed[key]) // 4 for key in editable) < defaults["global_token_cap"]
 
 
 @pytest.mark.parametrize(

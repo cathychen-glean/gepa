@@ -59,6 +59,8 @@ class EvalSetALDataInst(TypedDict):
     eval_entry_ids: NotRequired[list[str]]
     focused_eval_set_name: NotRequired[str]
     focused_eval_set_version: NotRequired[str]
+    focused_entry_ids: NotRequired[dict[str, str]]
+    screen_references: NotRequired[dict[str, str]]
 
 
 class SingleModelALDataInst(EvalSetALDataInst):
