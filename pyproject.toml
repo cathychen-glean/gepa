@@ -106,7 +106,7 @@ langchain = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-glean_gepa = ["configs/*.yaml", "configs/packs/*.yaml"]
+glean_gepa = ["configs/*.yaml", "configs/packs/*.yaml", "prompts/*/target.yaml", "prompts/*/template.prompt"]
 
 [tool.uv.sources]
 # Built from the in-repo distribution until it is published to glean-pip; the

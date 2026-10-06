@@ -19,14 +19,13 @@ from glean_gepa.prompt import (
     tool_description_override_key,
 )
 from glean_gepa.prompt_constants import (
-    CORE_TOOL_DESCRIPTIONS,
     CORE_TOOLS,
     EXECUTION_DISCIPLINE_KEY,
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     WRITING_CODE_KEY,
-    WRITING_CODE_TOKEN_BUDGET,
 )
+from glean_gepa.prompt_targets import module_token_budget, stock_text
 from glean_gepa.reflection_prompts import parse_chosen_tool_keys
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 from glean_gepa.objectives.registry import BUILTIN_OBJECTIVES
@@ -63,16 +62,18 @@ from glean_gepa.prompt import (
     tool_description_override_key,
 )
 from glean_gepa.prompt_constants import (
-    CORE_TOOL_DESCRIPTIONS,
     CORE_TOOLS,
     EXECUTION_DISCIPLINE_KEY,
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     WRITING_CODE_KEY,
-    WRITING_CODE_TOKEN_BUDGET,
 )
 from glean_gepa.reflection_prompts import parse_chosen_tool_keys
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
+
+CORE_TOOL_DESCRIPTIONS = {key: stock_text(key) or "" for key in CORE_TOOLS}
+WRITING_CODE_TOKEN_BUDGET = module_token_budget(WRITING_CODE_KEY) or 0
+
 
 
 def test_tool_description_override_key_matches_sanitize_identifier_lower():

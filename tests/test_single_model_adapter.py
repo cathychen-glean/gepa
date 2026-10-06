@@ -312,6 +312,54 @@ def test_diagnosis_pass_is_reasked_when_the_reflector_returns_a_rewrite():
     assert variants == [rewrite]
 
 
+def test_reconcile_keeps_only_targeted_companion_edits():
+    """A companion that rewrites its module, breaks markup, or names an unknown module is dropped."""
+    lines = [f"- rule {index}: keep this line as it is." for index in range(10)]
+    system = "\n".join([*lines, "- Only an easy lookup may answer directly; send everything else to discover."])
+    tool_usage = "<<<[[has_search_tools]]\n- Empty internal results route to discover.\n>>>\n" + "\n".join(lines)
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+    )
+    candidate = Candidate(
+        model="fast",
+        prompt_modules={"ROUTING": "- Escalate analysis requests.", "SYSTEM": system, "TOOLS": tool_usage},
+        module_specs={name: ModuleSpec(name, "free_text", 1024) for name in ("ROUTING", "SYSTEM", "TOOLS")},
+        global_token_cap=4096,
+        baseline_prompt_hash="seed",
+    )
+    fixed_system = system.replace("Only an easy lookup", "Single-source lookups")
+    replies = [
+        "===MODULE: SYSTEM===\nWHY: 'Only an easy lookup' restates the old narrow rule.\nTEXT:\n" + fixed_system + "\n"
+        "===MODULE: TOOLS===\nWHY: drops the branch.\nTEXT:\n- Empty internal results route to discover.\n"
+        "===MODULE: UNKNOWN===\nWHY: x\nTEXT:\nanything\n",
+        "===MODULE: SYSTEM===\nWHY: rewrite.\nTEXT:\n- A completely different module.\n",
+        "NONE",
+    ]
+    prompts: list[str] = []
+
+    def reflection_lm(prompt: str) -> str:
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    def reconcile() -> list[tuple[str, str, str]]:
+        edits = adapter.reconcile_other_modules(
+            reflection_lm,
+            candidate,
+            module_name="ROUTING",
+            new_text="- Answer single-source lookups directly.",
+            diagnosis="under-escalation: 3 of 5",
+            others=["SYSTEM", "TOOLS"],
+        )
+        return [(edit.module, edit.text, edit.why) for edit in edits]
+
+    assert reconcile() == [("SYSTEM", fixed_system, "'Only an easy lookup' restates the old narrow rule.")]
+    assert "+- Answer single-source lookups directly." in prompts[0] and "under-escalation: 3 of 5" in prompts[0]
+    assert reconcile() == []
+    assert reconcile() == []
+
+
 def test_high_signal_evaluation_runs_the_uploaded_focused_eval_set():
     evalcli = EvalCliClient(binary="/fake/evalcli")
     adapter = SingleModelAdapter(

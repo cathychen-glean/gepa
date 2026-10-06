@@ -29,10 +29,11 @@ from glean_gepa.al_adapter import (
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
-from glean_gepa.prompt_constants import CORE_TOOL_KEYS, PROMPT_MODULE_DEFAULTS
-from glean_gepa.reflection_prompts import parse_chosen_tool_keys, tool_description_choice_prompt
+from glean_gepa.prompt_constants import CORE_TOOL_KEYS
+from glean_gepa.prompt_targets import stock_text
+from glean_gepa.reflection_prompts import ReconcileEdit, parse_chosen_tool_keys, tool_description_choice_prompt
 from glean_gepa.run_log import format_child_proposal_report, format_screening_report, log_section
-from glean_gepa.utils import apply_single_module_edit
+from glean_gepa.utils import apply_module_edits
 
 HIGH_SIGNAL_FIX_RATE_THRESHOLD = 0.5
 SKIP_CHILD_SCREENING_KINDS = frozenset({"none", "skip"})
@@ -161,9 +162,7 @@ def modules_after_tool_choice(
         )
     if not evidenced:
         return non_core
-    descriptions = {
-        module: parent.prompt_modules.get(module) or PROMPT_MODULE_DEFAULTS.get(module, "") for module in evidenced
-    }
+    descriptions = {module: parent.prompt_modules.get(module) or stock_text(module) or "" for module in evidenced}
     raw = reflection_llm(
         tool_description_choice_prompt(
             tools=descriptions,
@@ -219,10 +218,12 @@ def make_children_for_generation(
     reflection_hamming_distance_k: int | None = None,
     children_by_root: dict[str, list[Candidate]] | None = None,
 ) -> list[Candidate]:
-    """Create children by applying reflection-generated edits to one module.
+    """Create children, each built around one reflection-generated module edit.
 
-    Offspring slots are split evenly across frontier parents. When the count
-    does not divide evenly, the higher-scoring parents get the extra slots.
+    A child rewrites one module, and also any lines in the other editable modules
+    that the reflector says contradict that rewrite. Offspring slots are split
+    evenly across frontier parents. When the count does not divide evenly, the
+    higher-scoring parents get the extra slots.
     ``children_by_root`` retains the children already reflected from a parent.
     Reusing those candidates is intentional: a root's traces and prompt are
     unchanged while it remains on the frontier, so reflecting on it again only
@@ -319,11 +320,25 @@ def make_children_for_generation(
                 continue
             variants_by_module[module] = list(variants)
 
+        companion_pool = [module for module in adapter.editable_modules if module not in CORE_TOOL_KEYS]
         added = 0
         for module, variant in _round_robin_variants(modules_this_round, variants_by_module):
             if added >= slot_budget or len(children) >= offspring_count:
                 break
-            child = apply_single_module_edit(parent, module, variant)
+            # One child, one goal: the primary edit, plus only the lines elsewhere that the
+            # reflector says contradict it. Nothing else rides along.
+            companions: list[ReconcileEdit] = []
+            others = [other for other in companion_pool if other != module and other in parent.prompt_modules]
+            if others:
+                companions = adapter.reconcile_other_modules(
+                    reflection_llm,
+                    parent,
+                    module_name=module,
+                    new_text=variant,
+                    diagnosis=diagnosis_by_module.get(module, ""),
+                    others=others,
+                )
+            child = apply_module_edits(parent, {module: variant, **{edit.module: edit.text for edit in companions}})
             if not append_child(child):
                 continue
             added += 1
@@ -331,14 +346,19 @@ def make_children_for_generation(
                 existing.prompt_modules != child.prompt_modules for existing in cached_children
             ):
                 cached_children.append(child)
+            edited = [module, *(edit.module for edit in companions)]
+            justification = diagnosis_by_module.get(module, "").strip()
+            if companions:
+                reconciled = "\n".join(f"- {edit.module}: {edit.why or '(no reason given)'}" for edit in companions)
+                justification = f"{justification}\n\nReconciled conflicting lines:\n{reconciled}".strip()
             log_section(
                 f"CHILD PROPOSAL {child.candidate_id}",
                 format_child_proposal_report(
                     parent_id=parent.candidate_id,
                     child_id=child.candidate_id,
-                    module=module,
-                    delta=_format_child_delta(parent, child, module),
-                    justification=diagnosis_by_module.get(module, ""),
+                    module=", ".join(edited),
+                    delta="\n".join(_format_child_delta(parent, child, name) for name in edited),
+                    justification=justification,
                 ),
             )
         return added
@@ -769,7 +789,7 @@ class EvolutionaryProposer:
         """Convert a GEPA program into adapter-editable Glean prompt modules."""
         prompt_modules = dict(program)
         for key in self.module_specs:
-            default = PROMPT_MODULE_DEFAULTS.get(key)
+            default = stock_text(key)
             if default is not None:
                 prompt_modules.setdefault(key, default)
         content = json.dumps(prompt_modules, sort_keys=True)

@@ -48,6 +48,9 @@ class _ReflectionAdapter:
         self.reflection_calls += 1
         return self.variants, None, ""
 
+    def reconcile_other_modules(self, *_args: object, **_kwargs: object) -> list[object]:
+        return []
+
 
 class _Evaluation:
     def __init__(self) -> None:
@@ -230,6 +233,51 @@ def test_offspring_slots_are_shared_round_robin_across_modules(monkeypatch) -> N
     assert children[0].prompt_modules["EXECUTION_DISCIPLINE"] == "EXECUTION_DISCIPLINE v1"
     assert children[4].prompt_modules["EXECUTION_DISCIPLINE"] == "EXECUTION_DISCIPLINE v2"
     assert adapter.modules_reflected == ["EXECUTION_DISCIPLINE", "RULES_EXT", "glean_search", "glean_document_reader"]
+
+
+def test_a_child_carries_its_edit_plus_only_the_reconciled_conflicts() -> None:
+    """Each child has one primary edit; other modules change only where the reflector found a conflict."""
+    from glean_gepa.reflection_prompts import ReconcileEdit
+
+    class _ReconcilingAdapter(_MultiModuleAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.editable_modules = ["WALDO_ROUTING", "WALDO_SYSTEM", "WALDO_TOOL_USAGE"]
+            self.reconciled: list[tuple[str, tuple[str, ...]]] = []
+
+        def reconcile_other_modules(self, _llm, _parent, *, module_name, new_text, diagnosis, others):
+            self.reconciled.append((new_text, tuple(others)))
+            assert diagnosis == f"diagnosis for {module_name}"
+            if new_text == "WALDO_ROUTING v1":
+                return [ReconcileEdit("WALDO_SYSTEM", "system aligned with routing v1", "restated the old rule")]
+            return []
+
+    adapter = _ReconcilingAdapter()
+    root = Candidate(
+        model="test",
+        prompt_modules=dict.fromkeys(adapter.editable_modules, "original"),
+        module_specs={module: ModuleSpec(module, "free_text", 100) for module in adapter.editable_modules},
+        global_token_cap=1000,
+        baseline_prompt_hash="baseline",
+        candidate_id="root",
+    )
+
+    children = make_children_for_generation(
+        adapter, [root], {root.candidate_id: _Evaluation()}, reflection_llm=object(), offspring_count=2
+    )
+
+    assert [child.prompt_modules for child in children] == [
+        {
+            "WALDO_ROUTING": "WALDO_ROUTING v1",
+            "WALDO_SYSTEM": "system aligned with routing v1",
+            "WALDO_TOOL_USAGE": "original",
+        },
+        {"WALDO_ROUTING": "original", "WALDO_SYSTEM": "WALDO_SYSTEM v1", "WALDO_TOOL_USAGE": "original"},
+    ]
+    assert adapter.reconciled == [
+        ("WALDO_ROUTING v1", ("WALDO_SYSTEM", "WALDO_TOOL_USAGE")),
+        ("WALDO_SYSTEM v1", ("WALDO_ROUTING", "WALDO_TOOL_USAGE")),
+    ]
 
 
 class _ScoredEvaluation(_Evaluation):

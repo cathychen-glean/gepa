@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 from datetime import date, timedelta
-from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 from gepa.core.data_loader import ListDataLoader
@@ -14,29 +13,19 @@ from glean_gepa.evalcli_client import (
 from glean_gepa.evalset_policy import UnseenEvalSetPolicy
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES
 from glean_gepa.experiment_config import load_experiment_config, runner_arg_defaults
-from glean_gepa.prompt import compile_system_prompt, compile_waldo_system_override, materialize_system_prompt
+from glean_gepa.prompt import compile_encoded_prompt
 from glean_gepa.prompt_constants import (
     CORE_TOOLS,
     CORE_TOOLS_GROUP,
-    DEFAULT_EXECUTION_DISCIPLINE,
-    DEFAULT_FULL_PROMPT,
-    DEFAULT_WRITING_CODE,
     EXECUTION_DISCIPLINE_KEY,
     FULL_PROMPT_KEY,
-    MODULE_TOKEN_BUDGETS,
-    PROMPT_MODULE_DEFAULTS,
     RULES_EXT_KEY,
-    WRITING_CODE_KEY,
-)
-from glean_gepa.waldo_prompt_constants import (
-    DEFAULT_WALDO_ROUTING,
     WALDO_ROUTING_KEY,
-    WALDO_ROUTING_SLOT,
-    WALDO_ROUTING_TOKEN_BUDGET,
     WALDO_SYSTEM_KEY,
     WALDO_TOOL_USAGE_KEY,
-    compile_waldo_system_prompt,
+    WRITING_CODE_KEY,
 )
+from glean_gepa.prompt_targets import compile_prompt_text, stock_text
 from glean_gepa.runner import (
     CUSTOMER_DEPLOYMENTS_FILENAME,
     CUSTOMER_EVAL_DEPLOYMENT_IDS,
@@ -77,37 +66,46 @@ SEED_WITH_RULES_SLOT = {**SEED_BOTH, "WRITING_CODE": "patterns\n{RULES_EXT}"}
 _PINNED_EXECUTION_DISCIPLINE = {FULL_PROMPT_KEY: "PREFIX\n### Execution Discipline\n- Answer fast.\nSUFFIX"}
 
 
-def test_compile_and_materialize_prompt_modules():
+def _coding(candidate: dict[str, str]) -> str:
+    return compile_prompt_text("coding_agent_loop_system", candidate)
+
+
+def _waldo(candidate: dict[str, str]) -> str:
+    return compile_prompt_text("waldo_system", candidate)
+
+
+def test_compile_prompt_modules():
     """Writing Code and Execution Discipline splice into FULL_PROMPT; empty
     discipline falls back so the heading is never bare."""
-    assert compile_system_prompt(SEED_BOTH) == "PREFIX\npatterns\nSUFFIX"
+    assert _coding(SEED_BOTH) == "PREFIX\npatterns\nSUFFIX"
 
-    stock = compile_system_prompt({WRITING_CODE_KEY: "CUSTOM_PATTERNS"})
-    assert "CUSTOM_PATTERNS" in stock
-    assert DEFAULT_WRITING_CODE not in stock
-    assert "{WRITING_CODE}" not in stock
+    stock_writing_code = stock_text(WRITING_CODE_KEY) or ""
+    custom = _coding({WRITING_CODE_KEY: "CUSTOM_PATTERNS"})
+    assert "CUSTOM_PATTERNS" in custom
+    assert stock_writing_code not in custom
+    assert "{WRITING_CODE}" not in custom
 
-    assert compile_system_prompt({}) == DEFAULT_FULL_PROMPT.replace(
-        "{EXECUTION_DISCIPLINE}", DEFAULT_EXECUTION_DISCIPLINE
-    )
-    assert (
-        compile_system_prompt({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"}) == "PREFIX\n{WRITING_CODE}\nSUFFIX"
-    )
+    stock_template = stock_text(FULL_PROMPT_KEY) or ""
+    assert "{WRITING_CODE}" in stock_template and "{EXECUTION_DISCIPLINE}" in stock_template
+    assert "{RULES_EXT}" in stock_writing_code
+    assert _coding({}) == stock_template.replace(
+        "{EXECUTION_DISCIPLINE}", stock_text(EXECUTION_DISCIPLINE_KEY) or ""
+    ).replace("{WRITING_CODE}", stock_writing_code.replace("{RULES_EXT}\n", ""))
+    # A pinned template without WRITING_CODE in the candidate still gets stock Writing Code.
+    pinned = _coding({FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX"})
+    assert pinned.startswith("PREFIX\n" + stock_writing_code.split("\n", 1)[0])
+    assert "{WRITING_CODE}" not in pinned and "{RULES_EXT}" not in pinned
 
-    prompt = materialize_system_prompt({})
-    assert prompt == DEFAULT_FULL_PROMPT.replace("{WRITING_CODE}", DEFAULT_WRITING_CODE)
-    assert "{RULES_EXT}" in prompt
-
-    custom = compile_system_prompt({EXECUTION_DISCIPLINE_KEY: "- Keep working until the deliverable is complete."})
-    assert "- Keep working until the deliverable is complete." in custom
-    assert "{EXECUTION_DISCIPLINE}" not in custom
+    discipline = _coding({EXECUTION_DISCIPLINE_KEY: "- Keep working until the deliverable is complete."})
+    assert "- Keep working until the deliverable is complete." in discipline
+    assert "{EXECUTION_DISCIPLINE}" not in discipline
     for candidate in ({EXECUTION_DISCIPLINE_KEY: ""}, {EXECUTION_DISCIPLINE_KEY: "   \n"}):
-        assert DEFAULT_EXECUTION_DISCIPLINE in compile_system_prompt(candidate)
+        assert (stock_text(EXECUTION_DISCIPLINE_KEY) or "") in _coding(candidate)
 
 
-def test_compile_system_prompt_splices_rules_ext_after_rules():
+def test_compile_splices_rules_ext_after_rules():
     writing = "intro\n**Rules:**\n- stock rule\n{RULES_EXT}\n### Sandbox\n"
-    compiled = compile_system_prompt(
+    compiled = _coding(
         {
             WRITING_CODE_KEY: writing,
             FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX",
@@ -119,13 +117,11 @@ def test_compile_system_prompt_splices_rules_ext_after_rules():
         "- Prefer Write after retrieving sources.\n- Do not skip Write when the teacher writes."
         "\n### Sandbox\n\nSUFFIX"
     )
-    empty = compile_system_prompt(
-        {WRITING_CODE_KEY: writing, FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX", RULES_EXT_KEY: ""}
-    )
+    empty = _coding({WRITING_CODE_KEY: writing, FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX", RULES_EXT_KEY: ""})
     assert empty == "PREFIX\nintro\n**Rules:**\n- stock rule\n### Sandbox\n\nSUFFIX"
 
     # A rewritten Writing Code may reflow the slot; the literal token must never ship.
-    reflowed = compile_system_prompt(
+    reflowed = _coding(
         {
             WRITING_CODE_KEY: "intro\n**Rules:**\n- stock rule\n{RULES_EXT}  \n### Sandbox\n",
             FULL_PROMPT_KEY: "PREFIX\n{WRITING_CODE}\nSUFFIX",
@@ -136,35 +132,28 @@ def test_compile_system_prompt_splices_rules_ext_after_rules():
 
 
 def test_seed_for_editable_modules():
-    assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == {WRITING_CODE_KEY: "patterns"}
+    # Seed text for the template the editable module renders into is pinned with it.
+    assert _seed_for_editable_modules(SEED_BOTH, [WRITING_CODE_KEY]) == SEED_BOTH
 
     raw = {**SEED_BOTH, "glean_search": "Search less."}
-    frozen = _seed_for_editable_modules(SEED_BOTH, [])
-    assert frozen[FULL_PROMPT_KEY] == "PREFIX\npatterns\nSUFFIX"
-    assert WRITING_CODE_KEY not in frozen
-
     core_tool_seed = _seed_for_editable_modules(raw, ["glean_search", "discover"])
-    assert core_tool_seed["glean_search"] == "Search less."
-    assert core_tool_seed["discover"] == PROMPT_MODULE_DEFAULTS["discover"]
+    assert core_tool_seed == {"glean_search": "Search less.", "discover": stock_text("discover")}
 
     rules_seed = _seed_for_editable_modules({**SEED_WITH_RULES_SLOT, RULES_EXT_KEY: ""}, [RULES_EXT_KEY])
-    assert rules_seed[RULES_EXT_KEY] == ""
-    assert rules_seed[FULL_PROMPT_KEY] == "PREFIX\npatterns\n{RULES_EXT}\nSUFFIX"
+    assert rules_seed == {**SEED_WITH_RULES_SLOT, RULES_EXT_KEY: ""}
 
     defaulted = _seed_for_editable_modules({}, [WRITING_CODE_KEY, RULES_EXT_KEY])
-    assert defaulted[WRITING_CODE_KEY] == DEFAULT_WRITING_CODE
-    assert defaulted[RULES_EXT_KEY] == ""
-    assert FULL_PROMPT_KEY not in defaulted
+    assert defaulted == {WRITING_CODE_KEY: stock_text(WRITING_CODE_KEY), RULES_EXT_KEY: ""}
 
+    # Modules the seed file does not set compile from stock text, so they are not pinned.
     overridden = _seed_for_editable_modules({RULES_EXT_KEY: "- Prefer Write."}, [RULES_EXT_KEY])
-    assert overridden[RULES_EXT_KEY] == "- Prefer Write."
-    assert overridden[FULL_PROMPT_KEY] == materialize_system_prompt({})
+    assert overridden == {RULES_EXT_KEY: "- Prefer Write."}
+    assert "- Do not use OCR or image-processing scripts; use available tool_sdk tools.\n- Prefer Write.\n" in (
+        _coding(overridden)
+    )
 
     stock = _seed_for_editable_modules({}, [EXECUTION_DISCIPLINE_KEY])
-    assert stock[EXECUTION_DISCIPLINE_KEY] == DEFAULT_EXECUTION_DISCIPLINE
-    # WRITING_CODE is not editable here, so the frozen prompt must keep the slot open.
-    assert "{EXECUTION_DISCIPLINE}" in stock[FULL_PROMPT_KEY]
-    assert "{WRITING_CODE}" not in stock[FULL_PROMPT_KEY]
+    assert stock == {EXECUTION_DISCIPLINE_KEY: stock_text(EXECUTION_DISCIPLINE_KEY)}
 
 
 @pytest.mark.parametrize(
@@ -192,58 +181,26 @@ def test_parse_editable_modules():
         _parse_editable_modules(FULL_PROMPT_KEY)
 
 
-def _waldo_seed(name: str) -> dict[str, str]:
-    return json.loads((Path(__file__).resolve().parents[1] / "data" / name).read_text())
+def test_a_rewritten_waldo_routing_core_is_stripped_and_spliced_before_available_tools():
+    rewritten = {WALDO_ROUTING_KEY: "## Core Agent Behavior\nCall discover.  \n"}
+    assert "Call discover.\n\n### Available Tools" in _waldo(rewritten)
 
 
-def test_routing_seed_compiles_to_the_live_prompt():
-    legacy = _waldo_seed("waldo_seed_candidate.json")
-    routing = _waldo_seed("waldo_routing_seed_candidate.json")
-
-    assert routing[WALDO_SYSTEM_KEY].startswith(WALDO_ROUTING_SLOT + "\n\n### Available Tools")
-    assert routing[WALDO_ROUTING_KEY].startswith("## First-Action Decision")
-    assert routing[WALDO_TOOL_USAGE_KEY] == legacy[WALDO_TOOL_USAGE_KEY]
-    assert compile_waldo_system_prompt(routing) == compile_waldo_system_prompt(legacy)
-
-    compiled = compile_waldo_system_prompt({})
-    assert WALDO_ROUTING_SLOT not in compiled
-    assert compiled.startswith(DEFAULT_WALDO_ROUTING + "\n\n### Available Tools")
-
-    rewritten = {**routing, WALDO_ROUTING_KEY: "## First-Action Decision\nCall discover.  \n"}
-    assert "Call discover.\n\n### Available Tools" in compile_waldo_system_prompt(rewritten)
+def test_waldo_sections_must_keep_both_search_tool_conditionals():
+    stripped = {WALDO_TOOL_USAGE_KEY: (stock_text(WALDO_TOOL_USAGE_KEY) or "").replace("<<<[[no_search_tools]]", "<<<")}
+    with pytest.raises(SystemExit, match=r"seed WALDO_TOOL_USAGE is missing required scio markup: <<<\[\[no_search"):
+        _seed_for_editable_modules(stripped, [WALDO_TOOL_USAGE_KEY])
 
 
-def test_waldo_seed_pins_frozen_siblings_and_rejects_a_template_without_the_slot():
-    raw = _waldo_seed("waldo_routing_seed_candidate.json")
-    seed = _seed_for_editable_modules(raw, [WALDO_ROUTING_KEY])
-    assert seed[WALDO_SYSTEM_KEY] == raw[WALDO_SYSTEM_KEY]
-    assert seed[WALDO_ROUTING_KEY] == raw[WALDO_ROUTING_KEY]
-    assert seed[WALDO_TOOL_USAGE_KEY] == raw[WALDO_TOOL_USAGE_KEY]
+def test_waldo_configs_seed_from_the_scio_template_within_the_cap():
+    assert ",llmo.per_prompt_overrides.waldo_system=" in compile_encoded_prompt({WALDO_ROUTING_KEY: "route"})
 
-    legacy = _waldo_seed("waldo_seed_candidate.json")
-    tool_usage_seed = _seed_for_editable_modules(legacy, [WALDO_TOOL_USAGE_KEY])
-    assert WALDO_ROUTING_KEY not in tool_usage_seed
-    assert compile_waldo_system_prompt(tool_usage_seed) == compile_waldo_system_prompt(legacy)
-    with pytest.raises(
-        SystemExit, match=r"WALDO_ROUTING is editable but the seed WALDO_SYSTEM has no \{WALDO_ROUTING\}"
-    ):
-        _seed_for_editable_modules(legacy, [WALDO_ROUTING_KEY])
-
-
-def test_routing_module_fits_its_budget_and_triggers_the_waldo_override():
-    routing = _waldo_seed("waldo_routing_seed_candidate.json")
-    assert MODULE_TOKEN_BUDGETS[WALDO_ROUTING_KEY] == WALDO_ROUTING_TOKEN_BUDGET
-    assert len(routing[WALDO_ROUTING_KEY]) // 4 < WALDO_ROUTING_TOKEN_BUDGET
-    assert compile_waldo_system_override({WALDO_ROUTING_KEY: "route"}).startswith(
-        "llmo.per_prompt_overrides.waldo_system="
-    )
-
+    for config in ("teacher_student_waldo", "teacher_student_waldo_escalation"):
+        assert "seed_candidate" not in runner_arg_defaults(load_experiment_config(config))
     defaults = runner_arg_defaults(load_experiment_config("teacher_student_waldo_escalation"))
-    assert Path(defaults["seed_candidate"]) == Path("data/waldo_routing_seed_candidate.json")
     editable = [WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY]
     assert defaults["editable_modules"] == ",".join(editable)
-    seed = _seed_for_editable_modules(routing, editable)
-    assert seed == {**routing, FULL_PROMPT_KEY: seed[FULL_PROMPT_KEY]}
+    seed = _seed_for_editable_modules({}, editable)
     assert sum(len(seed[key]) // 4 for key in editable) < defaults["global_token_cap"]
 
 

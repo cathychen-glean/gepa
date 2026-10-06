@@ -36,10 +36,16 @@ class EvalHarness(NamedTuple):
 
     ``runner_type`` is the EvalCLI ``--runner-type`` (e.g. ``GLEAN_CHAT``). ``sc_params``
     replaces the model alias's base harness preset when set. ``None`` uses the alias default.
+
+    ``extra_sc_params`` and ``drop_sc_params`` come from the prompt targets a run edits
+    (``render:`` in their ``target.yaml``): entries added after the preset, and preset
+    entries removed, on every eval so those prompts render for teacher and student alike.
     """
 
     runner_type: str | None = None
     sc_params: str | None = None
+    extra_sc_params: tuple[str, ...] = ()
+    drop_sc_params: tuple[str, ...] = ()
 
 
 class EvalSetALDataInst(TypedDict):

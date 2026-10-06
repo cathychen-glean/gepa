@@ -20,6 +20,9 @@ uv sync --extra dev
   - `api.py` — wiring into the `gepa` engine
   - `evolutionary_proposer.py` — parent selection, reflection, child screening
   - `single_model_adapter.py`, `teacher_student_adapter.py` — the two evaluation paths
+  - `prompt_targets.py`, `prompts/<scio template>/` — each optimizable prompt as a marked
+    template plus `target.yaml` (sections, budgets, frames, render scParams)
+  - `harnesses.py` — Coding Harness and Waldo scParams presets and model routing
   - `configs/` — shipped experiment configs
 - `packages/glean-gepa-core/` — the pinned GEPA engine subset, imported as `gepa`
 - `tests/` — pytest test suite

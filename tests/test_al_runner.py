@@ -23,22 +23,26 @@ from glean_gepa.prompt import (
     tool_description_override_key,
 )
 from glean_gepa.prompt_constants import (
-    CORE_TOOL_DESCRIPTIONS,
     CORE_TOOLS,
     EXECUTION_DISCIPLINE_KEY,
     RULES_EXT_KEY,
     TOOL_DESCRIPTION_OVERRIDES_PARAM,
     WRITING_CODE_KEY,
-    WRITING_CODE_TOKEN_BUDGET,
 )
+from glean_gepa.prompt_targets import module_token_budget, stock_text
 from glean_gepa.reflection_prompts import parse_chosen_tool_keys
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
 from unittest.mock import MagicMock
 import pytest
 import yaml
 from glean_gepa.adapter_types import EvalHarness
-from glean_gepa.al_adapter import CODING_HARNESS_SC_PARAMS, ALRunner
+from glean_gepa.al_adapter import ALRunner
+from glean_gepa.coding_harness_params import CODING_HARNESS_SC_PARAMS
 from glean_gepa.experiment_config import ExperimentConfigError, eval_harness, load_experiment_config
+
+CORE_TOOL_DESCRIPTIONS = {key: stock_text(key) or "" for key in CORE_TOOLS}
+WRITING_CODE_TOKEN_BUDGET = module_token_budget(WRITING_CODE_KEY) or 0
+
 
 
 def _start(runner: ALRunner) -> tuple[str, bool]:
@@ -357,9 +361,9 @@ def test_eval_section_parsing_and_validation(tmp_path):
         return path
 
     harness = eval_harness(load_experiment_config(write({"runner_type": "GLEAN_CHAT_V2", "sc_params": "a=1,b=2"})))
-    assert harness == ("GLEAN_CHAT_V2", "a=1,b=2")
+    assert harness == EvalHarness("GLEAN_CHAT_V2", "a=1,b=2")
     harness = eval_harness(load_experiment_config(write({"sc_params": ["a=1", " b=2 "]})))
-    assert harness == (None, "a=1,b=2")
+    assert harness == EvalHarness(None, "a=1,b=2")
     with pytest.raises(ExperimentConfigError, match="key=value"):
         load_experiment_config(write({"sc_params": ["novalue"]}))
     with pytest.raises(ExperimentConfigError, match="unknown keys"):
@@ -385,6 +389,32 @@ def test_runner_passes_harness_to_evalcli_or_keeps_defaults():
     assert "runner_type" not in kwargs  # evalcli's own default applies
     assert kwargs["sc_params"].startswith(CODING_HARNESS_SC_PARAMS)
     assert kwargs["eval_params"].endswith("gleanchat_agent=FAST")
+
+
+def test_render_sc_params_edit_the_preset_and_key_the_cache():
+    """A prompt that needs extra scParams to render gets them on every eval, and
+    its evals never reuse runs created without them."""
+    evalcli = MagicMock()
+    evalcli.create_eval_run.return_value = "ev-render"
+    harness = EvalHarness(extra_sc_params=("co.lo.mo.slwo.enabled=1",), drop_sc_params=("co.lo.mo.slwo.disabled=1",))
+    runner = ALRunner(evalcli=evalcli, harness=harness)
+    plain = ALRunner(evalcli=MagicMock())
+
+    params = runner._build_sc_params("claude_opus", "llmo.per_prompt_overrides.x=abc")
+    assert "co.lo.mo.slwo.disabled=1" in CODING_HARNESS_SC_PARAMS
+    assert "co.lo.mo.slwo.disabled=1" not in params.split(",")
+    preset_tail = CODING_HARNESS_SC_PARAMS.split(",")[-1]
+    assert f"{preset_tail},co.lo.mo.slwo.enabled=1,co.lo.oai_model_for_agentic_loop=" in params
+    assert params.endswith(",llmo.per_prompt_overrides.x=abc")
+    assert plain._build_sc_params("claude_opus", "") == (
+        CODING_HARNESS_SC_PARAMS + ",co.lo.oai_model_for_agentic_loop=CLAUDE_5_OPUS"
+    )
+
+    prompt = "llmo.per_prompt_overrides.x=abc"
+    plain_key = ("fast", hashlib.md5(prompt.encode()).hexdigest()[:16], "set", "v1", "gepa", "scio-prod")
+    runner._eval_run_ids[plain_key] = "ev-plain"
+    runner._verified_eval_ids.add("ev-plain")
+    assert runner.start("fast", prompt, "set", "v1", ["scio-prod"])[0] == "ev-render"
 
 
 def test_waldo_runs_use_auto_agent_and_skip_pre_auto_cache():

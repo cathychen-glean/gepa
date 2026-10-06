@@ -15,7 +15,7 @@ from glean_gepa.adapter_types import ALDataInst
 from glean_gepa.al_adapter import MODULES, Candidate, GleanAdapterBase, ModuleSpec
 from glean_gepa.batch import GleanEvaluationBatch
 from glean_gepa.prompt_constants import WRITING_CODE_KEY
-from glean_gepa.reflection_prompts import FAKE_FLOW_RESPONSIBILITY
+from glean_gepa.reflection_prompts import FAKE_FLOW_RESPONSIBILITY, ReconcileEdit
 
 
 def fake_evalset(split: str = "train") -> list[ALDataInst]:
@@ -164,6 +164,9 @@ class FakeFlowAdapter(GleanAdapterBase):
         )
         print(f"[FAKE FLOW] proposing fake iteration={next_iteration}")
         return [rewritten], False, f"Advance fake-flow iteration marker to {next_iteration}."
+
+    def reconcile_other_modules(self, *_args: Any, **_kwargs: Any) -> list[ReconcileEdit]:
+        return []
 
     @staticmethod
     def _reflective_example(trajectory: dict[str, Any]) -> dict[str, Any]:
