@@ -143,6 +143,7 @@ Shipped experiments:
 | `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match. Weighted screen. |
 | `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
 | `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
+| `teacher_student_memory.yaml` | teacher_student | `agentic_preference_rate` | Memory + personalization prompt seeded from askscio/scio#299585. Example wiring, not yet run. |
 
 Sections:
 
@@ -173,6 +174,48 @@ Full-train evals and focused screen slices start only the judges the search
 reads: the primary, anything in `objective.composite`, and anything in
 `screening.weights`. A judge listed only under `objective.validation` (the Waldo
 correctness judge) therefore runs once per candidate, on the val eval.
+
+## Adding a prompt to optimize (`prompts/<name>/`)
+
+Each scio prompt GEPA can override is one folder under `src/glean_gepa/prompts/`, named
+after the scio template (`data/prompts/templates/<name>.prompt`). The compiled text is sent
+as `llmo.per_prompt_overrides.<name>`. `prompt_targets.py` loads every folder; nothing else
+needs a code change.
+
+1. Copy the scio template to `prompts/<name>/template.prompt` and wrap each editable span in
+   `{#KEY}` ... `{/KEY}` marker lines. Deleting the marker lines must give back the scio
+   file. Sections may nest; a bare `{KEY}` declares a section with empty stock text.
+2. Write `prompts/<name>/target.yaml`:
+
+   ```yaml
+   harnesses: [coding]          # harnesses that render this prompt: coding, waldo
+   template:
+     key: MY_PROMPT             # candidate key for the frame around the sections
+     editable: true             # false keeps the frame fixed
+   sections:
+     MY_SECTION:
+       token_budget: 512
+       frame: You are rewriting ...   # fixed editing contract shown to the reflector
+       required_placeholders: [user_name]   # [[...]] a rewrite must keep
+       required_conditionals: [has_search_tools]   # <<<[[...]] a rewrite must keep
+       # fill: verbatim         # default strips the text and falls back to stock when empty
+       # drop_empty_line: true  # an empty fill removes the slot's line
+   render:                      # scParams every eval in the run needs to render this prompt
+     sc_params: [co.lo.cao.use_stripped_prompts=1]
+     drop_sc_params: []         # preset entries to remove
+   ```
+
+3. Seed: a JSON object of keys, or a `.prompt` file marked like `template.prompt` (copy a
+   scio PR's version of the file and add markers, as in
+   `data/memory_personalization_seed.prompt`). Without a seed, stock text is the seed.
+4. Point a config's `reflection.editable_modules` at the section keys. An objective's
+   `module_responsibilities` or `reflection.modules.<KEY>` overrides the YAML frame.
+
+The runner refuses a section with no slot in the seed, a seed missing required markup, and
+a model whose harness never renders the prompt. Reflection rejects a variant that drops a
+slot, a conditional, or required markup. `coding_agent_loop_system` (Coding Harness),
+`core_tool_descriptions` (tool `schema.description` overrides), `waldo_system`, and
+`stripped_engram_memory_instructions` are the worked examples.
 
 ## Implementation rules
 

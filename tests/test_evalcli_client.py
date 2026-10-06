@@ -6,12 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from glean_gepa.al_adapter import (
-    AGENTIC_LOOP_MODEL_OVERRIDES,
-    AGENTIC_LOOP_REASONING_EFFORT,
-    CODING_HARNESS_SC_PARAMS,
-    ALRunner,
-)
+from glean_gepa.al_adapter import ALRunner
+from glean_gepa.coding_harness_params import CODING_HARNESS_SC_PARAMS
+from glean_gepa.harnesses import AGENTIC_LOOP_MODEL_OVERRIDES, AGENTIC_LOOP_REASONING_EFFORT
 from glean_gepa.bigquery_client import BigQueryClient, BigQueryError
 from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import (

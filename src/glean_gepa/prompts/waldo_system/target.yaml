@@ -1,0 +1,34 @@
+# Waldo, the lightweight router in front of the full agent (scio waldo_system.prompt). It
+# answers easy lookups with attached search tools and hands everything else to discover.
+#
+# Production Waldo evals do not run this stock text: they send a longer, hand-tuned prompt.
+# data/waldo_seed_candidate.json carries that live prompt split into WALDO_SYSTEM and
+# WALDO_TOOL_USAGE; data/waldo_routing_seed_candidate.json also splits out WALDO_ROUTING.
+# Seed from one of them when tuning for the Waldo team.
+harnesses: [waldo]
+
+template:
+  key: WALDO_SYSTEM
+  # Sized to the live prompt (6.3k full, 3.8k routing core, 1.7k tool-usage body) with
+  # headroom. A budget below the seed would reject the seed itself.
+  token_budget: 8192
+  frame: >-
+    You are editing the Waldo system prompt outside its routing core and tool-usage sections:
+    the available-tools note, response guidelines, hallucination and confidentiality rules,
+    and user information. Keep the {WALDO_ROUTING} and {WALDO_TOOL_USAGE} slots.
+
+# Scio picks one branch per request, so both search-tool conditionals must survive every
+# rewrite of a section.
+sections:
+  WALDO_ROUTING:
+    token_budget: 6144
+    required_conditionals: [has_search_tools, no_search_tools]
+    frame: >-
+      You are rewriting Waldo's routing core: everything that decides whether Waldo searches or
+      calls discover, up to '### Available Tools'.
+  WALDO_TOOL_USAGE:
+    token_budget: 2560
+    required_conditionals: [has_search_tools, no_search_tools]
+    frame: >-
+      You are rewriting the body under '### Tool Usage Guidelines'. The heading stays in the
+      template; do not add one.

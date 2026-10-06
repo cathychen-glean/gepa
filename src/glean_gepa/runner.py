@@ -16,7 +16,7 @@ from gepa.core.data_loader import ListDataLoader
 from gepa.core.state import FrontierType
 from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import StdOutLogger
-from glean_gepa.adapter_types import ALDataInst, JudgingMode
+from glean_gepa.adapter_types import ALDataInst, EvalHarness, JudgingMode
 from glean_gepa.al_adapter import (
     ALRunner,
     ModuleSpec,
@@ -47,33 +47,25 @@ from glean_gepa.experiment_config import (
     screening_weights,
 )
 from glean_gepa.fake_flow import build_fake_flow_components
+from glean_gepa.harnesses import harness_for_model
 from glean_gepa.judge_metrics_util import JUDGE_SPECS
 from glean_gepa.objectives import build_objective
 from glean_gepa.objectives.utils.agentspan_query import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
-from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt, materialize_system_prompt
-from glean_gepa.prompt_constants import (
-    CORE_TOOLS,
-    CORE_TOOLS_GROUP,
-    DEFAULT_FULL_PROMPT,
-    EDITABLE_PROMPT_KEYS,
-    EXECUTION_DISCIPLINE_KEY,
-    FULL_PROMPT_KEY,
-    KNOWN_PROMPT_KEYS,
-    MODULE_TOKEN_BUDGETS,
-    PROMPT_MODULE_DEFAULTS,
-    RULES_EXT_KEY,
-    WRITING_CODE_KEY,
+from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt
+from glean_gepa.prompt_constants import WRITING_CODE_KEY
+from glean_gepa.prompt_targets import (
+    PromptTargetError,
+    build_seed,
+    harness_requirements,
+    load_seed_file,
+    module_token_budget,
+    parse_editable_modules,
+    render_requirements,
 )
-from glean_gepa.reflection_prompts import conditional_counts
 from glean_gepa.run_log import capture_run_log, log_section
 from glean_gepa.single_model_adapter import SingleModelAdapter
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
-from glean_gepa.waldo_prompt_constants import (
-    DEFAULT_WALDO_SYSTEM,
-    WALDO_SLOT_MODULES,
-    WALDO_SYSTEM_KEY,
-)
 
 CACHE_DIRECTORY_NAME = "cache"
 ADAPTER_CACHE_FILENAME = "glean_adapter_cache.json"
@@ -132,98 +124,50 @@ def _default_cache_file(run_dir: Path | None, filename: str) -> Path | None:
     return cache_file
 
 
-def _load_seed_candidate(path: Path) -> dict[str, str]:
-    """Load prompt-module overrides. Omitted keys use ``PROMPT_MODULE_DEFAULTS``."""
-    if not path.is_file():
-        raise SystemExit(f"seed_candidate file not found: {path}")
-    raw = json.loads(path.read_text())
-    if not isinstance(raw, dict):
-        raise SystemExit("seed_candidate must be a JSON object")
-
-    unknown = set(raw) - KNOWN_PROMPT_KEYS
-    if unknown:
-        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
-        raise SystemExit(f"seed_candidate has unknown keys: {unknown_list}")
-
-    seed: dict[str, str] = {}
-    for key, value in raw.items():
-        if not isinstance(value, str):
-            raise SystemExit(f"{key} must be a string. Got type={type(value)}")
-        seed[key] = value
-    return seed
+def _load_seed_candidate(path: Path | None) -> dict[str, str]:
+    """Load prompt-module overrides from JSON or a marked ``.prompt``. Omitted keys use stock text."""
+    if path is None:
+        return {}
+    try:
+        return load_seed_file(path)
+    except PromptTargetError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _parse_editable_modules(raw: str) -> list[str]:
-    parts = [part.strip() for part in raw.split(",") if part.strip()]
-    if not parts:
-        raise SystemExit("editable_modules must list at least one prompt key")
-    modules: list[str] = []
-    unknown: list[str] = []
-    for part in parts:
-        if part == CORE_TOOLS_GROUP:
-            for key in CORE_TOOLS:
-                if key not in modules:
-                    modules.append(key)
-        elif part in EDITABLE_PROMPT_KEYS:
-            if part not in modules:
-                modules.append(part)
-        elif part == FULL_PROMPT_KEY:
-            raise SystemExit(
-                f"{FULL_PROMPT_KEY} is not editable: it is the render template. Edit a scoped "
-                f"module ({WRITING_CODE_KEY}, {RULES_EXT_KEY}, {EXECUTION_DISCIPLINE_KEY}, or core tools) instead."
-            )
-        else:
-            unknown.append(part)
-    if unknown:
-        unknown_list = ", ".join(sorted(repr(key) for key in unknown))
-        known_list = ", ".join(sorted([*EDITABLE_PROMPT_KEYS, CORE_TOOLS_GROUP]))
-        raise SystemExit(f"unknown editable_modules: {unknown_list}. Known keys: {known_list}")
-    return modules
+    try:
+        return parse_editable_modules([part.strip() for part in raw.split(",") if part.strip()])
+    except PromptTargetError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _seed_for_editable_modules(raw: dict[str, str], editable_modules: list[str]) -> dict[str, str]:
     """Build the GEPA candidate dict for the requested editable modules."""
-    seed: dict[str, str] = {key: raw.get(key, PROMPT_MODULE_DEFAULTS[key]) for key in editable_modules}
-    if WRITING_CODE_KEY not in editable_modules:
-        seed[FULL_PROMPT_KEY] = materialize_system_prompt(raw)
-    editable_waldo_slots = [key for key in editable_modules if key in WALDO_SLOT_MODULES]
-    if editable_waldo_slots:
-        # Pin the Waldo template so its slots are filled at compile time; a seed may override it.
-        seed.setdefault(WALDO_SYSTEM_KEY, raw.get(WALDO_SYSTEM_KEY, DEFAULT_WALDO_SYSTEM))
-        template = seed[WALDO_SYSTEM_KEY]
-        for key, (slot, _default) in WALDO_SLOT_MODULES.items():
-            if slot in template:
-                # Frozen sibling modules must come from the seed too, or compile falls back to stock text.
-                seed.setdefault(key, raw.get(key, PROMPT_MODULE_DEFAULTS[key]))
-        for key in editable_waldo_slots:
-            slot = WALDO_SLOT_MODULES[key][0]
-            if slot not in template:
+    try:
+        return build_seed(raw, editable_modules)
+    except PromptTargetError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _eval_harness_for(
+    experiment: ExperimentConfig | None,
+    editable_modules: Sequence[str],
+    models: Sequence[str],
+) -> EvalHarness:
+    """The ``eval:`` harness plus the scParams the edited prompts need to render.
+
+    Fails when a model runs a harness that never renders one of the edited prompts.
+    """
+    for target, harnesses in harness_requirements(editable_modules).items():
+        for model in models:
+            harness = harness_for_model(model).name
+            if harness not in harnesses:
                 raise SystemExit(
-                    f"{key} is editable but the seed {WALDO_SYSTEM_KEY} has no {slot} slot. "
-                    f"Add the slot to {WALDO_SYSTEM_KEY} in the seed file, or drop {key} from editable_modules."
+                    f"{target} renders under the {'/'.join(harnesses)} harness, but model {model!r} runs the "
+                    f"{harness} harness. Pick a matching model or drop {target} modules from editable_modules."
                 )
-            if not conditional_counts(seed[key]):
-                raise SystemExit(
-                    f"seed {key} has no <<<[[has_search_tools]]>>> / <<<[[no_search_tools]]>>> "
-                    "conditionals. Scio needs both to pick the right branch per request."
-                )
-    if RULES_EXT_KEY in editable_modules and "{RULES_EXT}" not in seed.get(
-        WRITING_CODE_KEY, seed.get(FULL_PROMPT_KEY, "")
-    ):
-        raise SystemExit(
-            f"{RULES_EXT_KEY} is editable but the seed prompt has no {{RULES_EXT}} slot. "
-            f"Add {{RULES_EXT}} to {WRITING_CODE_KEY} in the seed file, or drop {RULES_EXT_KEY} "
-            "from editable_modules."
-        )
-    template = seed.get(FULL_PROMPT_KEY, raw.get(FULL_PROMPT_KEY, DEFAULT_FULL_PROMPT))
-    if EXECUTION_DISCIPLINE_KEY in editable_modules and "{EXECUTION_DISCIPLINE}" not in template:
-        raise SystemExit(
-            f"{EXECUTION_DISCIPLINE_KEY} is editable but the seed prompt has no "
-            f"{{EXECUTION_DISCIPLINE}} slot. The seed file pins a {FULL_PROMPT_KEY} materialized "
-            f"before this slot existed: re-materialize it from stock text, or drop "
-            f"{EXECUTION_DISCIPLINE_KEY} from editable_modules."
-        )
-    return seed
+    extra, dropped = render_requirements(editable_modules)
+    return eval_harness(experiment)._replace(extra_sc_params=extra, drop_sc_params=dropped)
 
 
 def _make_reflection_lm(
@@ -826,8 +770,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--seed_candidate",
         type=Path,
-        help="JSON object of prompt-module overrides. Omitted keys use the Python defaults "
-        "in glean_gepa.prompt_constants (WRITING_CODE, FULL_PROMPT, RULES_EXT, core-tool descriptions).",
+        help="Prompt-module overrides: a JSON object, or a .prompt file marked with {#KEY}...{/KEY}. "
+        "Omitted keys (or no file) use the stock text in glean_gepa/prompts/.",
     )
     parser.add_argument("--max_metric_calls", type=int, default=10)
     parser.add_argument("--run_dir", type=Path, default=None)
@@ -959,8 +903,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--editable_modules",
         default=WRITING_CODE_KEY,
         help=(
-            "Comma-separated prompt keys to edit (WRITING_CODE, CORE_TOOLS, RULES_EXT, "
-            "EXECUTION_DISCIPLINE, or individual core-tool keys)."
+            "Comma-separated prompt keys to edit: any section declared under glean_gepa/prompts/ "
+            "(WRITING_CODE, RULES_EXT, WALDO_ROUTING, ...), or a group such as CORE_TOOLS."
         ),
     )
     customer_eval_group = parser.add_mutually_exclusive_group()
@@ -1099,12 +1043,12 @@ def _run_from_args(args: argparse.Namespace) -> None:
         return
 
     experiment = args.experiment
-    if args.seed_candidate is None:
-        raise SystemExit("--seed_candidate is required unless --fake_flow or --config with run.seed_candidate is set")
     editable_modules = _parse_editable_modules(args.editable_modules)
     judging_mode = cast(JudgingMode, args.judging_mode)
     raw_seed = _load_seed_candidate(args.seed_candidate)
     seed_candidate = _seed_for_editable_modules(raw_seed, editable_modules)
+    models = [args.student_model, *([args.teacher_model] if judging_mode == "teacher_student" else [])]
+    harness = _eval_harness_for(experiment, editable_modules, models)
     log_section("RUN CONFIG", _format_run_config(args, judging_mode, editable_modules, seed_candidate, experiment))
     evalcli = EvalCliClient(binary=args.evalcli)
     bigquery_client = BigQueryClient(project_id=args.bigquery_project)
@@ -1148,7 +1092,7 @@ def _run_from_args(args: argparse.Namespace) -> None:
         cache_file=str(eval_run_cache_file) if eval_run_cache_file else None,
         eval_run_timeout_sec=args.eval_run_timeout_sec,
         eval_run_grace_period_sec=args.eval_run_grace_period_sec,
-        harness=eval_harness(experiment),
+        harness=harness,
     )
     adapter_kwargs = {
         "runner": al_runner,
@@ -1163,10 +1107,10 @@ def _run_from_args(args: argparse.Namespace) -> None:
     logger = StdOutLogger()
     tracker = create_experiment_tracker()
     spec_names = candidate_module_names(adapter.editable_modules)
-    module_specs = {name: ModuleSpec(name, "free_text", MODULE_TOKEN_BUDGETS.get(name, 1024)) for name in spec_names}
+    module_specs = {name: ModuleSpec(name, "free_text", module_token_budget(name) or 1024) for name in spec_names}
     global_token_cap = max(
         args.global_token_cap,
-        *(MODULE_TOKEN_BUDGETS.get(name, 0) for name in adapter.editable_modules),
+        *(module_token_budget(name) or 0 for name in adapter.editable_modules),
     )
     proposer_kwargs = {
         "logger": logger,

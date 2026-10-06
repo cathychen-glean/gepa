@@ -18,7 +18,12 @@ from glean_gepa.adapter_types import JudgingMode
 from glean_gepa.objectives.utils.core import EVIDENCE_LIMIT, RunAnalysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
-from glean_gepa.reflection_prompts import DEFAULT_MODULE_RESPONSIBILITY, core_tool_reflection_prompt
+from glean_gepa.prompt_targets import section_frame
+from glean_gepa.reflection_prompts import (
+    DEFAULT_MODULE_RESPONSIBILITY,
+    compose_responsibility,
+    core_tool_reflection_prompt,
+)
 
 if TYPE_CHECKING:
     from gepa.core.adapter import EvaluationBatch
@@ -135,6 +140,9 @@ def module_responsibility(
         return responsibility
     if module_name in CORE_TOOL_KEYS:
         return core_tool_reflection_prompt(module_name)
+    frame = section_frame(module_name)
+    if frame:
+        return compose_responsibility(frame, DEFAULT_MODULE_RESPONSIBILITY)
     return DEFAULT_MODULE_RESPONSIBILITY
 
 

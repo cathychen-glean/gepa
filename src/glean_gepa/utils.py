@@ -1,9 +1,12 @@
+from collections.abc import Mapping
+
 from glean_gepa.al_adapter import Candidate
 
 
-def apply_single_module_edit(parent: Candidate, module_name: str, new_text: str) -> Candidate:
+def apply_module_edits(parent: Candidate, edits: Mapping[str, str]) -> Candidate:
+    """Copy ``parent`` with every module in ``edits`` replaced."""
     pm = dict(parent.prompt_modules)
-    pm[module_name] = new_text
+    pm.update(edits)
     return Candidate(
         model=parent.model,
         prompt_modules=pm,

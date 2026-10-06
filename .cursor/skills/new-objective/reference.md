@@ -123,33 +123,29 @@ the reference evals' dates. Run it with `full_network`.
 
 ## Splitting a prompt module
 
-Use this when the rules that drive the signal sit in a frozen part of the prompt. The
-worked example is `WALDO_TOOL_USAGE`, the `{WALDO_TOOL_USAGE}` slot in `WALDO_SYSTEM`
-(`waldo_prompt_constants.py`, `runner._seed_for_editable_modules`,
-`prompt.compile_waldo_system_override`).
+Use this when the rules that drive the signal sit in a frozen part of the prompt. Prompts
+and their sections are data under `src/glean_gepa/prompts/<scio template>/`; see "Adding a
+prompt to optimize" in `docs/glean_gepa_architecture_guidelines.md`. The worked example is
+`WALDO_ROUTING`, the `{WALDO_ROUTING}` slot in `WALDO_SYSTEM`.
 
 1. Pick one contiguous span of the live seed text. A contiguous span is what lets the
    compiled seed stay byte-identical.
-2. In the module constants file (`waldo_prompt_constants.py` for Waldo): add the key, a
-   `{SLOT}`, a token budget with headroom over the seed, and stock default text. Fill the
-   slot in the compile function. Module text is stripped, so put separators in the template
-   around the slot, not in the module.
-3. Register the key in `PROMPT_MODULE_DEFAULTS` and `MODULE_TOKEN_BUDGETS`
-   (`prompt_constants.py`).
-4. In `runner._seed_for_editable_modules`: when the new key is editable, pin `WALDO_SYSTEM`
-   from the seed and require the slot in that template. Today this check is written only
-   for `WALDO_TOOL_USAGE`; a new slot needs the same check, or compile falls back to stock
-   text for a frozen sibling.
-5. Make `compile_waldo_system_override` fire for a candidate that carries only the new key.
-   Today it fires for `WALDO_SYSTEM` or `WALDO_TOOL_USAGE`.
-6. Write a new seed file. Leave the old one in place, since shipped configs use it. Assert
+2. In `prompts/<name>/template.prompt`, wrap the stock span in `{#KEY}` ... `{/KEY}`
+   marker lines. In `target.yaml`, declare the section with a token budget that has
+   headroom over the seed, a frame, and any `required_placeholders` /
+   `required_conditionals`. Stripped fill is the default, so separators around the slot
+   belong in the template, not in the module.
+3. Write a new seed file with the span cut out of the template into the new key (or a
+   marked `.prompt` seed). Leave the old one in place, since shipped configs use it. Assert
    that the new seed compiles to the same prompt as the old one.
-7. Point the new config's `editable_modules` and the objective's `module_responsibilities`
-   at the new key. Raise `search.global_token_cap` above the frozen modules plus the new
-   budget.
+4. Point the new config's `editable_modules` and the objective's `module_responsibilities`
+   at the new key. Raise `search.global_token_cap` above the editable target's modules plus
+   the new budget.
 
-Slots and `<<<[[...]]>>>` conditionals in module text are protected automatically:
-`drops_render_slot` and `drops_conditional` reject variants that lose them.
+The seed builder pins the seed's template and every frozen section it renders, and refuses
+an editable section with no slot. Slots, `<<<[[...]]>>>` conditionals, and declared
+required markup are protected during reflection: `drops_render_slot`, `drops_conditional`,
+and `PromptModule.missing_markup` reject variants that lose them.
 
 ## Tests
 

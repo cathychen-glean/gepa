@@ -1,0 +1,33 @@
+# The Coding Harness agent-loop system prompt (scio coding_agent_loop_system.prompt).
+# template.prompt is that file with the editable sections marked; RULES_EXT is a bare
+# slot inside WRITING_CODE with empty stock text.
+harnesses: [coding]
+# Every eval pins this prompt, even when no coding module is in the candidate, so scio
+# template drift never changes what a run measures and existing eval caches stay valid.
+always_emit: true
+
+template:
+  key: FULL_PROMPT
+  # The template is the frame around the sections; edit a section instead.
+  editable: false
+
+sections:
+  WRITING_CODE:
+    token_budget: 1024
+    # Spliced exactly as written: the body owns its leading and trailing blank lines.
+    fill: verbatim
+    frame: >-
+      You are rewriting the ## Writing Code body: SDK call patterns, ToolResult handling,
+      the **Rules:** list, and sandbox privacy. Do not add a heading.
+  EXECUTION_DISCIPLINE:
+    token_budget: 512
+    frame: >-
+      You are rewriting the bullets under '### Execution Discipline', which set how much work the
+      assistant does before it responds. Each line must start with '- '. Do not add a heading.
+  RULES_EXT:
+    token_budget: 512
+    drop_empty_line: true
+    frame: >-
+      You are writing at most two markdown bullets that will be appended after the existing
+      **Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those
+      existing Rules, do not add a heading, and do not exceed two bullets.

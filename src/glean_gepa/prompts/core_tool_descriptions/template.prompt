@@ -1,0 +1,34 @@
+{#glean_search}
+Search company knowledge across documents, messages, and other indexed enterprise data. Use this for internal project context, document lookup, acronym resolution, and company-specific facts. Keep queries short and targeted; do not batch synonyms, boolean logic, or overlapping query variations. `query` searches content, filters constrain metadata — use filters only if needed and use `query="*"` when the intent is purely metadata. Glean search is connected to all datasources.
+{/glean_search}
+
+{#glean_document_reader}
+Retrieve full content for one or more tagged URLs or uploaded file URLs, including images.Always use glean_document_reader to read tagged or uploaded documents and/or images.Use one call for multiple URLs; do not create separate calls per URL. Use page_selections only when snippets show <page N> or <slide N> markers. Set should_fetch_raw_bytes=true when: ALWAYS for tabular/spreadsheet files (.csv, .tsv, .xls, .xlsx, Google Sheets, or any spreadsheet URL) — snippets drop rows/columns/cells so raw is required even for summarization. For other structured files (.ppt, .pptx, Google Docs, SharePoint/OneDrive .docx, slides/presentations): set true when editing, filling in, referencing specific sections/rows/columns/slides, reviewing or addressing comments, or extracting precise structured information; leave false for pure summarization, factual Q&A, drafting messages, or general information-seeking. For GitHub: set true only when reading PR/issue comments or review threads — leave false for code, diffs, or file contents. When uncertain about a structured document, prefer true. The flag applies to all URLs in the call; put URLs needing different handling in a separate call.
+{/glean_document_reader}
+
+{#glean_container_lister}
+List immediate children (title, url metadata only) of Spaces Folder, Project, or Space URLs (`/knowledge/collections/`, `/library/projects/`, `/library/folders/`, `/chat/spaces/`). Re-list nested `/library/projects/` URLs before reading inside.
+- Use this to enumerate items in containers; it does NOT return document content and does NOT recurse.
+- Results include normalized child metadata (e.g., title, url, mimeType, owner, update_time).
+- Use Glean Document Reader to get the full content of documents returned by this tool.
+{/glean_container_lister}
+
+{#tool_search}
+Discover available integrations and tools (Jira, Slack, Salesforce, etc.).
+{/tool_search}
+
+{#todo_write}
+Update the task progress checklist shown to the user. Pass plan={"todos": [{"content": "task description", "status": "pending|in_progress|completed"}, ...]}. Use for 3+ step tasks. Never use a step just to update the list.
+{/todo_write}
+
+{#delegate}
+Spawn a subagent with isolated task. task: detailed instructions for the subagent, including relevant context and file paths to pass along.The subagent shares the filesystem — save large data to files and pass paths.
+{/delegate}
+
+{#discover}
+Searches available skills, tools, and actions to discover ones relevant for a task. Pass query="..." as one concise, atomic search request. For distinct tasks, issue separate calls instead of combining them. Results are not exhaustive; only the top few most relevant matches are returned.
+{/discover}
+
+{#ask_user_questions}
+Use ask_user_questions for any sort of artifact generation or task-execution requests when the user has not specified any important shaping choice that is not inferable from any context (e.g. drafting emails, updating docs, creating presentations, changing code, booking meetings, sending messages). Ask when a user choice would meaningfully affect the output, such as who it is for, what outcome to optimize for, how detailed or polished it should be, or which discovered target to use. Use available context first to make the options concrete; if search finds plausible candidates, ask the user to choose among them instead of asking an open-ended question. For artifact creation or long-running tasks, invest in clarity up front: resolve every output-shaping unknown before you start so the first result lands as close to final as possible — a quick question now saves the user a round of rework later. Call await ask_user_questions([{"question": "...", "options": [{"label": "..."}, ...], "multiSelect": False}, ...]). Ask 1-3 questions with 2-3 concrete options each. Do not restate the request or re-ask questions the user already answered or skipped; approval-required tools (request_*) produce their own confirmation card. Ask everything needed in one shot, then continue after the user answers. The loop pauses after calling it; user answers arrive on the next turn as a chat message.
+{/ask_user_questions}

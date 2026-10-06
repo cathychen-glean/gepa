@@ -12,6 +12,9 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from glean_gepa.prompt_constants import EXECUTION_DISCIPLINE_KEY, RULES_EXT_KEY, WRITING_CODE_KEY
+from glean_gepa.prompt_targets import conditional_counts, prompt_module, section_frame
+
 DEFAULT_MODULE_RESPONSIBILITY = "Focus only on this module's responsibilities."
 
 # The renderer treats <<<[[name]] ... >>> as a live conditional, so reflection fences
@@ -31,7 +34,6 @@ CONDITIONAL_ABSENT_RULE = (
 )
 
 _PLACEHOLDER = re.compile(r"\[\[(\w+)\]\]")
-_CONDITIONAL_OPEN = re.compile(r"<<<\[\[(\w+)\]\]")
 _RENDER_SLOT = re.compile(r"\{([A-Z][A-Z0-9_]*)\}")
 _VARIANT_HEADING = re.compile(r"(?i)variant\s*\d*\s*(\([^)]*\))?\s*[:.]?")
 
@@ -44,14 +46,6 @@ def render_slots(text: str) -> set[str]:
 def drops_render_slot(proposed: str, *, current: str) -> bool:
     """Whether ``proposed`` lost a slot ``current`` had, which would orphan that module."""
     return bool(render_slots(current) - render_slots(proposed))
-
-
-def conditional_counts(text: str) -> dict[str, int]:
-    """Count ``<<<[[name]] ... >>>`` conditional openers by name."""
-    counts: dict[str, int] = {}
-    for name in _CONDITIONAL_OPEN.findall(text):
-        counts[name] = counts.get(name, 0) + 1
-    return counts
 
 
 def drops_conditional(proposed: str, *, current: str) -> bool:
@@ -71,9 +65,16 @@ def drops_conditional(proposed: str, *, current: str) -> bool:
     return proposed.count("<<<") != proposed.count(">>>")
 
 
-def markup_rule_for(current: str) -> str:
+def markup_rule_for(current: str, module_name: str = "") -> str:
     """State which template markup in ``current`` a rewrite has to carry over."""
     rules = []
+    module = prompt_module(module_name) if module_name else None
+    if module and module.required_placeholders:
+        listed = ", ".join(f"[[{name}]]" for name in module.required_placeholders)
+        rules.append(
+            f"Keep {listed} verbatim: scio fills each placeholder at render time, and a variant that "
+            "loses one is discarded."
+        )
     if "<<<" in current:
         rules.append(CONDITIONAL_PRESERVE_RULE)
         names = sorted(conditional_counts(current))
@@ -102,9 +103,9 @@ DIAGNOSIS_MARKUP_RULE = (
 )
 
 
-def diagnosis_markup_rule_for(current: str) -> str:
+def diagnosis_markup_rule_for(current: str, module_name: str = "") -> str:
     """Markup constraints for the patch-proposal pass."""
-    rule = markup_rule_for(current)
+    rule = markup_rule_for(current, module_name)
     return DIAGNOSIS_MARKUP_RULE if rule == CONDITIONAL_ABSENT_RULE else rule
 
 
@@ -155,33 +156,18 @@ GENERALITY_RULES = f"{NO_EXAMPLE_SPECIFICS_RULE} {TEACHER_IS_OFFLINE_RULE}"
 
 # --- Module frames -----------------------------------------------------------
 # The fixed editing contract for each module: what text the reflector is touching and
-# the shape it must keep. Objectives add the objective-specific body, an optional
-# analysis guide, and closing rules through ``compose_responsibility`` so the contract
-# is stated once and every objective's responsibility reads the same way.
+# the shape it must keep. Frames live with each prompt in its ``target.yaml``; objectives
+# add the objective-specific body, an optional analysis guide, and closing rules through
+# ``compose_responsibility`` so every objective's responsibility reads the same way.
 
-RULES_EXT_FRAME = (
-    "You are writing at most two markdown bullets that will be appended after the existing "
-    "**Rules:** list in Writing Code. Each line must start with '- '. Do not repeat those "
-    "existing Rules, do not add a heading, and do not exceed two bullets."
-)
-
-EXECUTION_DISCIPLINE_FRAME = (
-    "You are rewriting the bullets under '### Execution Discipline', which set how much work the "
-    "assistant does before it responds. Each line must start with '- '. Do not add a heading."
-)
-
-WRITING_CODE_FRAME = (
-    "You are rewriting the ## Writing Code body: SDK call patterns, ToolResult handling, "
-    "the **Rules:** list, and sandbox privacy. Do not add a heading."
-)
+RULES_EXT_FRAME = section_frame(RULES_EXT_KEY)
+EXECUTION_DISCIPLINE_FRAME = section_frame(EXECUTION_DISCIPLINE_KEY)
+WRITING_CODE_FRAME = section_frame(WRITING_CODE_KEY)
 
 
 def core_tool_frame(tool_name: str) -> str:
     """Editing contract for one core tool's prompt-visible ``schema.description``."""
-    return (
-        f"You are editing only the prompt-visible schema.description for the core tool `{tool_name}`. "
-        "The override replaces description text only — not the tool signature, parameters, or Returns."
-    )
+    return section_frame(tool_name)
 
 
 def compose_responsibility(frame: str, body: str, *, guide: str = "", closing: str = GENERALITY_RULES) -> str:
@@ -357,7 +343,7 @@ def diagnosis_prompt(
         f"3) Every supplied example is relevant evidence for {module_name}; use it to propose a variant.\n"
         f"4) Make only generalizable changes; do not overfit to individual examples. "
         f"{NO_EXAMPLE_SPECIFICS_RULE}\n"
-        f"5) {diagnosis_markup_rule_for(current)}\n"
+        f"5) {diagnosis_markup_rule_for(current, module_name)}\n"
         f"6) {length_rule}\n\n"
         f"Output format (do NOT return a full rewrite of the module in this step):\n"
         f"DIAGNOSIS:\n"
@@ -459,7 +445,7 @@ def consolidate_prompt(
         f"Consolidate the following patch suggestions into up to {max_variants} candidate rewrites "
         f"of the module {module_name}. Preserve good behavior, incorporate consistent changes only, "
         f"and make only generalizable changes. {NO_EXAMPLE_SPECIFICS_RULE} "
-        f"{markup_rule_for(current)} {consolidate_length}\n"
+        f"{markup_rule_for(current, module_name)} {consolidate_length}\n"
         f"{PATCHES_ARE_THE_WHITELIST_RULE}\n"
         f"Output each variant separated by '\n===VARIANT===\n'.\n\n"
         f"CURRENT:\n{MODULE_TEXT_BEGIN}\n{current}\n{MODULE_TEXT_END}\n\n"
@@ -467,6 +453,85 @@ def consolidate_prompt(
         f"{diagnosis_section}"
         f"SUGGESTIONS:\n{suggestions}\n"
     )
+
+
+RECONCILE_NONE = "NONE"
+_RECONCILE_HEADER = re.compile(r"^===MODULE:\s*([A-Za-z_][A-Za-z0-9_]*)\s*===[ \t]*$", re.MULTILINE)
+_RECONCILE_WHY = re.compile(r"^\s*WHY\s*:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+_RECONCILE_TEXT = re.compile(r"^\s*TEXT\s*:[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class ReconcileEdit:
+    """One companion rewrite: the full new module text and the conflict it removes."""
+
+    module: str
+    text: str
+    why: str
+
+
+def reconcile_prompt(
+    *,
+    module_name: str,
+    diagnosis: str,
+    change: str,
+    others: Mapping[str, tuple[str, str]],
+    length_rules: Mapping[str, str],
+) -> str:
+    """Ask which other modules contradict a proposed edit, and for only the lines that do.
+
+    ``others`` maps each candidate module to ``(responsibility, current text)``.
+    """
+    sections = "".join(
+        f"### {name}\nRESPONSIBILITY:\n{responsibility}\n\n"
+        f"MARKUP: {markup_rule_for(current, name)}\nLENGTH: {length_rules.get(name, '')}\n"
+        f"{MODULE_TEXT_BEGIN}\n{current}\n{MODULE_TEXT_END}\n\n"
+        for name, (responsibility, current) in others.items()
+    )
+    diagnosis_section = f"DIAGNOSIS behind the change:\n{diagnosis.strip()}\n\n" if diagnosis.strip() else ""
+    return (
+        f"A child prompt rewrites the module {module_name} to fix one failure. The other modules below are "
+        "compiled into the same prompt, and the model follows whichever statement of a rule is strictest, so "
+        f"a line elsewhere that contradicts or overrides the new {module_name} can cancel the fix.\n\n"
+        f"{diagnosis_section}"
+        f"CHANGE to {module_name} (unified diff):\n{change.strip()}\n\n"
+        f"OTHER MODULES:\n{sections}"
+        "Task: find lines in the OTHER MODULES that contradict the CHANGE, restate the old rule it replaces, or "
+        "would override it, and rewrite only those lines so the prompt states one consistent rule. Change "
+        "nothing else: no new rules, no rewording of lines that already agree, and no fixes for other "
+        f"failures. Leave a module out entirely when nothing in it conflicts. {NO_EXAMPLE_SPECIFICS_RULE}\n\n"
+        f"If no module conflicts, reply with {RECONCILE_NONE} and nothing else. Otherwise, for each module you "
+        "change, reply with:\n"
+        "===MODULE: <module name>===\n"
+        "WHY: <one sentence quoting the conflicting line and what it contradicted>\n"
+        "TEXT:\n"
+        "<the complete revised module text>\n"
+    )
+
+
+def parse_reconcile_reply(raw: str, *, eligible: Sequence[str]) -> list[ReconcileEdit]:
+    """Companion edits named in a reconcile reply. Unknown modules and empty texts are dropped."""
+    text = raw.strip()
+    if not text or text.upper() == RECONCILE_NONE:
+        return []
+    eligible_set = set(eligible)
+    headers = list(_RECONCILE_HEADER.finditer(text))
+    edits: list[ReconcileEdit] = []
+    seen: set[str] = set()
+    for index, header in enumerate(headers):
+        module = header.group(1)
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        body = text[header.end() : end]
+        if module not in eligible_set or module in seen:
+            continue
+        why_match = _RECONCILE_WHY.search(body)
+        text_match = _RECONCILE_TEXT.search(body)
+        new_text = body[text_match.end() :].strip() if text_match else ""
+        if not new_text:
+            continue
+        seen.add(module)
+        edits.append(ReconcileEdit(module, new_text, why_match.group(1).strip() if why_match else ""))
+    return edits
 
 
 PATCHES_ARE_THE_WHITELIST_RULE = (

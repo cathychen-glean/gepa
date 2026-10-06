@@ -39,8 +39,8 @@ from glean_gepa.objectives.utils.agentspan_query import (
 )
 from glean_gepa.objectives.utils.core import NoComparedEntriesError, PairedRunAnalysis, log_analysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT
+from glean_gepa.prompt_constants import WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY
 from glean_gepa.reflection_prompts import GENERALITY_RULES, compose_responsibility
-from glean_gepa.waldo_prompt_constants import WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY
 
 ESCALATION_MATCH_OBJECTIVE = "escalation_match"
 

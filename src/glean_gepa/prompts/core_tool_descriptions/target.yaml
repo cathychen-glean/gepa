@@ -1,0 +1,15 @@
+# Prompt-visible schema.description for the core tools, one {#key} block per tool in
+# template.prompt. Keys match scio's sanitize_identifier(name.lower()): glean_search, not
+# "Glean Search". An override replaces the description only (glean_document_reader keeps
+# its raw-bytes suffix). Shell is not editable here.
+kind: tool_descriptions
+override_param: co.pyagents_tool_description_overrides
+harnesses: [coding]
+# `editable_modules: CORE_TOOLS` selects every tool below.
+group: CORE_TOOLS
+
+section_defaults:
+  token_budget: 2048
+  frame: >-
+    You are editing only the prompt-visible schema.description for the core tool `{name}`.
+    The override replaces description text only — not the tool signature, parameters, or Returns.
