@@ -24,12 +24,8 @@ run:
   # val pinned below it runs on scio-prod, not a sampled customer deployment.
   customer_eval: true
   eval_run_timeout_sec: 21600
-  # Seed is the LIVE production Waldo prompt (from a Waldo eval's
-  # llmo.per_prompt_overrides.waldo_system), split into WALDO_SYSTEM (template with
-  # the {WALDO_TOOL_USAGE} slot) and WALDO_TOOL_USAGE (the "Glean Search Argument
-  # Construction" rules + search-tool conditionals). It is ~4x the stock
-  # waldo_system.prompt in scio master; do not seed from the stock defaults.
-  seed_candidate: data/waldo_seed_candidate.json
+  # No seed_candidate: the seed is scio master's waldo_system.prompt
+  # (prompts/waldo_system/template.prompt).
   editable_modules: [WALDO_TOOL_USAGE]
 
 models:
@@ -170,6 +166,6 @@ search:
   offspring_count: 5
   reflection_samples: 25
   reflection_hamming_distance_k: null
-  # WALDO_SYSTEM (~5.9k tok) + WALDO_TOOL_USAGE budget (2560). Must exceed their sum so
-  # the per-module budget binds, not this cap.
+  # Must exceed the frozen WALDO_SYSTEM and WALDO_ROUTING text (~1.2k tok) plus the
+  # WALDO_TOOL_USAGE budget (2560), so the per-module budget binds, not this cap.
   global_token_cap: 9216

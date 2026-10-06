@@ -1,16 +1,11 @@
 # Waldo, the lightweight router in front of the full agent (scio waldo_system.prompt). It
 # answers easy lookups with attached search tools and hands everything else to discover.
-#
-# Production Waldo evals do not run this stock text: they send a longer, hand-tuned prompt.
-# data/waldo_seed_candidate.json carries that live prompt split into WALDO_SYSTEM and
-# WALDO_TOOL_USAGE; data/waldo_routing_seed_candidate.json also splits out WALDO_ROUTING.
-# Seed from one of them when tuning for the Waldo team.
 harnesses: [waldo]
 
 template:
   key: WALDO_SYSTEM
-  # Sized to the live prompt (6.3k full, 3.8k routing core, 1.7k tool-usage body) with
-  # headroom. A budget below the seed would reject the seed itself.
+  # Stock text is ~0.7k template, ~0.5k routing core, ~0.35k tool-usage body; budgets are
+  # 7-12x stock.
   token_budget: 8192
   frame: >-
     You are editing the Waldo system prompt outside its routing core and tool-usage sections:

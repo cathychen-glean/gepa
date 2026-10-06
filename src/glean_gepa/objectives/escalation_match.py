@@ -596,36 +596,31 @@ RESTATED_ROUTING_TASK = (
 )
 
 WALDO_ROUTING_FRAME = (
-    "You are rewriting the routing core at the top of the Waldo router prompt: the First-Action "
-    "Decision, the tool-state constraints, the grounding, capability, and Mandatory Discover gates, and "
-    "the Routing section. It has conditional branches, <<<[[has_search_tools]] ... >>> and "
-    "<<<[[no_search_tools]] ... >>>; scio renders exactly one per request. Keep both branches and every "
-    "[[...]] placeholder. The same routing rule is restated in several subsections; when you change "
-    "one, change every restatement so the prompt does not contradict itself. Sections after this one "
-    "are edited separately and refer back to 'easy lookup' and to 'First-Action Decision' by name: keep "
-    "that term and heading. 'Source Selection for Easy Lookups' picks internal versus web search and "
-    "does not affect escalation; leave it unchanged."
+    "You are rewriting the routing core at the top of the Waldo router prompt: '### Role & "
+    "Capabilities' and '### Routing', which lists the requests that go straight to discover (written "
+    "`[[waldo_discover_tool_name]]`) and the easy lookups Waldo answers with its attached tools. It has "
+    "conditional branches, <<<[[has_search_tools]] ... >>> and <<<[[no_search_tools]] ... >>>; scio "
+    "renders exactly one per request. Keep both branches and every [[...]] placeholder. Role & "
+    "Capabilities and Routing state the same decision; when you change one, change the other so the "
+    "prompt does not contradict itself. Sections after this one are edited separately and refer back to "
+    "'the easy lookups above': keep the term 'easy lookup'."
 )
 
 WALDO_SYSTEM_FRAME = (
     "You are rewriting the Waldo router template. The routing core and the tool-usage section are "
     "separate modules spliced in at their slots. The escalation decision is restated here in the "
-    "'### Available Tools' paragraph and in the closing 'Final Grounding Invariant', 'Final Routing "
-    "Invariant', and 'Final First-Action Check': each defines an easy lookup narrowly and sends every "
-    "other request, and every empty or incomplete retrieval, to discover. Those are the lines that move "
-    "escalation. Keep the term 'easy lookup' and the heading name 'First-Action Decision', which the "
-    "routing core defines. Response Guidelines, Citation Deduplication, Hallucination Prevention, "
-    "Confidentiality, User Information, 'Final Citation Audit', and 'Final Search-Call Validation' shape "
-    "the answer or the search call, not the escalation decision: leave them unchanged."
+    "'### Available Tools' paragraph, which says when to write the final answer and to call discover "
+    "when the attached tools cannot complete the task: that is the line that moves escalation. Keep the "
+    "term 'easy lookup', which the routing core defines. Response Guidelines, Hallucination Prevention, "
+    "Confidentiality, and User Information shape the answer, not the escalation decision: leave them "
+    "unchanged."
 )
 
 WALDO_TOOL_USAGE_FRAME = (
     "You are rewriting the Waldo tool-usage section, spliced into the template under '### Tool Usage "
-    "Guidelines'. 'Glean Search Argument Construction' through 'Final validation before emitting the "
-    "call' builds search arguments and does not affect escalation: leave it unchanged. The escalation "
-    "lines come after it: the <<<[[has_search_tools]] ... >>> blocks that send an empty or irrelevant "
-    "internal result to discover, 'When a request routes to `discover`, call it immediately', "
-    "'Classification never changes after a tool result', and the 'Final output gate'. It has "
+    "Guidelines'. Every line here moves escalation: which requests the attached tools are for, how long "
+    "to keep searching before handing off ('Be persistent on info-seeking lookups'), when one or two "
+    "searches may come before discover, and discover for unsupported filters or tools. It has "
     "conditional branches, <<<[[has_search_tools]] ... >>> and <<<[[no_search_tools]] ... >>>; keep "
     "both, every [[...]] placeholder, and the term 'easy lookup'."
 )

@@ -24,6 +24,7 @@ from glean_gepa.objectives.escalation_match import (
     summarize_coverage,
 )
 from glean_gepa.objectives.utils.core import NoComparedEntriesError
+from glean_gepa.prompt_targets import stock_text
 
 RAN = "Agent execution completed successfully"
 
@@ -239,17 +240,15 @@ def test_focused_screen_scores_the_student_against_the_parent_teacher():
 
 def test_restated_routing_modules_point_the_reflector_at_their_discover_lines():
     objective = EscalationMatchObjective()
+    stock = {key: stock_text(key) or "" for key in ("WALDO_ROUTING", "WALDO_SYSTEM", "WALDO_TOOL_USAGE")}
+    routing = objective.reflection_prompt("WALDO_ROUTING")
+    for heading in ("### Role & Capabilities", "### Routing"):
+        assert heading in routing and heading in stock["WALDO_ROUTING"]
     system = objective.reflection_prompt("WALDO_SYSTEM")
-    for heading in (
-        "### Available Tools",
-        "Final Grounding Invariant",
-        "Final Routing Invariant",
-        "Final First-Action",
-    ):
-        assert heading in system
+    assert "### Available Tools" in system and "### Available Tools" in stock["WALDO_SYSTEM"]
     tool_usage = objective.reflection_prompt("WALDO_TOOL_USAGE")
-    assert "Final output gate" in tool_usage and "Classification never changes" in tool_usage
-    assert "Glean Search Argument Construction" in tool_usage
+    assert "Be persistent on info-seeking lookups" in tool_usage
+    assert "Be persistent on info-seeking lookups" in stock["WALDO_TOOL_USAGE"]
 
 
 def _trajectory(output: dict[str, Any], score: float) -> dict[str, Any]:

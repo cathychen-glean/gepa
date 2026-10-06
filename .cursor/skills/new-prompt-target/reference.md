@@ -130,8 +130,8 @@ refuses a student or teacher model on any other harness.
     needs a `token_budget` and a frame telling it to keep every `{SLOT}` line.
 - **Budgets** use `len(text) // 4` tokens.
   - Use at least 1.5x stock for a section expected to grow; the checker warns under 1.25x.
-    Shipped sections use 512–1024 for coding paragraphs, 2048 per tool description, and
-    2560–6144 for Waldo's routing rules.
+    Shipped sections use 512–1024 for coding paragraphs and 2048 per tool description.
+    Waldo's budgets (2560–8192) are 7–12x stock, far looser than this rule.
   - `search.global_token_cap` must cover the pinned template plus the editable budgets.
 - **Frames.**
   - Write them as "You are rewriting <what the section owns>." plus format constraints

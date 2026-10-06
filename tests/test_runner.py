@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 from datetime import date, timedelta
-from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 from gepa.core.data_loader import ListDataLoader
@@ -26,7 +25,7 @@ from glean_gepa.prompt_constants import (
     WALDO_TOOL_USAGE_KEY,
     WRITING_CODE_KEY,
 )
-from glean_gepa.prompt_targets import compile_prompt_text, module_token_budget, stock_text
+from glean_gepa.prompt_targets import compile_prompt_text, stock_text
 from glean_gepa.runner import (
     CUSTOMER_DEPLOYMENTS_FILENAME,
     CUSTOMER_EVAL_DEPLOYMENT_IDS,
@@ -182,64 +181,26 @@ def test_parse_editable_modules():
         _parse_editable_modules(FULL_PROMPT_KEY)
 
 
-def _waldo_seed(name: str) -> dict[str, str]:
-    return json.loads((Path(__file__).resolve().parents[1] / "data" / name).read_text())
-
-
-def test_routing_seed_compiles_to_the_live_prompt():
-    legacy = _waldo_seed("waldo_seed_candidate.json")
-    routing = _waldo_seed("waldo_routing_seed_candidate.json")
-
-    assert routing[WALDO_SYSTEM_KEY].startswith("{WALDO_ROUTING}\n\n### Available Tools")
-    assert routing[WALDO_ROUTING_KEY].startswith("## First-Action Decision")
-    assert routing[WALDO_TOOL_USAGE_KEY] == legacy[WALDO_TOOL_USAGE_KEY]
-    assert _waldo(routing) == _waldo(legacy)
-
-    compiled = _waldo({})
-    assert "{WALDO_ROUTING}" not in compiled
-    assert compiled.startswith((stock_text(WALDO_ROUTING_KEY) or "") + "\n\n### Available Tools")
-
-    rewritten = {**routing, WALDO_ROUTING_KEY: "## First-Action Decision\nCall discover.  \n"}
+def test_a_rewritten_waldo_routing_core_is_stripped_and_spliced_before_available_tools():
+    rewritten = {WALDO_ROUTING_KEY: "## Core Agent Behavior\nCall discover.  \n"}
     assert "Call discover.\n\n### Available Tools" in _waldo(rewritten)
 
 
-def test_waldo_seed_pins_frozen_siblings_and_rejects_a_template_without_the_slot():
-    raw = _waldo_seed("waldo_routing_seed_candidate.json")
-    seed = _seed_for_editable_modules(raw, [WALDO_ROUTING_KEY])
-    assert seed[WALDO_SYSTEM_KEY] == raw[WALDO_SYSTEM_KEY]
-    assert seed[WALDO_ROUTING_KEY] == raw[WALDO_ROUTING_KEY]
-    assert seed[WALDO_TOOL_USAGE_KEY] == raw[WALDO_TOOL_USAGE_KEY]
-
-    legacy = _waldo_seed("waldo_seed_candidate.json")
-    tool_usage_seed = _seed_for_editable_modules(legacy, [WALDO_TOOL_USAGE_KEY])
-    assert WALDO_ROUTING_KEY not in tool_usage_seed
-    assert _waldo(tool_usage_seed) == _waldo(legacy)
-    with pytest.raises(
-        SystemExit, match=r"WALDO_ROUTING is editable but the seed WALDO_SYSTEM has no \{WALDO_ROUTING\}"
-    ):
-        _seed_for_editable_modules(legacy, [WALDO_ROUTING_KEY])
-
-
 def test_waldo_sections_must_keep_both_search_tool_conditionals():
-    raw = _waldo_seed("waldo_routing_seed_candidate.json")
-    stripped = {**raw, WALDO_TOOL_USAGE_KEY: raw[WALDO_TOOL_USAGE_KEY].replace("<<<[[no_search_tools]]", "<<<")}
+    stripped = {WALDO_TOOL_USAGE_KEY: (stock_text(WALDO_TOOL_USAGE_KEY) or "").replace("<<<[[no_search_tools]]", "<<<")}
     with pytest.raises(SystemExit, match=r"seed WALDO_TOOL_USAGE is missing required scio markup: <<<\[\[no_search"):
         _seed_for_editable_modules(stripped, [WALDO_TOOL_USAGE_KEY])
 
 
-def test_routing_module_fits_its_budget_and_triggers_the_waldo_override():
-    routing = _waldo_seed("waldo_routing_seed_candidate.json")
-    budget = module_token_budget(WALDO_ROUTING_KEY)
-    assert budget == 6144
-    assert len(routing[WALDO_ROUTING_KEY]) // 4 < budget
+def test_waldo_configs_seed_from_the_scio_template_within_the_cap():
     assert ",llmo.per_prompt_overrides.waldo_system=" in compile_encoded_prompt({WALDO_ROUTING_KEY: "route"})
 
+    for config in ("teacher_student_waldo", "teacher_student_waldo_escalation"):
+        assert "seed_candidate" not in runner_arg_defaults(load_experiment_config(config))
     defaults = runner_arg_defaults(load_experiment_config("teacher_student_waldo_escalation"))
-    assert Path(defaults["seed_candidate"]) == Path("data/waldo_routing_seed_candidate.json")
     editable = [WALDO_ROUTING_KEY, WALDO_SYSTEM_KEY, WALDO_TOOL_USAGE_KEY]
     assert defaults["editable_modules"] == ",".join(editable)
-    seed = _seed_for_editable_modules(routing, editable)
-    assert seed == routing
+    seed = _seed_for_editable_modules({}, editable)
     assert sum(len(seed[key]) // 4 for key in editable) < defaults["global_token_cap"]
 
 

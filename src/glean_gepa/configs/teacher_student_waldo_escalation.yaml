@@ -7,10 +7,9 @@
 # of teacher_student_waldo.yaml, which scores first-tool match and tunes the Tool Usage
 # Guidelines instead; harness and models are identical.
 #
-# Base rate: in the 2026-10-01 reference pair (Luna teacher vs Qwen student) the teacher
-# escalated on 88.5% of both-ran entries, so an always-escalate student would have scored
-# ~0.885. If this teacher is similar, only the correctness floor below guards against
-# over-escalation; watch the logged student escalation rate.
+# Base rate: if the teacher escalates on most entries, an always-escalate student scores
+# close to that rate, and only the correctness floor below guards against over-escalation.
+# Watch the logged student escalation rate.
 #
 # Run:  uv run python -m glean_gepa.runner --config teacher_student_waldo_escalation
 
@@ -24,13 +23,10 @@ run:
   # val pinned below it runs on scio-prod, not a sampled customer deployment.
   customer_eval: true
   eval_run_timeout_sec: 21600
-  # Seed is the LIVE production Waldo prompt (from a Waldo eval's
-  # llmo.per_prompt_overrides.waldo_system), split into WALDO_SYSTEM (template with
-  # {WALDO_ROUTING} and {WALDO_TOOL_USAGE} slots), WALDO_ROUTING (everything before
-  # "### Available Tools"), and WALDO_TOOL_USAGE (the "Glean Search Argument
-  # Construction" rules + search-tool conditionals). It compiles to exactly the prompt
-  # in data/waldo_seed_candidate.json.
-  seed_candidate: data/waldo_routing_seed_candidate.json
+  # No seed_candidate: the seed is scio master's waldo_system.prompt
+  # (prompts/waldo_system/template.prompt), split into WALDO_SYSTEM (the template with
+  # {WALDO_ROUTING} and {WALDO_TOOL_USAGE} slots), WALDO_ROUTING (Role & Capabilities and
+  # Routing), and WALDO_TOOL_USAGE (the body under "### Tool Usage Guidelines").
   editable_modules: [WALDO_ROUTING, WALDO_SYSTEM, WALDO_TOOL_USAGE]
 
 models:
