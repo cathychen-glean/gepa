@@ -5,7 +5,7 @@ a count, a yes/no per entry). See ``_template_agentspan.py`` for the SQL variant
 and the full "which template?" guide.
 
 Copy to ``objectives/<signal>.py`` and fill every ``TODO``. Nothing here is
-registered; add an ``ObjectiveSpec`` to ``objectives/registry.py`` and a signal to
+registered; add an entry to ``OBJECTIVES`` in ``objectives/registry.py`` and a signal to
 an experiment YAML when ready.
 
 Three decisions, top to bottom:

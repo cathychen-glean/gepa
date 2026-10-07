@@ -49,7 +49,7 @@ from glean_gepa.experiment_config import (
 from glean_gepa.fake_flow import build_fake_flow_components
 from glean_gepa.harnesses import harness_for_model
 from glean_gepa.judge_metrics_util import JUDGE_SPECS
-from glean_gepa.objectives import build_objective
+from glean_gepa.objectives.registry import build_objective
 from glean_gepa.objectives.utils.agentspan_query import DEFAULT_LOOKBACK_DAYS
 from glean_gepa.openai_client import create_qe_openai_client, format_exception_chain, get_perfeval_secret
 from glean_gepa.prompt import candidate_module_names, compile_encoded_prompt

@@ -3,7 +3,7 @@
 #
 # This file is self-contained. `signals`, `objective`, `screening`, and
 # `reflection` below are the full experiment; nothing is merged in from elsewhere.
-# `signals[].source` must be a telemetry source registered for this mode in
+# `signals[].source` must be a key of `OBJECTIVES["single_model"]` in
 # glean_gepa/objectives/registry.py.
 
 schema_version: 1

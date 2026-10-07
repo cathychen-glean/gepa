@@ -27,10 +27,10 @@ points, frontier behavior, data-source notes, test list, and gotchas.
    prompt after your change. The verify script enforces this. New behavior goes in a new
    YAML file, or behind a new param whose default reproduces today's behavior.
 2. **Add, don't alter.** Never change an existing objective's `name`, `telemetry_dimensions`,
-   score semantics, or param defaults. Never set `default=True` on a new `ObjectiveSpec`:
-   each mode already has one, and a second fails `load_builtins`. Don't touch adapters,
-   `objectives/base.py`, `objectives/protocol.py`, or `objectives/utils/` unless every
-   objective needs the change (ask the user first).
+   score semantics, or param defaults. Never change `DEFAULT_SOURCE` in
+   `objectives/registry.py`: each mode already has its default. Don't touch adapters,
+   `objectives/base.py`, or `objectives/utils/` unless every objective needs the change
+   (ask the user first).
 3. **Reuse before writing.** Prefer, in order: a YAML-only signal, a new param on an existing
    objective, then a new objective file copied from the closest existing one. Objectives
    never import from each other; shared code comes from `objectives/utils/`.
@@ -115,7 +115,8 @@ the user and resolve it. Write the script under `.tmp_debug/`, not `src/`.
 Follow the guide's "Adding an objective" layout (types, parse and aggregate, source,
 feedback, class) and its checklist. Repo-specific musts:
 
-- Register one `ObjectiveSpec` in `objectives/registry.py`. Never set `default=True`.
+- Add one entry to `OBJECTIVES[mode]` in `objectives/registry.py`. Never import `registry.py`
+  from inside `glean_gepa.objectives`; it must stay a leaf module to avoid an import cycle.
 - New fields on rollout output go into `adapter_types.py` as `NotRequired` keys.
 - Log coverage (compared, unpaired, skipped by reason, incomplete) in `validate_full_eval`
   or `log_analysis`. For teacher_student, override `require_compared_entries` and raise

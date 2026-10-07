@@ -21,7 +21,8 @@ from glean_gepa.experiment_config import (
     screening_weights,
 )
 from glean_gepa.judge_metrics_util import DEFAULT_CUSTOMER_VALIDATION_GATES, JUDGE_SPECS
-from glean_gepa.objectives import AnalysisRequest, build_objective
+from glean_gepa.objectives import AnalysisRequest
+from glean_gepa.objectives.registry import build_objective
 from glean_gepa.objectives.shell import SHELL_SUCCESS_OBJECTIVE
 from glean_gepa.objectives.tool_match import empty_tool_match_analysis
 from glean_gepa.runner import _parse_args

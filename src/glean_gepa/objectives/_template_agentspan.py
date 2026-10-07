@@ -15,7 +15,7 @@ Which template?
     it is evalcli.
 
 Copy to ``objectives/<signal>.py`` and fill every ``TODO``. Nothing here is
-registered; add an ``ObjectiveSpec`` to ``objectives/registry.py`` and a signal to
+registered; add an entry to ``OBJECTIVES`` in ``objectives/registry.py`` and a signal to
 an experiment YAML when ready.
 
 Four decisions, top to bottom:

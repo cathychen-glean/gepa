@@ -28,7 +28,7 @@ from glean_gepa.prompt_constants import (
 from glean_gepa.prompt_targets import module_token_budget, stock_text
 from glean_gepa.reflection_prompts import parse_chosen_tool_keys
 from glean_gepa.teacher_student_adapter import TeacherStudentAdapter
-from glean_gepa.objectives.registry import BUILTIN_OBJECTIVES
+from glean_gepa.objectives.registry import OBJECTIVES
 from glean_gepa.prompt_constants import FULL_PROMPT_KEY
 from glean_gepa.reflection_prompts import (
     MODULE_TEXT_BEGIN,
@@ -163,8 +163,9 @@ def _consolidate(current: str, **kw) -> str:
 
 
 def test_no_objective_claims_the_render_template_as_a_module():
-    for spec in BUILTIN_OBJECTIVES:
-        assert FULL_PROMPT_KEY not in spec.load().module_responsibilities
+    for sources in OBJECTIVES.values():
+        for cls in sources.values():
+            assert FULL_PROMPT_KEY not in cls.module_responsibilities
 
 
 # --- Markup safety: the renderer treats <<<[[name]] ... >>> as a live conditional and {SLOT}

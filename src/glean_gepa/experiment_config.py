@@ -11,14 +11,14 @@ from typing import Any
 from glean_gepa.adapter_types import EvalHarness, JudgingMode, PairwiseJudge, PointwiseJudge
 from glean_gepa.focused_evalset import FOCUSED_BUCKET_TYPES
 from glean_gepa.judge_metrics_util import CUSTOMER_AGENTIC_PREFERENCE_METRIC, JUDGE_SPEC_NAMES, JUDGE_SPECS
-from glean_gepa.objectives import is_registered_telemetry_source, is_telemetry_source
+from glean_gepa.objectives.registry import is_known_source, is_registered
 
 CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 DEFAULT_EVAL_SET_NAME = "Glean Chat V2 Medium"
 DEFAULT_DEPLOYMENT_IDS = ("scio-prod",)
 
 # Mode is the eval topology. Telemetry sources are registered per mode in
-# glean_gepa.objectives; a signal is scorable when its source is registered for the mode.
+# glean_gepa.objectives.registry; a signal is scorable when its source is registered for the mode.
 SUPPORTED_MODES: tuple[JudgingMode, ...] = ("single_model", "teacher_student")
 
 # Sources whose signal value is read straight from telemetry or the config, as
@@ -390,7 +390,7 @@ def agentspan_lookback_days(config: ExperimentConfig) -> int | None:
     lookbacks = [
         int(signal["lookback_days"])
         for signal in config.signals
-        if is_telemetry_source(str(signal.get("source") or "")) and signal.get("lookback_days") is not None
+        if is_known_source(str(signal.get("source") or "")) and signal.get("lookback_days") is not None
     ]
     return max(lookbacks) if lookbacks else None
 
@@ -435,9 +435,7 @@ def _parse_signals(raw: Any, *, mode: JudgingMode) -> list[dict[str, Any]]:
             raise ExperimentConfigError(f"signal {name!r} is declared more than once")
         seen.add(name)
         source = signal.get("source")
-        if source not in {_CONSTANT_SOURCE, "cortex_judge", None} and not is_registered_telemetry_source(
-            mode, str(source)
-        ):
+        if source not in {_CONSTANT_SOURCE, "cortex_judge", None} and not is_registered(mode, str(source)):
             raise ExperimentConfigError(
                 f"mode {mode} cannot score signal {name!r} (source {source!r} is not registered for this mode)"
             )
@@ -489,7 +487,7 @@ def _scorable_signal_names(signals: list[dict[str, Any]], *, mode: JudgingMode) 
     for signal in signals:
         if signal.get("enabled", True) is False:
             continue
-        if signal.get("source") == _CONSTANT_SOURCE or is_registered_telemetry_source(mode, signal.get("source")):
+        if signal.get("source") == _CONSTANT_SOURCE or is_registered(mode, signal.get("source")):
             names.add(str(signal["name"]))
     return names
 

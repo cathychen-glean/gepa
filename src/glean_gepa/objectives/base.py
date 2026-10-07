@@ -2,8 +2,8 @@
 
 ``TeacherStudentAdapter`` and ``SingleModelAdapter`` own how evals are run.
 An objective owns the metric: fetching telemetry, scoring rows, high-signal
-selection, and reflection. Register a new ``(mode, source)`` pair to add a
-metric without forking an adapter.
+selection, and reflection. Add an entry to ``objectives/registry.py``'s
+``OBJECTIVES`` to add a metric without forking an adapter.
 """
 
 from __future__ import annotations
@@ -13,8 +13,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Literal, TypeVar, cast
 
-import glean_gepa.objectives.registry as _registry
-from glean_gepa.adapter_types import JudgingMode
 from glean_gepa.objectives.utils.core import EVIDENCE_LIMIT, RunAnalysis
 from glean_gepa.objectives.utils.mismatch import REFLECTION_HIGH_SIGNAL_ENTRY_LIMIT, select_mismatch_groups
 from glean_gepa.prompt_constants import CORE_TOOL_KEYS
@@ -35,12 +33,6 @@ if TYPE_CHECKING:
 _REFLECTION_K_DEFAULT = object()
 
 REFLECTION_EVIDENCE_LIMIT = EVIDENCE_LIMIT
-
-# Read-only views of ``glean_gepa.objectives.registry``.
-TELEMETRY_SOURCES: dict[tuple[JudgingMode, str], type] = _registry._REGISTRY
-MODE_DEFAULT_TELEMETRY_SOURCE: dict[JudgingMode, str] = {
-    spec.mode: spec.source for spec in _registry.BUILTIN_OBJECTIVES if spec.default
-}
 
 
 # The analysis type a concrete objective's ``analyze()`` returns; subclasses bind it.
@@ -349,6 +341,11 @@ class TeacherStudentObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     # cache entry is absent here and is treated as hydrated.
     _unhydrated_pairs: set[tuple[str, str]]
 
+    def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1) -> None:
+        self.bigquery_client = bigquery_client
+        self.lookback_days = lookback_days
+        self.params = {}
+
     @property
     def analysis_cache(self) -> dict[tuple[str, str], Any]:
         """Objective-agnostic accessor for the paired-analysis cache."""
@@ -622,6 +619,13 @@ class SingleModelObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
     # which create these lazily so concrete ``__init__`` need not declare them.
     _eval_analysis_cache: dict[str, Any]
     _unhydrated_eval_ids: set[str]
+    bigquery_client: Any | None
+    lookback_days: int
+
+    def __init__(self, *, bigquery_client: Any | None = None, lookback_days: int = 1) -> None:
+        self.bigquery_client = bigquery_client
+        self.lookback_days = lookback_days
+        self.params = {}
 
     @abstractmethod
     def analyze(self, eval_id: str, *, request: AnalysisRequest) -> AnalysisT: ...
@@ -778,65 +782,10 @@ class SingleModelObjective(ExperimentConfigurable, ABC, Generic[AnalysisT]):
         del raw_cache
 
 
-def register_telemetry_source(
-    mode: JudgingMode,
-    source: str,
-    cls: type,
-    *,
-    replace: bool = False,
-    validate: bool = True,
-) -> None:
-    """Register an out-of-tree objective. Built-ins are listed in ``registry.BUILTIN_OBJECTIVES``."""
-    _registry.register(mode, source, cls, replace=replace, validate=validate)
-
-
-def unregister_telemetry_source(mode: JudgingMode, source: str) -> None:
-    _registry.unregister(mode, source)
-
-
-def is_registered_telemetry_source(mode: JudgingMode, source: str | None) -> bool:
-    return _registry.is_registered(mode, source)
-
-
-def is_telemetry_source(source: str | None) -> bool:
-    return _registry.is_known_source(source)
-
-
-def build_objective(
-    mode: JudgingMode,
-    signals: Sequence[Mapping[str, Any]] | None = None,
-    *,
-    bigquery_client: Any | None = None,
-    lookback_days: int = 1,
-    experiment: Mapping[str, Any] | None = None,
-) -> TeacherStudentObjective | SingleModelObjective:
-    """Construct the telemetry objective registered for ``mode`` and the first scorable signal's source."""
-    source = _registry.default_source(mode)
-    if signals:
-        for signal in signals:
-            if signal.get("enabled", True) is False:
-                continue
-            candidate = signal.get("source")
-            if isinstance(candidate, str) and _registry.is_registered(mode, candidate):
-                source = candidate
-                break
-    cls = _registry.resolve(mode, source)
-    objective = cls(bigquery_client=bigquery_client, lookback_days=lookback_days)
-    configure_objective(objective, experiment)
-    return objective
-
-
 __all__ = [
-    "MODE_DEFAULT_TELEMETRY_SOURCE",
     "ScoredRow",
     "SingleModelObjective",
-    "TELEMETRY_SOURCES",
     "TeacherStudentObjective",
     "TelemetryPendingError",
-    "build_objective",
     "configure_objective",
-    "is_registered_telemetry_source",
-    "is_telemetry_source",
-    "register_telemetry_source",
-    "unregister_telemetry_source",
 ]
