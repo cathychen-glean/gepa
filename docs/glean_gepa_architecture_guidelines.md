@@ -20,7 +20,7 @@ GEPA engine wiring (`api.py`)
         |
         +--> SingleModelAdapter
                evaluates one student through EvalCLI + BigQuery
-               objectives (objectives/registry.py): shell_telemetry, loop_telemetry
+               objectives (objectives/registry.py): shell_telemetry, loop_telemetry, golden_escalation
                optionally creates a fresh replay eval set per candidate
 
 Shared infrastructure (not adapters)
@@ -143,11 +143,13 @@ Shipped experiments:
 | `teacher_student_tool.yaml` | teacher_student | `tool_alignment` | First-tool match. Weighted screen. |
 | `teacher_student_agentic_1/2.yaml` | teacher_student | `agentic_preference_rate` | Pinned train/val slices, `screening.kind: none`. |
 | `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
+| `single_model_waldo_escalation.yaml` | single_model | `golden_escalation_match` | Waldo routing vs each entry's human-labeled route (`canonicalAnswer.target_route`); trains on `waldo_golden:le297309_routing_labeled`, validates on `holdout_labeled`. |
 Sections:
 
 - `signals` -- every metric the run scores or reports. `source` is a key of
   `OBJECTIVES[mode]` in `objectives/registry.py` (`tool_match`,
-  `citation_match`, `agentic_preference`, `escalation_match`; `shell_telemetry`, `loop_telemetry`),
+  `citation_match`, `agentic_preference`, `escalation_match`; `shell_telemetry`, `loop_telemetry`,
+  `golden_escalation`),
   `cortex_judge` (with `type` and `kind`), or `constant`. Names must be unique.
   A telemetry source not registered for the file's `mode` fails the load.
 - `objective` -- `primary` (parent selection; must be scorable), `composite`
