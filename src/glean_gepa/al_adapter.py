@@ -799,9 +799,8 @@ class GleanAdapterBase:
         *,
         capture_traces: bool = True,
     ) -> list[GleanEvaluationBatch]:
-        """Run focused child screens concurrently; leave ordinary evals serial."""
-        is_focused = any(data.get("eval_entry_ids") for _candidate, batch in items for data in batch)
-        if not is_focused or len(items) < 2:
+        """Run each candidate's evals concurrently: child screens and the full-valset evals of a batch of children."""
+        if len(items) < 2:
             return [self.evaluate(batch, candidate, capture_traces=capture_traces) for candidate, batch in items]
 
         with ThreadPoolExecutor(max_workers=len(items)) as executor:
@@ -817,8 +816,8 @@ class GleanAdapterBase:
         candidates: list[dict[str, str]],
         capture_traces: bool = False,
     ) -> list[GleanEvaluationBatch]:
-        """Evaluate many candidates on the same batch. Override to overlap eval runs."""
-        return [self.evaluate(batch, candidate, capture_traces) for candidate in candidates]
+        """Evaluate many candidates on the same batch, concurrently."""
+        return self.batch_evaluate([(candidate, batch) for candidate in candidates], capture_traces=capture_traces)
 
     def prepare_high_signal_batch(self, batch: list[ALDataInst]) -> list[ALDataInst] | None:
         """Upload/reuse focused eval sets once before concurrent child screening."""
