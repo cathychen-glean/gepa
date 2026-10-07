@@ -145,8 +145,8 @@ Shipped experiments:
 | `teacher_student_waldo.yaml` | teacher_student | `tool_alignment` | Waldo router prompt; student and teacher both run Waldo (`waldo:PROVIDER:MODEL[:effort]`). |
 Sections:
 
-- `signals` -- every metric the run scores or reports. `source` is a telemetry
-  source registered for the mode in `objectives/registry.py` (`tool_match`,
+- `signals` -- every metric the run scores or reports. `source` is a key of
+  `OBJECTIVES[mode]` in `objectives/registry.py` (`tool_match`,
   `citation_match`, `agentic_preference`, `escalation_match`; `shell_telemetry`, `loop_telemetry`),
   `cortex_judge` (with `type` and `kind`), or `constant`. Names must be unique.
   A telemetry source not registered for the file's `mode` fails the load.
@@ -233,13 +233,13 @@ An objective turns one eval run (or a teacher/student pair) into per-entry
 scores and reflection evidence. Adapters, the proposer, caching, and the
 reflection frame are shared; you write the parts that know your signal.
 
+Adding one is one class file, one entry in `OBJECTIVES`, and a test.
+
 ### Start from a template
 
 Two complete, importable objectives live beside the real ones. Copy the one
-that matches where your signal comes from, rename, and fill the `TODO`s:
-
-Start from the template that matches where the signal lives. The question is:
-does the eval run's analysis view already have your number?
+that matches where your signal comes from, rename, and fill the `TODO`s. The
+question is: does the eval run's analysis view already have your number?
 
 | Answer | Template | Lines | Examples |
 |---|---|---|---|
@@ -250,8 +250,8 @@ Not sure? Call `evalcli.get_analysis_view(eval_id)` on a recent run. If the fiel
 you would score is in an entry's `metadata` or a judge's `outputs`, it is evalcli.
 Both templates open with this same question.
 
-Both pass `check_objective_contract` and pyright as-is. Each is one file in
-the same layout as the five shipped objectives, top to bottom:
+Both instantiate and pass pyright as-is. Each is one file in the same layout
+as the shipped objectives, top to bottom:
 
 1. **Types.** One `EntryMetrics` dataclass with `entry_id`, `passed`, `score`;
    one aggregate dataclass; the `Analysis` frame alias.
@@ -282,12 +282,14 @@ template marks where each goes.
 | File | What goes there |
 |---|---|
 | `objectives/<signal>.py` | The copied template. One file: types, parsing, source, feedback, class. |
-| `objectives/registry.py` | One `ObjectiveSpec` in `BUILTIN_OBJECTIVES`. `source` is the string an experiment YAML's `signals[].source` uses to select you. |
+| `objectives/registry.py` | One import and one entry in `OBJECTIVES[mode]`, keyed by `source`: the string an experiment YAML's `signals[].source` uses to select you. |
 | `configs/<experiment>.yaml` | A self-contained experiment that declares a signal with your `source` and sets `objective.primary`, `composite`, `screening`, and `reflection`. Copy `single_model_shell.yaml` or `teacher_student.yaml`. |
-| `tests/test_<signal>_objective.py` | At least the contract test (below), a scoring test, and a reflective-example test. |
+| `tests/test_<signal>_objective.py` | At least a selection test (below), a scoring test, and a reflective-example test. |
 
-Do not touch the adapters, `base.py`, `protocol.py`, or anything under
-`objectives/utils/` unless every existing objective needs the change.
+Do not touch the adapters, `base.py`, or anything under `objectives/utils/`
+unless every existing objective needs the change. Never import `registry.py`
+from inside `glean_gepa.objectives`: the objective classes import `al_adapter`,
+which imports the package, so the catalog must stay a leaf module.
 
 ### Class attributes
 
@@ -327,8 +329,7 @@ Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 
 ### Scores
 
-- Every score is higher-is-better in `[0.0, 1.0]`. `scored_rows_are_normalized`
-  in `protocol.py` rejects anything else.
+- Every score is higher-is-better in `[0.0, 1.0]`.
 - `objective_scores` in each row must contain `self.name`. Extra keys are fine;
   the experiment YAML's `objective.composite` decides which ones enter the composite.
 - Provisional results (telemetry not yet ingested) return an analysis whose
@@ -338,28 +339,31 @@ Optional overrides with sensible defaults: `is_pending`, `aggregate_score`,
 
 ```python
 # objectives/registry.py
-ObjectiveSpec(
-    mode="single_model",
-    source="downvote_judge",
-    class_path="glean_gepa.objectives.downvote_judge:DownvoteJudgeObjective",
-    summary="Judge did not downvote the answer.",
-),
+from glean_gepa.objectives.downvote_judge import DownvoteJudgeObjective
+
+OBJECTIVES = {
+    ...
+    "single_model": {
+        ...
+        "downvote_judge": DownvoteJudgeObjective,
+    },
+}
 ```
 
 ```python
 # tests/test_downvote_judge_objective.py  (mirrors tests/test_loop_objective.py)
-from glean_gepa.objectives import registry
-from glean_gepa.objectives.protocol import ObjectiveProtocol, check_objective_contract
+from glean_gepa.objectives.registry import build_objective
 
-def test_satisfies_contract_and_is_registered() -> None:
-    assert check_objective_contract(DownvoteJudgeObjective) == []
-    assert isinstance(DownvoteJudgeObjective(bigquery_client=MagicMock()), ObjectiveProtocol)
-    assert registry.resolve("single_model", "downvote_judge") is DownvoteJudgeObjective
+def test_selected_from_its_signal() -> None:
+    signals = [{"name": "downvote_judge", "source": "downvote_judge"}]
+    objective = build_objective("single_model", signals, bigquery_client=MagicMock())
+    assert isinstance(objective, DownvoteJudgeObjective)
 ```
 
-`tests/test_objectives_catalog.py` already asserts that every spec in
-`BUILTIN_OBJECTIVES` loads and satisfies the protocol, so a missing hook fails
-CI before you write a scoring test.
+`tests/test_objectives.py` already instantiates every entry in `OBJECTIVES`
+and checks its mode base class and required class attributes, so a missing
+abstract hook or attribute fails CI before you write a scoring test. Never set
+a new entry as `DEFAULT_SOURCE`; each mode already has one.
 
 ### What `objectives/utils/` gives you
 
@@ -385,7 +389,7 @@ and `agentic_preference.py` (no SQL, no aggregate on the frame).
 - [ ] Class binds its frame: `SingleModelObjective[YourAnalysis]`.
 - [ ] `analyze` goes through the shared cache helper.
 - [ ] `build_reflective_example` goes through `self.reflective_example`.
-- [ ] `ObjectiveSpec` added; `uv run pytest tests/test_objectives_catalog.py` passes.
+- [ ] Entry added to `OBJECTIVES`; `uv run pytest tests/test_objectives.py` passes.
 - [ ] Experiment YAML added or extended; `uv run pytest tests/test_experiment_config.py` passes.
 - [ ] `uv run ruff check src/ && uv run pyright src/` clean.
 

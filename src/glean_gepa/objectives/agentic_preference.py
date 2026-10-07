@@ -2,7 +2,7 @@
 
 Trace loading and judge-rationale parsing live in
 :mod:`glean_gepa.objectives.agentic_preference_traces`. This module maps that
-analysis onto the contract in :mod:`glean_gepa.objectives.protocol`.
+analysis onto the ``TeacherStudentObjective`` contract in :mod:`glean_gepa.objectives.base`.
 
 There is no SQL of its own and no aggregate on the frame: the score is
 computed from judge output by the adapter, not here."""

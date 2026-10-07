@@ -28,13 +28,14 @@ Copy the closest objective, rename, and delete what you don't need. All paths ar
 Cortex judges are scorable only in teacher_student (`_MODES_WITH_CORTEX_JUDGES` in
 `experiment_config.py`).
 
-Required class members, beyond the shared contract in `objectives/protocol.py`:
+Required class members, beyond the abstract methods and the `name`, `telemetry_dimensions`,
+`focused_bucket_type`, and `failure_label` attributes on the two bases in `objectives/base.py`:
 
 - teacher_student: `teacher_compared_key`, `student_compared_key`, `mismatch_pair`
   (returns `(teacher, student)` or `None`), `validate_full_eval`.
 - single_model: `pending_telemetry_label`, `pending_count`, `log_analysis`.
 - Both: `__init__` must accept `bigquery_client` and `lookback_days` (or `**kwargs`).
-  The registry rejects a class that has neither the parameter nor a var-keyword.
+  `build_objective` passes both as keywords.
 
 ## YAML extension points
 
@@ -59,8 +60,7 @@ Adding a param safely:
 
 ## Scores and the frontier
 
-- Every score is in [0, 1] and higher is better; `scored_rows_are_normalized` rejects
-  anything else, bools included.
+- Every score is a float in [0, 1] (not a bool) and higher is better.
 - A teacher_student row's `objective_score` is
   `{**constant_scores, **row.dimension_scores, **judge_scores}`.
 - With `frontier_type: hybrid`, the frontier keys are one per val instance (the composite)
@@ -155,8 +155,8 @@ and `PromptModule.missing_markup` reject variants that lose them.
 
 `tests/test_<signal>_objective.py` should cover:
 
-- [ ] Contract and registry: `check_objective_contract(cls) == []` and
-      `registry.resolve(mode, source) is cls`.
+- [ ] Catalog: `OBJECTIVES[mode][source] is cls`; `tests/test_objectives.py` instantiates it
+      and checks its base class and required attributes.
 - [ ] Parse and classify: each status, precedence, and exclusion rule.
 - [ ] Aggregate on a fixture shaped like the reference (counts and rates).
 - [ ] SQL guards: required filters and exclusions are in the query; forbidden fields are not.

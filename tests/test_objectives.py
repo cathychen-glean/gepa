@@ -1,61 +1,85 @@
-"""The objective catalog is the single registration point and rejects bad entries."""
+"""The objective catalog lists valid classes, ``build_objective`` picks the right one, and it stays a leaf module."""
 
 from __future__ import annotations
+
+import subprocess
+import sys
+from unittest.mock import MagicMock
 
 import pytest
 
 from glean_gepa.experiment_config import ExperimentConfigError, load_experiment_config
-from glean_gepa.objectives import register_telemetry_source, registry, unregister_telemetry_source
-from glean_gepa.objectives.base import (
-    MODE_DEFAULT_TELEMETRY_SOURCE,
-    TELEMETRY_SOURCES,
-    ScoredRow,
-    TeacherStudentObjective,
-    build_objective,
-)
-from glean_gepa.objectives.protocol import (
-    REQUIRED_ATTRIBUTES,
-    REQUIRED_METHODS,
-    ObjectiveProtocol,
-    check_objective_contract,
-    scored_rows_are_normalized,
-)
-from glean_gepa.objectives.registry import (
-    BUILTIN_OBJECTIVES,
-    VALID_MODES,
-    ObjectiveRegistrationError,
-    validate_objective_class,
-)
+from glean_gepa.objectives.base import SingleModelObjective, TeacherStudentObjective
+from glean_gepa.objectives.loop import LoopEfficiencyObjective
+from glean_gepa.objectives.registry import DEFAULT_SOURCE, OBJECTIVES, build_objective, is_known_source, is_registered
+from glean_gepa.objectives.shell import ShellSuccessObjective
+from glean_gepa.objectives.tool_match import FirstToolMatchObjective
+
+MODE_BASES = {"teacher_student": TeacherStudentObjective, "single_model": SingleModelObjective}
+CATALOG = [(mode, source, cls) for mode, sources in OBJECTIVES.items() for source, cls in sources.items()]
+# Abstract bases don't enforce class attributes, so the catalog test checks them explicitly.
+REQUIRED_CLASS_ATTRIBUTES = ("name", "telemetry_dimensions", "focused_bucket_type", "failure_label")
 
 
-def test_every_catalog_spec_loads_and_registers() -> None:
-    registered = registry.registered()
-    for spec in BUILTIN_OBJECTIVES:
-        assert registered[(spec.mode, spec.source)] is spec.load(), spec.source
-    assert len(registered) >= len(BUILTIN_OBJECTIVES)
+def test_catalog_covers_both_modes() -> None:
+    assert set(OBJECTIVES) == set(MODE_BASES)
 
 
-def test_catalog_has_one_default_per_mode_and_base_aliases_follow_it() -> None:
-    defaults = {spec.mode for spec in BUILTIN_OBJECTIVES if spec.default}
-    assert defaults == VALID_MODES
-    assert MODE_DEFAULT_TELEMETRY_SOURCE == {"teacher_student": "tool_match", "single_model": "shell_telemetry"}
-    assert TELEMETRY_SOURCES is registry.registered()
+@pytest.mark.parametrize(("mode", "source", "cls"), CATALOG, ids=[f"{m}/{s}" for m, s, _ in CATALOG])
+def test_every_catalog_entry_is_a_complete_objective_for_its_mode(mode: str, source: str, cls: type) -> None:
+    # shell and loop reject a None client, so every entry gets a fake one.
+    objective = cls(bigquery_client=MagicMock(), lookback_days=1)
+    assert isinstance(objective, MODE_BASES[mode]), source
+    for attribute in REQUIRED_CLASS_ATTRIBUTES:
+        assert hasattr(objective, attribute), f"{source} has no {attribute!r}"
 
 
-def test_catalog_sources_are_unique_per_mode() -> None:
-    keys = [(spec.mode, spec.source) for spec in BUILTIN_OBJECTIVES]
-    assert len(keys) == len(set(keys))
+def test_every_mode_default_is_in_the_catalog() -> None:
+    assert set(DEFAULT_SOURCE) == set(OBJECTIVES)
+    for mode, source in DEFAULT_SOURCE.items():
+        assert source in OBJECTIVES[mode], mode
 
 
-def test_builtins_pass_validation_and_instantiate() -> None:
-    for spec in BUILTIN_OBJECTIVES:
-        cls = spec.load()
-        assert validate_objective_class(cls, mode=spec.mode, source=spec.source) == [], spec.source
-        # Single-model objectives require a client; any object satisfies the constructor check.
-        assert isinstance(cls(bigquery_client=object(), lookback_days=1), ObjectiveProtocol), spec.source
+def test_is_registered_is_per_mode_and_is_known_source_spans_modes() -> None:
+    assert is_registered("teacher_student", "tool_match")
+    assert not is_registered("teacher_student", "loop_telemetry")
+    assert not is_registered("single_model", None)
+    assert is_known_source("loop_telemetry") and is_known_source("tool_match")
+    assert not is_known_source("") and not is_known_source(None) and not is_known_source("cortex_judge")
 
 
-def test_a_registered_second_source_is_selectable_from_config(tmp_path) -> None:
+def test_build_objective_picks_first_enabled_signal_registered_for_the_mode() -> None:
+    client = MagicMock()
+    signals = [
+        {"name": "off", "source": "citation_match", "enabled": False},
+        {"name": "judge", "source": "cortex_judge"},
+        {"name": "other_mode", "source": "loop_telemetry"},
+        {"name": "loop", "source": "loop_telemetry"},
+    ]
+    assert isinstance(build_objective("single_model", signals, bigquery_client=client), LoopEfficiencyObjective)
+    # citation_match is disabled and loop_telemetry is single_model only, so teacher_student falls back.
+    assert type(build_objective("teacher_student", signals)) is FirstToolMatchObjective
+    assert type(build_objective("single_model", None, bigquery_client=client)) is ShellSuccessObjective
+    skipped = [{"name": "loop", "source": "loop_telemetry", "enabled": False}]
+    assert type(build_objective("single_model", skipped, bigquery_client=client)) is ShellSuccessObjective
+
+
+def test_build_objective_applies_experiment_config() -> None:
+    experiment = {
+        "objective": {"params": {"k": 3}},
+        "reflection": {"failure_label": "CUSTOM FAILURES"},
+        "screening": {"high_signal": "first_tool_match"},
+        "signals": [{"name": "first_tool_match", "source": "tool_match"}],
+    }
+    objective = build_objective("teacher_student", experiment["signals"], lookback_days=4, experiment=experiment)
+    assert objective.params == {"k": 3}
+    assert objective.failure_label == "CUSTOM FAILURES"
+    assert objective.high_signal == "first_tool_match"
+    assert objective.signal_names == ("first_tool_match",)
+    assert type(objective).failure_label != "CUSTOM FAILURES"
+
+
+def test_a_catalog_entry_is_selectable_from_config(tmp_path, monkeypatch) -> None:
     class Dummy:
         name = "dummy_alignment"
         telemetry_dimensions = ("dummy_alignment",)
@@ -70,81 +94,46 @@ def test_a_registered_second_source_is_selectable_from_config(tmp_path) -> None:
     )
     with pytest.raises(ExperimentConfigError, match="cannot score signal"):
         load_experiment_config(yaml)
-    register_telemetry_source("teacher_student", "dummy_trace", Dummy, validate=False)
-    try:
-        config = load_experiment_config(yaml)
-        assert isinstance(build_objective("teacher_student", config.signals), Dummy)
-    finally:
-        unregister_telemetry_source("teacher_student", "dummy_trace")
+    monkeypatch.setitem(OBJECTIVES["teacher_student"], "dummy_trace", Dummy)
+    config = load_experiment_config(yaml)
+    assert isinstance(build_objective("teacher_student", config.signals), Dummy)
 
 
-def test_register_rejects_incomplete_class_with_every_problem_listed() -> None:
-    class Incomplete(TeacherStudentObjective):
-        name = "incomplete"
-        telemetry_dimensions = ("incomplete",)
-        focused_bucket_type = "QUERY_CANONICAL"
-
-        def __init__(self) -> None:  # wrong constructor on purpose
-            pass
-
-    with pytest.raises(ObjectiveRegistrationError) as excinfo:
-        registry.register("teacher_student", "incomplete", Incomplete)
-    message = str(excinfo.value)
-    assert "missing method analyze()" in message
-    assert "missing method entry_row()" in message
-    assert "__init__ must accept keyword 'bigquery_client'" in message
-    assert not registry.is_registered("teacher_student", "incomplete")
+@pytest.mark.parametrize("base", [TeacherStudentObjective, SingleModelObjective])
+def test_subclass_missing_abstract_methods_cannot_be_instantiated(base: type) -> None:
+    incomplete = type(
+        "Incomplete",
+        (base,),
+        {"name": "incomplete", "telemetry_dimensions": ("incomplete",), "focused_bucket_type": "QUERY_CANONICAL"},
+    )
+    with pytest.raises(TypeError, match="abstract"):
+        incomplete()
 
 
-def test_register_rejects_wrong_mode_base_and_bad_source() -> None:
-    shell = registry.resolve("single_model", "shell_telemetry")
-    problems = validate_objective_class(shell, mode="teacher_student", source="Bad-Source")
-    assert any("must subclass TeacherStudentObjective" in p for p in problems)
-    assert any("snake_case" in p for p in problems)
+_IMPORT_ORDER_MODULES = (
+    "glean_gepa.run_log",
+    "glean_gepa.focused_evalset",
+    "glean_gepa.objectives",
+    "glean_gepa.objectives.tool_match",
+    "glean_gepa.experiment_config",
+    "glean_gepa.objectives.registry",
+)
+# Each module first, then the rest in order, plus the whole list reversed.
+_IMPORT_ORDERS = [
+    (first, *(module for module in _IMPORT_ORDER_MODULES if module != first)) for first in _IMPORT_ORDER_MODULES
+] + [tuple(reversed(_IMPORT_ORDER_MODULES))]
 
 
-def test_register_refuses_silent_override_but_allows_replace() -> None:
-    tool_match = registry.resolve("teacher_student", "tool_match")
-    citation = registry.resolve("teacher_student", "citation_match")
-    registry.register("teacher_student", "tool_match", tool_match)  # same class: no-op
-    with pytest.raises(ObjectiveRegistrationError, match="already registered"):
-        registry.register("teacher_student", "tool_match", citation)
-    try:
-        registry.register("teacher_student", "tool_match", citation, replace=True)
-        assert registry.resolve("teacher_student", "tool_match") is citation
-    finally:
-        registry.register("teacher_student", "tool_match", tool_match, replace=True)
-
-
-def test_contract_lists_every_missing_member_for_bare_class() -> None:
-    class Bare:
-        pass
-
-    missing = check_objective_contract(Bare)
-    assert missing == [f"attribute {name!r}" for name in REQUIRED_ATTRIBUTES] + [
-        f"method {name}()" for name in REQUIRED_METHODS
-    ]
-
-
-def test_contract_treats_unimplemented_abstract_methods_as_missing() -> None:
-    class Partial(TeacherStudentObjective):
-        name = "partial"
-        telemetry_dimensions = ("partial",)
-        focused_bucket_type = "QUERY_CANONICAL"
-
-    missing = check_objective_contract(Partial)
-    assert "method analyze()" in missing
-    assert "method entry_row()" in missing
-    assert "method aggregate_row()" in missing
-    assert "attribute 'failure_label'" not in missing  # inherited default counts
+@pytest.mark.parametrize("order", _IMPORT_ORDERS, ids=[order[0] for order in _IMPORT_ORDERS[:-1]] + ["reversed"])
+def test_registry_is_a_leaf_module_so_any_import_order_works(order: tuple[str, ...]) -> None:
+    code = "\n".join(f"import {module}" for module in order)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 def test_reflective_example_helper_builds_the_shared_frame() -> None:
     """Objectives supply four slots; the helper owns Inputs, Metrics, defaults, and evidence caps."""
-    from unittest.mock import MagicMock
-
     from glean_gepa.objectives.base import REFLECTION_EVIDENCE_LIMIT
-    from glean_gepa.objectives.shell import ShellSuccessObjective
 
     objective = ShellSuccessObjective(bigquery_client=MagicMock())
     trajectory = {
@@ -171,10 +160,3 @@ def test_reflective_example_helper_builds_the_shared_frame() -> None:
     bare = objective.reflective_example({**trajectory, "data": {"eval_set_name": "set"}}, feedback="f")
     assert "eval_run_id" not in bare["Inputs"]
     assert bare["Action Inputs"] == [] and bare["Execution Errors"] == []
-
-
-def test_scored_rows_are_normalized_rejects_out_of_range_and_bool() -> None:
-    ok = [ScoredRow(entry_id="a", dimension_scores={"m": 0.0}, output={}), ScoredRow("b", {"m": 1.0}, {})]
-    assert scored_rows_are_normalized(ok)
-    assert not scored_rows_are_normalized([ScoredRow("c", {"m": 1.5}, {})])
-    assert not scored_rows_are_normalized([ScoredRow("d", {"m": True}, {})])

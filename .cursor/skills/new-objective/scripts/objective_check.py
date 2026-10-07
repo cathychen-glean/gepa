@@ -29,7 +29,7 @@ def _fingerprint_config(path: Path) -> dict[str, Any]:
         load_experiment_config,
         runner_arg_defaults,
     )
-    from glean_gepa.objectives.base import build_objective
+    from glean_gepa.objectives.registry import build_objective
     from glean_gepa.prompt import compile_encoded_prompt
     from glean_gepa.prompt_constants import WRITING_CODE_KEY
     from glean_gepa.runner import _load_seed_candidate, _parse_editable_modules, _seed_for_editable_modules
