@@ -20,6 +20,7 @@ from glean_gepa.objectives.agentic_preference import AgenticPreferenceObjective
 from glean_gepa.objectives.base import SingleModelObjective, TeacherStudentObjective, configure_objective
 from glean_gepa.objectives.citation_match import CitationMatchObjective
 from glean_gepa.objectives.escalation_match import EscalationMatchObjective
+from glean_gepa.objectives.golden_escalation import GoldenEscalationMatchObjective
 from glean_gepa.objectives.loop import LoopEfficiencyObjective
 from glean_gepa.objectives.shell import ShellSuccessObjective
 from glean_gepa.objectives.tool_match import FirstToolMatchObjective
@@ -34,6 +35,7 @@ OBJECTIVES: dict[JudgingMode, dict[str, type[TeacherStudentObjective] | type[Sin
     "single_model": {
         "shell_telemetry": ShellSuccessObjective,
         "loop_telemetry": LoopEfficiencyObjective,
+        "golden_escalation": GoldenEscalationMatchObjective,
     },
 }
 # Objective used when a config for the mode declares no scorable signal.

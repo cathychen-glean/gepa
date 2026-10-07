@@ -109,6 +109,11 @@ class SingleModelALRolloutOutput(BaseALRolloutOutput):
     eval_trace_id: NotRequired[str]
     student_loops: NotRequired[int]
     correctness: NotRequired[float]
+    golden_route: NotRequired[str]
+    golden_notes: NotRequired[str]
+    student_waldo_termination: NotRequired[str]
+    student_waldo_summary: NotRequired[str]
+    student_first_sentence_refusal: NotRequired[bool]
 
 
 class TeacherStudentALRolloutOutput(BaseALRolloutOutput):

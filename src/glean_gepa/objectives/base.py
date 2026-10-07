@@ -62,11 +62,19 @@ class AnalysisRequest:
     hydrate_action_inputs
         Attach tool payloads from detailed traces to high-signal entries.
         False for validation-only batches, which never feed reflection.
+    eval_set_name, eval_set_version, deployment_ids
+        The eval set the run executed (a focused copy for screens). Single-model
+        only; empty when the caller does not know it. Neither EvalCLI run status
+        nor agentspan records it, so an objective that joins per-entry data such
+        as labels to the set's entries reads it here.
     """
 
     evalcli: Any | None = None
     detail: AnalysisDetail = "per_entry"
     hydrate_action_inputs: bool = True
+    eval_set_name: str = ""
+    eval_set_version: str = ""
+    deployment_ids: tuple[str, ...] = ()
 
     @property
     def wants_per_entry(self) -> bool:

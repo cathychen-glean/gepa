@@ -1,0 +1,90 @@
+# Waldo escalation experiment (single-model, golden labels).
+#
+# Goal: tune the Waldo routing rules (the WALDO_ROUTING core plus the lines in WALDO_SYSTEM
+# and WALDO_TOOL_USAGE that restate it) so the router takes each request's human-labeled
+# route. Sibling of teacher_student_waldo_escalation.yaml: same student, harness, seed, and
+# editable modules, but each entry is scored against its golden route instead of a teacher.
+#
+# Score: an entry scores 1 when the student escalates (SAW_INSUFFICIENT_TOOLS) where
+# canonicalAnswer.target_route is `discover`, and answers (SAW_READY) where it is
+# `direct_response`. A fallback (NO_SAMPLE, MAX_LOOPS_EXHAUSTED, NO_TOOL_CALLS) scores 0
+# either way. Skipped and unlabeled entries are not scored.
+#
+# Base rate: train is 63 discover / 31 direct_response, so an always-escalate student
+# scores 0.67 on train; holdout is 20 / 20, where it scores 0.50. Watch the logged
+# over-escalation count.
+#
+# Run:  uv run python -m glean_gepa.runner --config single_model_waldo_escalation
+
+schema_version: 1
+mode: single_model
+
+run:
+  dir: run_sm_waldo_escalation
+  max_metric_calls: 10
+  # Post-search seed-vs-best eval on the holdout set, gated by objective.validation.
+  customer_eval: true
+  eval_run_timeout_sec: 21600
+  # No seed_candidate: the seed is scio master's waldo_system.prompt, split into
+  # WALDO_SYSTEM, WALDO_ROUTING, and WALDO_TOOL_USAGE (prompts/waldo_system/).
+  editable_modules: [WALDO_ROUTING, WALDO_SYSTEM, WALDO_TOOL_USAGE]
+
+models:
+  student: waldo:OPEN_AI:GPT6_LUNA:none
+  reflection: OPEN_AI:GPT5_6_LUNA
+
+eval:
+  # Waldo evals run on the standard Glean Chat runner; the runner appends the Waldo
+  # enable flag, model, and compiled waldo_system override to WALDO_HARNESS_SC_PARAMS.
+  runner_type: GLEAN_CHAT
+
+data:
+  # Both versions carry the gold routing row in expectedOutput.canonicalAnswer.
+  # Train: LE-297309 human-reviewed routing traces (94 entries). Val: the 40-entry
+  # holdout slice of combined_v2. They share no queries.
+  eval_set_name: waldo_golden
+  deployment_ids: [scio-prod]
+  lookback_days: 14
+  days_back: 0
+  val_version_count: 1
+  train_eval_versions: [le297309_routing_labeled]
+  val_eval_versions: [holdout_labeled]
+
+signals:
+  - name: golden_escalation_match
+    source: golden_escalation
+    lookback_days: 7
+
+objective:
+  primary: golden_escalation_match
+  frontier_type: hybrid
+  composite:
+    golden_escalation_match: 1.0
+  focused_bucket_type: QUERY_CANONICAL
+  params:
+    # Focused screen copies keep the query but not canonicalAnswer; their entries take
+    # the label of the same query in these sets.
+    label_eval_sets: ["waldo_golden:le297309_routing_labeled", "waldo_golden:holdout_labeled"]
+  # Cortex judges are not scored in-loop in single_model; this gate runs once, on the
+  # post-search seed-vs-best pair (pairwise vs the seed, not a teacher).
+  validation:
+    - metric: agentic_correctness_rate
+      min: 0.48
+
+screening:
+  # Focused screen: the child must take the golden route on >= 25% of the parent's
+  # mismatches, rerun as a QUERY_CANONICAL copy of those entries.
+  kind: high_signal_fix_rate
+  threshold: 0.25
+  high_signal: golden_escalation_match
+
+reflection:
+  editable_modules: [WALDO_ROUTING, WALDO_SYSTEM, WALDO_TOOL_USAGE]
+  # No `modules:` override: the objective's per-module responsibilities carry the score
+  # model, the analysis guide, and which lines of each module move escalation.
+
+search:
+  offspring_count: 5
+  reflection_samples: 25
+  reflection_hamming_distance_k: null
+  global_token_cap: 10752

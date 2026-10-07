@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 from glean_gepa.adapter_types import (
@@ -15,7 +16,12 @@ from glean_gepa.al_adapter import (
     GleanAdapterBase,
 )
 from glean_gepa.batch import EvalRunIds, GleanEvaluationBatch
-from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, ensure_focused_eval_set, resolve_eval_run_target
+from glean_gepa.focused_evalset import (
+    SESSION_BUCKET_TYPE,
+    ensure_focused_eval_set,
+    focused_entry_id,
+    resolve_eval_run_target,
+)
 from glean_gepa.objectives import AnalysisDetail, AnalysisRequest, SingleModelObjective, TelemetryPendingError
 from glean_gepa.objectives.shell import ShellSuccessObjective
 from glean_gepa.objectives.utils.evalset_entries import fetch_high_signal_evalset_entries
@@ -162,11 +168,17 @@ class SingleModelAdapter(GleanAdapterBase):
         *,
         detail: AnalysisDetail = "per_entry",
         hydrate_action_inputs: bool = True,
+        eval_set_name: str = "",
+        eval_set_version: str = "",
+        deployment_ids: Sequence[str] = (),
     ):
         request = AnalysisRequest(
             evalcli=self.runner.evalcli,
             detail=detail,
             hydrate_action_inputs=hydrate_action_inputs,
+            eval_set_name=eval_set_name,
+            eval_set_version=eval_set_version,
+            deployment_ids=tuple(deployment_ids),
         )
         analysis = self.objective.analyze(eval_id, request=request)
         if eval_id in self._eval_analysis_cache:
@@ -220,7 +232,10 @@ class SingleModelAdapter(GleanAdapterBase):
 
         for al_data_inst in batch:
             deployment_ids = al_data_inst.get("deployment_ids", [])
-            requested_entry_ids = al_data_inst.get("eval_entry_ids")
+            # A QUERY_CANONICAL focused copy gives each entry a new id; score the copy's ids.
+            requested_entry_ids = [
+                focused_entry_id(al_data_inst, entry_id) for entry_id in al_data_inst.get("eval_entry_ids") or []
+            ] or None
             target = resolve_eval_run_target(
                 self.runner.evalcli,
                 al_data_inst,
@@ -273,6 +288,9 @@ class SingleModelAdapter(GleanAdapterBase):
                 student_eval_id,
                 detail=detail,
                 hydrate_action_inputs=not bool(al_data_inst.get("validation_only")),
+                eval_set_name=eval_set_name,
+                eval_set_version=eval_set_version,
+                deployment_ids=deployment_ids,
             )
             if self.objective.is_pending(analysis):
                 label = self.objective.pending_telemetry_label or self.objective.name

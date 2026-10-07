@@ -13,7 +13,6 @@ from helpers import single_model_adapter
 
 from glean_gepa.al_adapter import ALRunner, Candidate, ModuleSpec, extract_shell_action_inputs
 from glean_gepa.batch import GleanEvaluationBatch
-from glean_gepa.debug import set_debug
 from glean_gepa.evalcli_client import EvalCliClient
 from glean_gepa.focused_evalset import SESSION_BUCKET_TYPE, FocusedEvalSet
 from glean_gepa.objectives import AnalysisRequest
@@ -158,7 +157,10 @@ def test_evaluate_scores_the_aggregate_and_surfaces_each_failing_entry():
     with (
         patch.object(adapter, "_get_or_run_student_eval", return_value="run_123"),
         patch.object(adapter.runner.evalcli, "get_analysis_trace", return_value=_shell_trace("call-1", "python3 x.py")),
-        patch("glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis", return_value=_one_failing_entry_analysis()),
+        patch(
+            "glean_gepa.objectives.shell.fetch_eval_run_shell_tool_error_analysis",
+            return_value=_one_failing_entry_analysis(),
+        ),
     ):
         result = adapter.evaluate(_SHELL_BATCH, {"WRITING_CODE": "p"}, capture_traces=True)
         full_val = adapter.evaluate(
@@ -171,7 +173,9 @@ def test_evaluate_scores_the_aggregate_and_surfaces_each_failing_entry():
     assert result.trajectories is not None and result.trajectories[0]["data"]["eval_trace_id"] == "trace-student-1"
     assert full_val.scores == [0.75] and full_val.objective_scores == [{SHELL_SUCCESS_OBJECTIVE: 0.75}]
 
-    reflective = adapter.make_reflective_dataset({"WRITING_CODE": "p"}, result, ["WRITING_CODE"], k=1)["WRITING_CODE"][0]
+    reflective = adapter.make_reflective_dataset({"WRITING_CODE": "p"}, result, ["WRITING_CODE"], k=1)["WRITING_CODE"][
+        0
+    ]
     assert reflective["Execution Errors"] == ["command exited with status 1"]
     assert reflective["Action Inputs"] == ['{"command": "python3 x.py"}']
 
@@ -597,6 +601,70 @@ def test_high_signal_evaluation_scores_entries_not_shell_calls():
 
     assert result.scores == [1.0, 0.0]
     assert result.summary[SHELL_SUCCESS_OBJECTIVE] == 0.5
+
+
+def test_query_canonical_focused_eval_scores_the_copys_entry_ids_and_passes_the_eval_set():
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+    )
+    # The focused copy re-ids each entry; telemetry is keyed by the copy's ids.
+    passing = ShellToolErrorEntryMetrics(
+        entry_id="copy-1",
+        shell_executions=1,
+        shell_errors=0,
+        shell_error_rate=0.0,
+        shell_error_pct=0.0,
+        recent_error_examples=(),
+    )
+    analysis = MagicMock(
+        aggregate=MagicMock(shell_success_rate=1.0),
+        per_entry={passing.entry_id: passing},
+        high_signal_entry_ids=(),
+    )
+    with (
+        patch.object(adapter, "_get_or_run_student_eval", return_value="focused-run"),
+        patch.object(adapter, "_get_or_fetch_analysis", return_value=analysis) as get_analysis,
+    ):
+        result = adapter.evaluate(
+            [
+                {
+                    "eval_set_name": "Source",
+                    "eval_set_version": "v1",
+                    "deployment_ids": ["prod"],
+                    "status": "active",
+                    "eval_entry_ids": ["source-1", "source-2"],
+                    "focused_eval_set_name": "focused",
+                    "focused_eval_set_version": "v1_hs",
+                    "focused_entry_ids": {"source-1": "copy-1", "source-2": "copy-2"},
+                }
+            ],
+            {"WRITING_CODE": "prompt"},
+            capture_traces=True,
+        )
+
+    assert get_analysis.call_args.kwargs["eval_set_name"] == "focused"
+    assert get_analysis.call_args.kwargs["eval_set_version"] == "v1_hs"
+    assert get_analysis.call_args.kwargs["deployment_ids"] == ["prod"]
+    assert [output["entry_id"] for output in result.outputs] == ["copy-1"]
+    # copy-2 has no telemetry: a miss over the full request, not a dropped entry.
+    assert result.summary[SHELL_SUCCESS_OBJECTIVE] == 0.5
+
+
+def test_fetched_analysis_request_carries_the_runs_eval_set():
+    adapter = SingleModelAdapter(
+        runner=ALRunner(evalcli=EvalCliClient(binary="/fake/evalcli")),
+        bigquery_client=MagicMock(),
+        student_model="fast",
+    )
+    with patch.object(adapter.objective, "analyze") as analyze:
+        adapter._get_or_fetch_analysis(
+            "run-1", detail="traces", eval_set_name="golden", eval_set_version="train", deployment_ids=["prod"]
+        )
+    request = analyze.call_args.kwargs["request"]
+    assert (request.eval_set_name, request.eval_set_version, request.deployment_ids) == ("golden", "train", ("prod",))
+    assert request.evalcli is adapter.runner.evalcli
 
 
 def test_extract_shell_action_inputs_matches_action_run_id():
