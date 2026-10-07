@@ -55,7 +55,9 @@ def test_only_teacher_student_can_score_a_judge_dimension():
 def test_screening_score_follows_the_primary_or_the_weighted_blend():
     """Screen on the primary by default; with screening.weights the child must clear the blend,
     and an empty child eval can never pass."""
-    tool_match_eval = GleanEvaluationBatch(outputs=[], scores=[0.85], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0})
+    tool_match_eval = GleanEvaluationBatch(
+        outputs=[], scores=[0.85], summary={TOOL_ALIGNMENT_OBJECTIVE: 0.5, "correctness": 1.0}
+    )
     assert teacher_student_adapter().get_screening_score(tool_match_eval) == 0.5
     assert teacher_student_adapter(primary_objective="correctness").get_screening_score(tool_match_eval) == 1.0
 
@@ -186,3 +188,20 @@ def test_high_signal_batch_evaluation_dispatches_children_concurrently():
     results = adapter.batch_evaluate(items)
 
     assert len(results) == 2
+
+
+def test_full_valset_evaluation_dispatches_children_concurrently():
+    adapter = GleanAdapterBase.__new__(GleanAdapterBase)
+    barrier = threading.Barrier(3)
+
+    def evaluate_fn(_batch_data, _candidate, _capture_traces):
+        barrier.wait(timeout=1)
+        return _batch([1.0])
+
+    adapter._evaluate_fn = evaluate_fn
+    valset = [{"eval_set_name": "set", "eval_set_version": "v1", "deployment_ids": ["prod"], "status": "active"}]
+    items = [({"WRITING_CODE": f"child-{index}"}, valset) for index in range(3)]
+
+    assert len(adapter.batch_evaluate(items, capture_traces=False)) == 3
+    barrier.reset()
+    assert len(adapter.evaluate_many(valset, [candidate for candidate, _batch_data in items])) == 3
